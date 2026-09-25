@@ -16,6 +16,7 @@ from enum import Enum
 
 __all__ = [
     "QScheme",
+    "parse_codebook_dtype",
     "parse_spec_fields",
 ]
 
@@ -94,15 +95,47 @@ def _get_quant_min_max(dtype: str):
         max_val = (2 ** (2**es)) ** (nbits - 2)
         return -max_val, max_val
 
-    # Normalized floats (NF)
-    if match := re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype, re.IGNORECASE):
-        if match.group(2) is not None:
-            max_val = 2 ** (int(match.group(2)) - 1) - 1
-        else:
-            max_val = 1
+    # Lookup tables span their entries' range, or [-1, 1] when the entries
+    # keep the model's dtype.
+    if (codebook := parse_codebook_dtype(dtype)) is not None:
+        entry = codebook[1]
+        max_val = 1 if entry is None else _get_quant_min_max(entry)[1]
         return -max_val, max_val
 
     raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def parse_codebook_dtype(dtype: str):
+    """Split a lookup-table dtype into its index width and entry dtype.
+
+    ``lut<I>_to_<E>`` stores ``I``-bit indices into a table of ``2**I``
+    entries of dtype ``E``, a signed ``int<N>`` or ``fp<B>_e<X>m<Y>``.  A bare
+    ``lut<I>`` keeps the entries in the model's own dtype.
+
+    Args:
+        dtype: A dtype name.
+
+    Returns:
+        ``(index_bits, entry_dtype)``, ``entry_dtype`` None for a bare
+        ``lut<I>``; None when ``dtype`` is not a lookup table.
+
+    Raises:
+        ValueError: The entry dtype is neither a signed integer nor a signed
+            float.
+    """
+    match = re.fullmatch(r"lut(\d+)(?:_to_(\w+))?", dtype)
+    if match is None:
+        return None
+    index_bits, entry_dtype = match.groups()
+    if entry_dtype is None or re.fullmatch(r"int\d+", entry_dtype):
+        return int(index_bits), entry_dtype
+    fp = re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", entry_dtype)
+    if fp is None or int(fp[1]) != int(fp[2]) + int(fp[3]) + 1:
+        raise ValueError(
+            f"{dtype}: a lookup table's entries are int<N> or a signed "
+            f"fp<bits>_e<exponent>m<mantissa>, not {entry_dtype}"
+        )
+    return int(index_bits), entry_dtype
 
 
 def parse_spec_fields(s: str) -> dict:

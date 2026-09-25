@@ -64,7 +64,7 @@ from voyager_compiler.quantization import (
     gptq,
     load_codebooks,
 )
-from voyager_compiler.quantization.lcq import _quantized_operands
+from voyager_compiler.quantization.codebook_optimizer import _quantized_operands
 
 logger = logging.getLogger(__name__)
 

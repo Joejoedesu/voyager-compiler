@@ -23,7 +23,7 @@ from torch.fx import Interpreter
 
 from voyager_compiler.export_utils import get_node_name_to_scope
 from voyager_compiler.ops import calculate_mx_qparam, quantize, vmap
-from voyager_compiler.quantization.lcq import EPS
+from voyager_compiler.quantization.codebook_optimizer import EPS
 from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)

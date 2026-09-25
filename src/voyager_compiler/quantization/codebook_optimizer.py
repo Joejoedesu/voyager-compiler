@@ -1,11 +1,13 @@
-"""Learned codebook quantization: fit a tensor's own levels.
+"""Codebook optimization: fit a lookup table's entries to a tensor.
 
-A codebook is ``k`` distinct integers in ``[quant_min, quant_max]``, indexed
-by ``log2(k)`` bits, so the stored element keeps its width and only the
-levels it decodes to change.  It applies not to a tensor's raw values but to
-``x / blockscale`` under microscaling, so every routine below works in that
-normalized space.  How many levels there are, and what range they span, is
-the caller's to say -- nothing here assumes a size or a grid.
+A lookup-table dtype ``lut<I>_to_<E>`` stores ``I``-bit indices into
+``2**I`` entries of dtype ``E``, so the stored element keeps its width and
+only the levels it decodes to change.  It applies not to a tensor's raw
+values but to ``x / blockscale`` under microscaling, so every routine below
+works in that normalized space.  The levels are drawn from a set of
+candidates -- every value the entry dtype holds in the range, or an even
+spread across it when the entries keep the model's dtype -- and nothing here
+assumes their number or their spacing.
 
 ``optimal_codebook`` fits the levels to measured samples: the exact
 weighted-MSE minimum over an accumulated ``Histogram``, by dynamic
@@ -19,7 +21,6 @@ off zero -- pass ``pin_zero`` to forbid it.
 import enum
 import json
 import logging
-import math
 import os
 
 import numpy as np
@@ -27,17 +28,15 @@ import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
 from voyager_compiler.ops import calculate_mx_qparam, expand
-from voyager_compiler.ops.quantized import QMAP_SIZE
-from voyager_compiler.quantization.dtypes import create_normal_map
+from voyager_compiler.quantization.fake_quantize import entry_levels
 
 logger = logging.getLogger(__name__)
 
 EPS = 1e-12
 
-#: Bins the range is divided into when a tensor's statistics are
-#: accumulated.  The solver's candidate levels are integers, so this only
-#: has to be fine enough that a bin boundary never falls where a decision
-#: does; 4001 puts about 63 bins between consecutive integers.
+#: Bins the range is split into evenly, beside the edges the solver needs.
+#: The solver reads only those; these give anyone reading the histogram an
+#: even resolution across the range.
 HISTOGRAM_BINS = 4001
 
 #: Elements one ``Histogram.add`` converts to float64 at a time.  Widening
@@ -61,16 +60,37 @@ class Histogram:
     was gathered from, which is what separates a heavy bin from a crowded
     one.
 
+    A value rounds to its nearest level, so it switches level halfway
+    between two.  The bins have an edge at the midpoint of every pair of
+    candidates, which leaves no bin straddling a switch wherever the solver
+    puts the levels, and so makes its cost exact on any grid.
+
+    Args:
+        levels: The candidate levels, ascending.
+        even_bins: Bins the range is also split into evenly, beside the
+            midpoint edges.
+
     Attributes:
-        quant_min: Smallest representable value, and the low edge.
-        quant_max: Largest representable magnitude, and the high edge.
-        bins: Resolution the range is divided into.
+        levels: The candidate levels, ascending.
+        quant_min: The lowest candidate, and the low edge.
+        quant_max: The highest candidate, and the high edge.
+        bins: How many bins the midpoint and even edges make together.
     """
 
-    def __init__(self, quant_min, quant_max, bins=HISTOGRAM_BINS):
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.bins = bins
+    def __init__(self, levels, even_bins=HISTOGRAM_BINS):
+        self.levels = np.asarray(levels, dtype=np.float64)
+        self.quant_min = float(self.levels[0])
+        self.quant_max = float(self.levels[-1])
+        midpoints = (self.levels[:, None] + self.levels[None, :]) / 2
+        self._edges = np.unique(
+            np.concatenate(
+                [
+                    np.linspace(self.quant_min, self.quant_max, even_bins + 1),
+                    midpoints.ravel(),
+                ]
+            )
+        )
+        self.bins = self._edges.size - 1
         self.weight = None
         self.total = None
         self.square = None
@@ -78,9 +98,7 @@ class Histogram:
 
     def edges(self):
         """Return the bin boundaries the sums are taken between."""
-        return np.linspace(
-            self.quant_min - 0.5, self.quant_max + 0.5, self.bins + 1
-        )
+        return self._edges
 
     def add(self, values, weights):
         """Accumulate one tensor's normalized values into the bins.
@@ -99,26 +117,19 @@ class Histogram:
             self.count = torch.zeros(
                 self.bins, dtype=torch.int64, device=values.device
             )
-        edges = torch.linspace(
-            self.quant_min - 0.5,
-            self.quant_max + 0.5,
-            self.bins + 1,
-            device=values.device,
-            dtype=torch.float32,
-        )
+        edges = torch.as_tensor(self._edges, device=values.device)
         values = values.reshape(-1)
         weights = weights.reshape(-1).expand_as(values)
         for start in range(0, values.numel(), ACCUMULATE_CHUNK):
-            piece = values[start : start + ACCUMULATE_CHUNK]
-            share = weights[start : start + ACCUMULATE_CHUNK]
+            # Float64 so that a value is binned against the exact midpoints,
+            # and so that the order the bins are summed in -- which on a GPU
+            # is decided by the scheduler -- cannot move a level.  That same
+            # indifference to order is what lets the pass be sliced.
+            piece = values[start : start + ACCUMULATE_CHUNK].double()
+            share = weights[start : start + ACCUMULATE_CHUNK].double()
             index = (torch.bucketize(piece, edges, right=True) - 1).clamp_(
                 0, self.bins - 1
             )
-            # Float64 so that the order the bins are summed in -- which on a
-            # GPU is decided by the scheduler -- cannot move a level.  That
-            # same indifference to order is what lets the pass be sliced.
-            piece = piece.double()
-            share = share.double()
             self.weight.index_add_(0, index, share)
             self.total.index_add_(0, index, share * piece)
             self.square.index_add_(0, index, share * piece * piece)
@@ -132,90 +143,17 @@ class Histogram:
         )
 
 
-#: Candidates per level when fitting on the float grid.  The dynamic
-#: program holds a cube of this many candidates, so the cost is n^3; an odd
-#: count keeps an exact zero available for ``pin_zero``.
+#: Candidates across the range when the entries keep the model's dtype and
+#: so have no grid of their own.  The dynamic program holds a cube of them,
+#: so its cost is n^3; an odd count keeps an exact zero for ``pin_zero``.
 FLOAT_RESOLUTION = 257
-
-
-class CodebookGrid(enum.Enum):
-    """Where a fitted level is allowed to sit.
-
-    ``INTEGER`` restricts every level to the integer grid the PE array
-    decodes, which is what a deployed codebook must be.  ``FLOAT`` leaves
-    them at full precision, which is how NormalFloat and its relatives are
-    defined before anything projects them onto hardware -- useful for
-    measuring what the projection itself costs, and for a format whose
-    levels are stored as floats.
-    """
-
-    INTEGER = "integer"
-    FLOAT = "float"
-
-
-def to_integer_codebook(values, quant_max, quant_min=None):
-    """Project float levels onto distinct integers, endpoints pinned.
-
-    The block maximum always lands on the outermost level, so both endpoints
-    are forced to the range ends.
-
-    Args:
-        values: Candidate levels, any order.
-        quant_max: Largest representable magnitude.
-        quant_min: Smallest representable value, or None for the symmetric
-            ``-quant_max``.  Zero for a tensor that is never negative, whose
-            codebook would otherwise spend half its levels on values that
-            cannot occur.
-
-    Returns:
-        Sorted list of distinct integers of the same length as ``values``.
-
-    Raises:
-        ValueError: The range holds fewer integers than there are levels.
-    """
-    low = int(-quant_max if quant_min is None else quant_min)
-    high = int(quant_max)
-    if len(values) > high - low + 1:
-        raise ValueError(
-            f"{len(values)} levels cannot be distinct integers in "
-            f"[{low}, {high}], which holds only {high - low + 1}"
-        )
-    # Ascending, each level at least one above the last, so a crowd rounding
-    # onto the same integer spreads upwards instead of collapsing.
-    out = []
-    for value in sorted(int(round(v)) for v in values):
-        out.append(max(value, low if not out else out[-1] + 1))
-    # Spreading upwards can run past the top, so walk back down leaving room
-    # for the levels above.  Both endpoints sit on the range ends: the block
-    # maximum always lands on the outermost level.
-    for index in reversed(range(len(out))):
-        out[index] = min(out[index], high - (len(out) - 1 - index))
-    out[0], out[-1] = low, high
-    return out
-
-
-def normal_float_levels(k, quant_max, grid=CodebookGrid.INTEGER):
-    """Return NormalFloat's levels, scaled to the codebook's range.
-
-    Args:
-        k: Number of levels; NormalFloat is defined for a power of two.
-        quant_max: Magnitude the outermost level sits at.
-        grid: Whether to project onto integers or keep full precision.
-
-    Returns:
-        ``k`` ascending distinct levels, the seed every fit starts from.
-    """
-    levels = (create_normal_map(k=int(math.log2(k))) * quant_max).tolist()
-    if grid is CodebookGrid.FLOAT:
-        return levels
-    return to_integer_codebook(levels, quant_max, -quant_max)
 
 
 def codebook_qmap(entries, device=None):
     """Build the 65536-entry bf16 lookup table a fake-quant consumes.
 
     Args:
-        entries: The codebook's integers.
+        entries: The codebook's entries.
         device: Where to build the table.
 
     Returns:
@@ -235,22 +173,15 @@ def codebook_qmap(entries, device=None):
     return codebook[index].to(torch.bfloat16)
 
 
-def optimal_codebook(
-    histogram,
-    k,
-    pin_zero=False,
-    grid=CodebookGrid.INTEGER,
-    resolution=FLOAT_RESOLUTION,
-):
+def optimal_codebook(histogram, k, pin_zero=False):
     """Return the globally optimal codebook, by dynamic programming.
 
-    Levels are ``k`` distinct candidates in ``[quant_min, quant_max]`` --
-    every integer, or ``resolution`` points across the range -- and
-    nearest-neighbour assignment puts the boundary between two chosen levels
-    at their midpoint.  Cluster membership is therefore an interval, which
-    makes the exact minimizer of the weighted squared error a shortest path
-    over ``(previous level, current level)`` states -- no initialization, no
-    local minima.
+    Levels are ``k`` distinct candidates from the histogram's ``levels``,
+    and nearest-neighbour assignment puts the boundary between two chosen
+    levels at their midpoint.  Cluster membership is therefore an interval,
+    which makes the exact minimizer of the weighted squared error a shortest
+    path over ``(previous level, current level)`` states -- no
+    initialization, no local minima.
 
     Args:
         histogram: Accumulated weighted moments of the tensor's
@@ -258,53 +189,38 @@ def optimal_codebook(
             pins the zero level, so ``pin_zero`` has nothing left to do and
             is ignored.
         k: Number of levels.
-        grid: Whether a level may sit only on an integer or anywhere in the
-            range at full precision.
-        resolution: Candidates spanning the range on the float grid.  The
-            search holds a cube of them, so its cost and memory grow as the
-            cube; unused on the integer grid, whose candidates are fixed.
         pin_zero: Force the level ``0`` into the codebook.  Minimizing
             squared error alone almost always spends that level
             elsewhere, which leaves a block's many small values unable
             to quantize to zero.
 
     Returns:
-        The optimal codebook as ``k`` ascending distinct levels.
+        The optimal codebook as ``k`` ascending distinct levels, integers
+        when every candidate is one.
 
     Raises:
-        ValueError: Fewer candidates in the range than levels asked for, so
-            no codebook of this size exists on this grid.
+        ValueError: Fewer candidates than levels asked for, so no codebook
+            of this size exists on this grid.
         RuntimeError: The shortest path did not reconstruct to ``k``
             distinct levels, which is a defect in the search rather than a
             property of the data.
     """
-    quant_min, quant_max = histogram.quant_min, histogram.quant_max
-    bins = histogram.bins
-    candidates = (
-        int(quant_max) - int(quant_min) + 1
-        if grid is CodebookGrid.INTEGER
-        else resolution
-    )
-    if k > candidates:
+    levels = histogram.levels
+    n = levels.size
+    if k > n:
         raise ValueError(
-            f"a {k}-level codebook cannot be drawn from the {candidates} "
-            f"candidates in [{quant_min}, {quant_max}]"
+            f"a {k}-level codebook cannot be drawn from the {n} candidates "
+            f"in [{histogram.quant_min}, {histogram.quant_max}]"
         )
+    # A codebook of integers reads as the entries the hardware stores.
+    as_entry = int if np.array_equal(levels, np.round(levels)) else float
     if k <= 2:
         # Both endpoints are pinned, so there is nothing left to choose.
-        ends = [float(quant_min), float(quant_max)][:k]
-        if grid is CodebookGrid.FLOAT:
-            return ends
-        return to_integer_codebook(ends, quant_max, quant_min)
+        return [as_entry(level) for level in (levels[0], levels[-1])][:k]
+    bins = histogram.bins
     edges = histogram.edges()
     cum_w, cum_s, cum_q = histogram.cumulative()
 
-    levels = (
-        np.arange(int(quant_min), int(quant_max) + 1)
-        if grid is CodebookGrid.INTEGER
-        else np.linspace(quant_min, quant_max, resolution)
-    )
-    n = levels.size
     midpoint = (levels[:, None] + levels[None, :]) / 2.0
     at = np.clip(
         np.searchsorted(edges, midpoint.ravel(), side="right") - 1, 0, bins
@@ -376,15 +292,13 @@ def optimal_codebook(
         flag = int(flag_choice[flag, prev, cur])
         chosen.append(step_back)
         prev, cur = step_back, prev
-    chosen = sorted({float(levels[i]) for i in chosen})
+    chosen = sorted({as_entry(levels[i]) for i in chosen})
     if len(chosen) != k:
         raise RuntimeError(
             f"the search returned {len(chosen)} distinct levels for a "
             f"{k}-level codebook"
         )
-    if grid is CodebookGrid.FLOAT:
-        return chosen
-    return to_integer_codebook(chosen, quant_max, quant_min)
+    return chosen
 
 
 def _contraction_last(tensor, ch_axis):
@@ -743,7 +657,7 @@ def install_codebook(module, levels, counts=None):
 
     Args:
         module: The fake-quant the levels belong to.
-        levels: One table of integers, or one table per grid cell in
+        levels: One table of entries, or one table per grid cell in
             row-major order when ``counts`` is given.
         counts: How many tables along each operand axis, for a grid of
             them.  None installs ``levels`` as the tensor's one table.
@@ -987,6 +901,8 @@ def fit_codebooks(
     quantized_inputs=False,
     dump=None,
     histograms=None,
+    max_levels=None,
+    resolution=FLOAT_RESOLUTION,
 ):
     """Fit a codebook to every tensor a prepared model quantizes, in place.
 
@@ -1027,6 +943,10 @@ def fit_codebooks(
         dump: Path to write the fitted tables to, as JSON.
         histograms: Dict filled with ``name -> accumulated histograms``,
             one per table the tensor is fitted.  Fresh by default.
+        max_levels: Fit at most this many levels per table.  None fills the
+            index, and a table never holds more levels than its grid.
+        resolution: Candidates across the range for a table whose entries
+            keep the model's dtype, and so have no grid of their own.
 
     Returns:
         ``name -> the fitted levels`` for every tensor fitted: one table
@@ -1145,13 +1065,26 @@ def fit_codebooks(
             # A tensor that never went negative -- a softmax output -- would
             # spend half its levels on values that cannot occur.  The floor
             # is read off the whole tensor in the pass before this one.
-            floor = floors[name].item()
-            histograms[name] = [
-                Histogram(
-                    0.0 if floor >= 0 else -module.quant_max, module.quant_max
-                )
-                for _ in cells
+            low = 0.0 if floors[name].item() >= 0 else -module.quant_max
+            if module.code_dtype is None:
+                # The fake-quant's table holds bfloat16 entries, so the
+                # candidates are bfloat16 values spread across the range; a
+                # signed range is mirrored about zero so it holds an exact 0.
+                if low < 0:
+                    half = torch.linspace(
+                        0, module.quant_max, resolution // 2 + 1
+                    )
+                    spread = torch.cat([-half.flip(0)[:-1], half])
+                else:
+                    spread = torch.linspace(0, module.quant_max, resolution)
+                candidates = spread.bfloat16().float().unique()
+            else:
+                candidates = entry_levels(module.code_dtype)
+            candidates = candidates.double().numpy()
+            candidates = candidates[
+                (candidates >= low) & (candidates <= module.quant_max)
             ]
+            histograms[name] = [Histogram(candidates) for _ in cells]
         energy = None
         # The operand's own loss-gradient sensitivity, not a partner's.
         # Only a Fisher mode fills that dict, so membership is the test.
@@ -1359,14 +1292,11 @@ def fit_codebooks(
             continue
         if group[0].quant_min == 0.0:
             unsigned.append(name)
-        # How many levels there are is the dtype's to say, and what the
-        # module already carries says it: a lookup table by how many
-        # distinct entries it holds, a codebook by its width.
-        k = (
-            int(torch.unique(module.qmap).numel())
-            if module.qmap.numel() == QMAP_SIZE and module.qmap.dim() == 1
-            else module.qmap.shape[-1]
-        )
+        # The index addresses 2**index_bits entries, and the grid can hold
+        # fewer.
+        k = min(2**module.index_bits, group[0].levels.size)
+        if max_levels is not None:
+            k = min(k, max_levels)
         fitted = [
             optimal_codebook(histogram, k=k, pin_zero=pin_zero)
             for histogram in group

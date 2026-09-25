@@ -66,8 +66,8 @@ SCHEME_ARGS = {
         "--bf16 --layout_policy systolic"
     ),
     "MXNF4": (
-        "--activation nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 "
-        "--weight nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
+        "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
+        "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --layout_policy systolic "
         "--scratchpad_size 2097152 --num_banks 16 --conv2d_im2col"
     ),

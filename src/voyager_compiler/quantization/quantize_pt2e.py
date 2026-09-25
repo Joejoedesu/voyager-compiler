@@ -1,9 +1,7 @@
 import copy
 import logging
-import math
 import operator
 import os
-import re
 from collections import OrderedDict
 from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -477,9 +475,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         per_head = table.dim() > 1
         values = table if per_head else torch.unique(table)
 
-        level_bits = re.fullmatch(r".*_(\d+)", activation_post_process.dtype)
         activation_post_process.dtype = (
-            f"int{math.ceil(math.log2(values.shape[-1]))}"
+            f"int{activation_post_process.index_bits}"
         )
         # A lookup table answers with the index directly, since it is
         # indexed by the value itself.  A codebook stays the levels, and
@@ -491,10 +488,17 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             if per_head
             else torch.searchsorted(values, table).to(torch.int64)
         )
+        # Entries without a dtype of their own are stored in the model's, and
+        # a graph with no parameters keeps the table's.  The midpoints are
+        # taken from the levels as fitted.
+        entries = values
+        parameter = next(iter(model.parameters()), None)
+        if activation_post_process.code_dtype is None and parameter is not None:
+            entries = values.to(parameter.dtype)
 
         with graph.inserting_before(node):
             dequant_code = create_getattr_from_value(
-                model, graph, "code", values
+                model, graph, "code", entries
             )
             if input_node.op != "get_attr":
                 midpoints = (values[..., :-1] + values[..., 1:]) / 2
@@ -502,8 +506,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     model, graph, "code", midpoints
                 )
 
-        if level_bits is not None:
-            dequant_code.meta["dtype"] = f"int{level_bits.group(1)}"
+        if activation_post_process.code_dtype is not None:
+            dequant_code.meta["dtype"] = activation_post_process.code_dtype
 
     get_attr_node = scale_qmap = None
     if input_node.op == "get_attr":

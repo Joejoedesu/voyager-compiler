@@ -318,7 +318,7 @@ def main_worker(gpu, ngpus_per_node, args):
         quantizer.set_module_name("fc", None)
 
         # if args.activation is not None and "microscaling" in args.activation:
-        #     import re
+        #     from voyager_compiler.quantization import parse_codebook_dtype
         #     from voyager_compiler import (
         #         QuantizationConfig,
         #         QuantizationSpec,
@@ -327,9 +327,8 @@ def main_worker(gpu, ngpus_per_node, args):
         #     )
 
         #     dtype = args.activation.split(",")[0]
-        #     if (match := re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype)):
-        #         bits = int(match.group(1))
-        #         dtype = f"int{bits}"
+        #     if (codebook := parse_codebook_dtype(dtype)) is not None:
+        #         dtype = f"int{codebook[0]}"
         #     qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
 
         #     bias_qspec = DerivedQuantizationSpec(

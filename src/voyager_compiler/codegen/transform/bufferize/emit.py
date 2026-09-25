@@ -323,7 +323,7 @@ def _is_index_vector(node) -> bool:
 
 
 def _dtype_str(node) -> str:
-    """The logical (quantized) dtype the bufferizer derived (``nf4_6``,
+    """The logical (quantized) dtype the bufferizer derived (``int4``,
     ``fp8_e5m3``) when there is one, else the physical torch dtype."""
     dtype = node.meta.get("dtype")
     if isinstance(dtype, str):
@@ -1395,7 +1395,7 @@ def gen_compute_graph(
 # ===========================================================================
 
 # Short names for the builtin torch dtypes used in the ``<shape x dtype>``
-# annotation (custom quantized dtypes carry their own string, e.g. ``nf4_6``,
+# annotation (custom quantized dtypes carry their own string, e.g. ``int6``,
 # used verbatim).
 _DTYPE_SHORT = {
     torch.float32: "f32",
@@ -1417,7 +1417,7 @@ def _type_str(node) -> str:
     unknown).
 
     The dtype is the custom (quantized) ``meta['dtype']`` string (e.g.
-    ``nf4_6``) used verbatim when set, else a short name for the builtin torch
+    ``int6``) used verbatim when set, else a short name for the builtin torch
     dtype (``f32`` / ``bf16`` / ...).  ``space`` is ``meta['space']`` (``DRAM``
     / ``Scratchpad``) from the bufferize pass.  Shapes come from the node's
     ShapeProp ``value`` or, inside loop bodies, the exported ``meta['val']``.

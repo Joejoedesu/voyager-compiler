@@ -19,32 +19,32 @@ BLOCKING = "qs=microscaling,bs=64"
 # named `_scale_bf16` is the one that leaves the scale alone.
 MICROSCALING = f"{BLOCKING},scale=fp8_e5m3"
 
-# MXNF4: 4-bit NormalFloat decoded to a 6-bit integer codebook.
-MXNF4_SPEC = f"nf4_6,{MICROSCALING},ax=-1"
-MXNF4_VALUE_SPEC = f"nf4_6,{MICROSCALING},ax=-2"
+# MXNF4: a 4-bit index into 16 int6 entries, seeded with NormalFloat.
+MXNF4_SPEC = f"lut4_to_int6,{MICROSCALING},ax=-1"
+MXNF4_VALUE_SPEC = f"lut4_to_int6,{MICROSCALING},ax=-2"
 
 # Plain 6-bit integers, which the attention operands carry in the variants
 # that quantize them separately from the linears.
 INT6_SPEC = f"int6,{MICROSCALING},ax=-1"
 INT6_VALUE_SPEC = f"int6,{MICROSCALING},ax=-2"
 
-# Plain integers, fp4 and NormalFloat with the block scale a power of two
-# (``fp8_e8m0``); the arms in ``POWER_OF_TWO_SCALE`` build their quantizer
-# with that flag.
+# Plain integers, fp4 and the int6 lookup table with the block scale a
+# power of two (``fp8_e8m0``); the arms in ``POWER_OF_TWO_SCALE`` build
+# their quantizer with that flag.
 INT8_SPEC = f"int8,{BLOCKING},ax=-1"
 INT8_VALUE_SPEC = f"int8,{BLOCKING},ax=-2"
 INT4_SPEC = f"int4,{BLOCKING},ax=-1"
 INT4_VALUE_SPEC = f"int4,{BLOCKING},ax=-2"
 FP4_SPEC = f"fp4_e2m1,{BLOCKING},ax=-1"
 FP4_VALUE_SPEC = f"fp4_e2m1,{BLOCKING},ax=-2"
-NF4_SPEC = f"nf4_6,{BLOCKING},ax=-1"
-NF4_VALUE_SPEC = f"nf4_6,{BLOCKING},ax=-2"
+NF4_SPEC = f"lut4_to_int6,{BLOCKING},ax=-1"
+NF4_VALUE_SPEC = f"lut4_to_int6,{BLOCKING},ax=-2"
 
-# 8-bit integer activations beside 4-bit NormalFloat weights decoded to an
-# 8-bit integer codebook.
+# 8-bit integer activations beside 4-bit lookup-table weights with int8
+# entries.
 MXINT8_ACT_SPEC = f"int8,{MICROSCALING},ax=-1"
 MXINT8_VALUE_SPEC = f"int8,{MICROSCALING},ax=-2"
-MXNF4_INT8_SPEC = f"nf4_8,{MICROSCALING},ax=-1"
+MXNF4_INT8_SPEC = f"lut4_to_int8,{MICROSCALING},ax=-1"
 
 QUANTIZATION_CONFIGS = {}
 
@@ -101,9 +101,7 @@ QUANTIZATION_CONFIGS["w16a4"] = {
     torch.ops.aten.matmul.default: [MXNF4_SPEC, MXNF4_VALUE_SPEC],
 }
 
-# Attention operands at int6 rather than NormalFloat.  The linears here keep
-# NormalFloat's float levels (`nf4`), not the int6 projection every other
-# config deploys.
+# Attention operands at plain int6 rather than through the lookup table.
 QUANTIZATION_CONFIGS["mxnf4_attn_int6"] = {
     torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
     torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],

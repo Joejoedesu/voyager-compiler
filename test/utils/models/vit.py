@@ -1,4 +1,3 @@
-import re
 import torch
 from tqdm import tqdm
 
@@ -24,6 +23,7 @@ from voyager_compiler.codegen import (
     remove_softmax_dtype_cast,
     remove_zero_attention_mask,
 )
+from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.quantization.quantize import get_conv_bn_layers
 
 from .utils import get_compile_args, get_transform_args
@@ -110,18 +110,21 @@ def quantize_and_dump_model(
 
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        match = re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype, re.IGNORECASE)
-        if match is not None and match.group(2) is not None:
-            dtype = f"int{match.group(2)}"
-        qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
-
-        bias_qspec = DerivedQuantizationSpec(
-            derived_from=None,
-            derive_qparams_fn=derive_bias_qparams_fn,
-            dtype=None,
-        )
-
-        qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
+        # A lookup table's layer takes its entry dtype, and stays unquantized
+        # when the entries keep the model's.
+        if (codebook := parse_codebook_dtype(dtype)) is not None:
+            dtype = codebook[1]
+        qconfig = None
+        if dtype is not None:
+            qspec = QuantizationSpec.from_str(
+                f"{dtype},qs=per_tensor_symmetric"
+            )
+            bias_qspec = DerivedQuantizationSpec(
+                derived_from=None,
+                derive_qparams_fn=derive_bias_qparams_fn,
+                dtype=None,
+            )
+            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
         quantizer.set_module_name(
             "^patch_embed.proj$"
             if timm_model

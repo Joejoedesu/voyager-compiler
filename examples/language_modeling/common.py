@@ -51,7 +51,7 @@ from voyager_compiler.codegen import (
 )
 from voyager_compiler.ops.quantized import decode, expand
 from voyager_compiler.quantization import load_codebooks
-from voyager_compiler.quantization.lcq import _quantized_operands
+from voyager_compiler.quantization.codebook_optimizer import _quantized_operands
 
 logger = logging.getLogger(__name__)
 

@@ -16,11 +16,12 @@ from voyager_compiler.quantization.dtypes import (
     quantize_to_posit,
 )
 from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
-from voyager_compiler.quantization.qspec import QScheme
+from voyager_compiler.quantization.qspec import QScheme, parse_codebook_dtype
 
 __all__ = [
     "FusedAmaxObsFakeQuantize",
     "_DerivedObserverOrFakeQuantize",
+    "entry_levels",
 ]
 
 
@@ -87,15 +88,34 @@ def get_quantization_map(dtype, device=None):
             values, int(nbits), int(es), round_to_even=True
         )
 
-    # NormalFloat by Tim Dettmers and adopted from the bitsandbytes library
-    # This data type returns two tensors: a mapping to the NF index, and
-    # a value map
-    if match := re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype):
-        nbits = int(match.group(1))
-        int_bits = int(match.group(2)) if match.group(2) else None
-        return quantize_to_nf(values, nbits, int_bits=int_bits)
+    # A lookup table, seeded with NormalFloat's levels on its entries' grid.
+    # It returns two tensors: the index each bit pattern maps to, and the
+    # entries.
+    if (codebook := parse_codebook_dtype(dtype)) is not None:
+        index_bits, entry = codebook
+        grid = None if entry is None else entry_levels(entry, device)
+        return quantize_to_nf(values, index_bits, grid=grid)
 
     raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def entry_levels(dtype, device=None):
+    """Return every value a lookup-table entry of ``dtype`` can hold.
+
+    The grid is symmetric, so an integer's extra negative value is left out:
+    ``int6`` spans [-31, 31], the range its ``quant_max`` gives.
+
+    Args:
+        dtype: The entry dtype, ``int<N>`` or ``fp<B>_e<X>m<Y>``.
+        device: Where to build the grid.
+
+    Returns:
+        The distinct values in ascending order, as float32, with one zero.
+    """
+    table = get_quantization_map(dtype, device).float()
+    levels = torch.unique(table[torch.isfinite(table)])
+    # ``torch.unique`` can keep -0 as the zero; adding 0 turns it into +0.
+    return levels[levels >= -levels.max()] + 0.0
 
 
 class FakeQuantizeFunction(torch.autograd.Function):
@@ -275,6 +295,9 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         quant_map = get_quantization_map(dtype, device)
         self.is_codebook_quantization = isinstance(quant_map, tuple)
         if self.is_codebook_quantization:
+            # The index width, and the dtype the entries are stored in, None
+            # when they keep the model's.
+            self.index_bits, self.code_dtype = parse_codebook_dtype(dtype)
             indices, values = quant_map
             quant_map = values[indices]
         self.register_buffer("qmap", quant_map, persistent=False)
