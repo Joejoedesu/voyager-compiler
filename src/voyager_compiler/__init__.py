@@ -79,7 +79,10 @@ from voyager_compiler.ops.layout import (
 )
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
+    DirectCastFakeQuantize,
     FusedAmaxObsFakeQuantize,
+    GroupWiseAffineFakeQuantize,
+    MXFakeQuantize,
     QConfig,
     QScheme,
     QuantizationConfig,
@@ -87,6 +90,8 @@ from voyager_compiler.quantization import (
     convert,
     convert_pt2e,
     derive_bias_qparams_fn,
+    freeze_cache_reads,
+    freeze_weights,
     get_default_quantizer,
     get_qconfig,
     prepare,
@@ -97,8 +102,6 @@ from voyager_compiler.quantization import (
     sink_obs_or_fq,
 )
 from voyager_compiler.quantization.dtypes import (
-    quantize_to_fp8_e4m3,
-    quantize_to_fp8_e5m2,
     quantize_to_nf,
     quantize_to_posit,
 )
@@ -113,7 +116,10 @@ from voyager_compiler.utils import with_execution_context
 __all__ = [
     "AcceleratorConfig",
     "DerivedQuantizationSpec",
+    "DirectCastFakeQuantize",
     "FusedAmaxObsFakeQuantize",
+    "GroupWiseAffineFakeQuantize",
+    "MXFakeQuantize",
     "OpMatcher",
     "QConfig",
     "QScheme",
@@ -132,6 +138,8 @@ __all__ = [
     "export_model",
     "extract_input_preprocessor",
     "fetch_attr",
+    "freeze_cache_reads",
+    "freeze_weights",
     "fuse_dequantize_quantize",
     "fuse_operator",
     "get_aten_graph_module",
@@ -147,8 +155,6 @@ __all__ = [
     "propagate_config",
     "propagate_shape",
     "quantize",
-    "quantize_to_fp8_e4m3",
-    "quantize_to_fp8_e5m2",
     "quantize_to_nf",
     "quantize_to_posit",
     "remove_softmax_dtype_cast",

@@ -534,7 +534,6 @@ def main(args):
             args.decode_qconfig,
             args.kivi,
             args.residual_length,
-            args.bake,
             args.codebooks,
             cache_len,
             device,
@@ -552,7 +551,6 @@ def main(args):
     tag = [args.qconfig] if args.qconfig else []
     tag += [f"decode-{args.decode_qconfig}"] if args.decode_qconfig else []
     tag += ["kivi"] if args.kivi else []
-    tag += ["baked"] if args.bake else []
     output_dir = args.output_dir or os.path.join(
         "pred_e" if args.e else "pred",
         "-".join([args.model_id.rstrip("/").split("/")[-1], *tag]),

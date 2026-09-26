@@ -2,9 +2,9 @@
 
 Model loading, the CLI options every script takes, sliding-window
 perplexity, greedy prompt completion for the LongBench scripts, and the
-quantized generator: the compiler's prefill and decode graphs, converted
-with ``convert_pt2e`` and driven through a greedy loop behind an HF-style
-``generate``.
+quantized generator: the compiler's prefill and decode graphs, prepared
+with their weights and KV-cache reads frozen, driven through a greedy loop
+behind an HF-style ``generate``.
 """
 
 import json
@@ -35,11 +35,9 @@ from quantization_configs import (
     set_residual_attention_qconfig,
 )
 from voyager_compiler import (
-    ShapeProp,
-    convert_pt2e,
     export_model,
-    fetch_attr,
-    fuse_quantize_dequantize_with_producer,
+    freeze_cache_reads,
+    freeze_weights,
     get_default_quantizer,
     prepare_pt2e,
     sink_obs_or_fq,
@@ -49,7 +47,6 @@ from voyager_compiler.codegen import (
     remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
 )
-from voyager_compiler.ops.quantized import decode, expand
 from voyager_compiler.quantization import load_codebooks
 from voyager_compiler.quantization.codebook_optimizer import _quantized_operands
 
@@ -242,6 +239,10 @@ ROTARY_SCOPE = r"model\.rotary_emb"
 # Prompt lengths the prefill graph is exported for come in blocks of this
 # many tokens: the microscaling block along the sequence axis.
 SEQ_BLOCK = 64
+# A prompt is padded to a multiple of this many tokens, so the prefill
+# graph meets few lengths: its fake-quants compile once per length.  The
+# padding sits after the prompt, where the causal mask hides it.
+PROMPT_BUCKET = 512
 
 
 def add_quantization_args(parser):
@@ -277,14 +278,6 @@ def add_quantization_args(parser):
         help=(
             "Positions of the KIVI cache kept in full precision while their "
             "chunk fills; a multiple of the 64-token group"
-        ),
-    )
-    parser.add_argument(
-        "--bake",
-        action="store_true",
-        help=(
-            "Bake the KIVI cache: quantize each chunk once as it completes "
-            "instead of the whole cache on every step (same numerics)"
         ),
     )
     parser.add_argument(
@@ -413,57 +406,6 @@ def build_decode(model, quantizer, quantized, split, kivi, cache_len):
     return gm
 
 
-def bake_kv_cache(gm, device):
-    """Bake the split KV caches of a converted decode graph.
-
-    The compiler's fold pass replaces each main cache with buffers of
-    codes and parameters read through a dequantize, so the per-step
-    quantize of the whole cache is gone.  The chunk fold it emits is a
-    ``torch.cond`` whose branch quantizes the residual into those buffers
-    at the chunk's entries; a CUDA graph cannot capture it, so the conds
-    are removed and their branches returned for ``StaticCacheGenerator``
-    to call.
-
-    Args:
-        gm: Converted decode graph, its caches split and empty.
-        device: Where the graph runs.
-
-    Returns:
-        One ``(branch, operands)`` per cache: the branch module and, per
-        operand, ``("attr", name)`` for a buffer of ``gm`` or ``("chunk",)``
-        for the index of the chunk being folded.
-    """
-    ShapeProp(gm).propagate(
-        torch.tensor([[1]], device=device), torch.tensor([0], device=device)
-    )
-    fuse_quantize_dequantize_with_producer(gm)
-    folds = []
-    for node in list(gm.graph.nodes):
-        if node.target is not torch.ops.higher_order.cond:
-            continue
-        if node.users:
-            raise RuntimeError(f"the fold {node} has users: {node.users}")
-        operands = []
-        for operand in node.args[3]:
-            if operand.op == "get_attr":
-                operands.append(("attr", operand.target))
-            elif operand.target is torch.ops.aten.index_copy_.default:
-                # The residual after the token's write: the buffer itself.
-                operands.append(("attr", operand.args[0].target))
-            elif operand.target is torch.ops.aten._local_scalar_dense.default:
-                operands.append(("chunk",))
-            else:
-                raise RuntimeError(f"unexpected fold operand {operand}")
-        folds.append((getattr(gm, node.args[1].target), operands))
-        gm.graph.erase_node(node)
-    gm.graph.eliminate_dead_code(
-        is_impure_node=lambda n: n.op in {"placeholder", "output"}
-        or n.target is torch.ops.aten.index_copy_.default
-    )
-    gm.recompile()
-    return folds
-
-
 def install_codebooks(prefill, decode, path):
     """Install fitted tables into both prepared graphs.
 
@@ -494,8 +436,9 @@ class StaticCacheGenerator:
     On a GPU the decode step is captured once as a CUDA graph over static
     input and output tensors and replayed from then on, which takes the
     Python and launch overhead of its few thousand nodes off every token.
-    Capture waits for ``replay`` to be set after conversion: the prepared
-    graph's fake-quants are not capturable.
+    A split cache's main half is written here, not by the decode graph:
+    each chunk as its residual fills, then ``refresh`` recomputes what the
+    graph reads from the main caches (``freeze_cache_reads``).
 
     Args:
         prefill: Graph returning ``(logits, cache)`` for a prompt whose
@@ -505,7 +448,10 @@ class StaticCacheGenerator:
         cache_len: Slots in the decode cache.
         residual_length: Slots in the decode graph's KIVI residual buffers,
             or ``None`` when its caches are not split.
-        pad_token_id: Token the prompt is padded with up to the next block.
+        refresh: What ``freeze_cache_reads`` returned for the decode
+            graph's main caches, or ``None`` when they are not split.
+        pad_token_id: Token the prompt is padded with, up to the next
+            multiple of ``PROMPT_BUCKET``.
         eos_token_ids: Tokens that end generation unless ``generate`` is
             given others.
         device: Where both graphs live.
@@ -517,6 +463,7 @@ class StaticCacheGenerator:
         decode,
         cache_len,
         residual_length,
+        refresh,
         pad_token_id,
         eos_token_ids,
         device,
@@ -525,6 +472,7 @@ class StaticCacheGenerator:
         self.decode = decode
         self.cache_len = cache_len
         self.residual_length = residual_length
+        self.refresh = refresh
         self.pad_token_id = pad_token_id
         self.eos_token_ids = eos_token_ids
         self.device = device
@@ -534,52 +482,30 @@ class StaticCacheGenerator:
         self.prefill_seconds = 0.0
         self.tokens = 0
         self.decode_seconds = 0.0
-        self.folds = []
-        self.baked_state = []
-
-    @property
-    def baked(self):
-        return bool(self.folds)
-
-    def install_folds(self, folds):
-        """Take the chunk folds ``bake_kv_cache`` returned, holding their
-        operand buffers by object -- the graph may drop the names later --
-        and remember the baked buffers' empty state for ``load_cache``."""
-        self.folds = []
-        self.baked_state = []
-        for branch, operands in folds:
-            args = []
-            for operand in operands:
-                if operand[0] == "chunk":
-                    args.append(None)
-                    continue
-                buffer = self.decode.get_buffer(operand[1])
-                args.append(buffer)
-                if "cache" in operand[1]:
-                    self.baked_state.append((buffer, buffer.clone()))
-            self.folds.append((branch, args))
 
     def fold(self, chunk):
-        """Quantize every residual into chunk ``chunk`` of its baked cache:
-        the branches the decode step's own folds would have run."""
-        for branch, args in self.folds:
-            branch(*(chunk if a is None else a for a in args))
+        """Copy every residual into chunk ``chunk`` of its main cache, the
+        write the decode graph leaves to the caller, and recompute what the
+        graph reads from the main caches."""
+        start = chunk * self.residual_length
+        for name, residual in self.decode.named_buffers():
+            if name.endswith("_residual"):
+                main = self.decode.get_buffer(name[: -len("_residual")])
+                main[:, :, start : start + self.residual_length] = residual
+        self.refresh()
 
     def load_cache(self, cache, length):
         """Copy the first ``length`` positions of a prefilled cache into the
         decode graph's buffers, zeroing the slots beyond them.  A split
-        cache takes its completed chunks, quantized into the baked buffers
-        when the cache is baked; the tail goes to the residual."""
+        cache takes its completed chunks; the tail goes to the residual."""
         done = length
         if self.residual_length is not None:
             done = length // self.residual_length * self.residual_length
         for layer, entry in enumerate(cache.layers):
             for kind, tensor in (("key", entry.keys), ("value", entry.values)):
-                name = f"{kind}_cache_{layer}"
-                if not self.baked:
-                    buffer = self.decode.get_buffer(name)
-                    buffer.zero_()
-                    buffer[:, :, :done] = tensor[:, :, :done]
+                buffer = self.decode.get_buffer(f"{kind}_cache_{layer}")
+                buffer.zero_()
+                buffer[:, :, :done] = tensor[:, :, :done]
                 if self.residual_length is None:
                     continue
                 residual = self.decode.get_buffer(
@@ -587,39 +513,8 @@ class StaticCacheGenerator:
                 )
                 residual.zero_()
                 residual[:, :, : length - done] = tensor[:, :, done:length]
-        if self.baked:
-            # Fold the prompt's completed chunks through the residuals, as
-            # decoding them would have, then put the tail back.
-            for buffer, state in self.baked_state:
-                buffer.copy_(state)
-            chunk_len = self.residual_length
-            for chunk in range(done // chunk_len):
-                for layer, entry in enumerate(cache.layers):
-                    for kind, tensor in (
-                        ("key", entry.keys),
-                        ("value", entry.values),
-                    ):
-                        residual = self.decode.get_buffer(
-                            f"{kind}_cache_{layer}_residual"
-                        )
-                        residual.copy_(
-                            tensor[
-                                :,
-                                :,
-                                chunk * chunk_len : (chunk + 1) * chunk_len,
-                            ]
-                        )
-                self.fold(chunk)
-            for layer, entry in enumerate(cache.layers):
-                for kind, tensor in (
-                    ("key", entry.keys),
-                    ("value", entry.values),
-                ):
-                    residual = self.decode.get_buffer(
-                        f"{kind}_cache_{layer}_residual"
-                    )
-                    residual.zero_()
-                    residual[:, :, : length - done] = tensor[:, :, done:length]
+        if self.refresh is not None:
+            self.refresh()
 
     def capture(self, token, position):
         """Capture one decode step as a CUDA graph.  The warmup steps it
@@ -653,8 +548,8 @@ class StaticCacheGenerator:
 
     def step(self, token, position):
         """Write ``token`` at ``position`` and return the next logits.  On
-        a baked cache the chunk ``position`` completes is folded after the
-        step, as the graph's own fold would have done."""
+        a split cache the chunk ``position`` completes is folded after the
+        step."""
         if self.device.type != "cuda" or not self.replay:
             out = self.decode(
                 input_ids=torch.tensor([[token]], device=self.device),
@@ -669,8 +564,9 @@ class StaticCacheGenerator:
             with torch.cuda.device(self.device):
                 self.graph.replay()
             logits = self.static_logits
-        if self.baked and position % self.residual_length == (
-            self.residual_length - 1
+        if (
+            self.refresh is not None
+            and position % self.residual_length == self.residual_length - 1
         ):
             self.fold(position // self.residual_length)
         return logits
@@ -706,7 +602,10 @@ class StaticCacheGenerator:
                 f"{length} prompt + {max_new_tokens} new tokens exceed the "
                 f"{self.cache_len}-slot cache"
             )
-        padded = -(-length // SEQ_BLOCK) * SEQ_BLOCK
+        padded = min(
+            -(-length // PROMPT_BUCKET) * PROMPT_BUCKET,
+            self.cache_len // SEQ_BLOCK * SEQ_BLOCK,
+        )
         prompt = torch.nn.functional.pad(
             input_ids, (0, padded - length), value=self.pad_token_id
         )
@@ -744,77 +643,6 @@ class StaticCacheGenerator:
         )
 
 
-def predecode_weights(gm, shared):
-    """Decode each constant weight a ``linear_mx`` reads once, in place of
-    the decode and scale multiply it would otherwise run on every call.
-
-    ``linear_mx`` uses a weight as is when given no code and no scale, so
-    the arithmetic is unchanged.  A weight whose decoded tensor equals one
-    already in ``shared`` -- the other graph's, under the same name with the
-    leading ``model_`` scopes stripped -- is pointed at that tensor.
-
-    Args:
-        gm: Converted graph, rewritten in place.
-        shared: ``name -> decoded tensor``; extended with the new ones.
-
-    Returns:
-        ``(decoded, reused)`` counts.
-    """
-    target = torch.ops.quantized_ops.linear_mx.default
-    decoded = reused = 0
-    for node in list(gm.graph.nodes):
-        if node.target is not target:
-            continue
-        weight = node.args[1]
-        scale = node.kwargs.get("weight_scale")
-        code = node.kwargs.get("weight_code")
-        constants = [weight, scale] + ([code] if code is not None else [])
-        if scale is None or any(c.op != "get_attr" for c in constants):
-            continue
-        value = fetch_attr(gm, weight.target)
-        if code is not None:
-            value = decode(value, fetch_attr(gm, code.target))
-        value = value * expand(
-            fetch_attr(gm, scale.target), value.shape, node.kwargs["block_size"]
-        )
-        name = f"{weight.target}_decoded"
-        key = name
-        while key.startswith("model_"):
-            key = key[len("model_") :]
-        twin = shared.get(key)
-        if twin is not None and torch.equal(twin, value):
-            value = twin
-            reused += 1
-        else:
-            shared[key] = value
-            decoded += 1
-        gm.register_buffer(name, value)
-        with gm.graph.inserting_before(node):
-            replacement = gm.graph.get_attr(name)
-        node.args = (node.args[0], replacement, *node.args[2:])
-        node.kwargs = {
-            k: v
-            for k, v in node.kwargs.items()
-            if k not in ("weight_scale", "weight_code")
-        }
-    gm.graph.eliminate_dead_code()
-    gm.recompile()
-    return decoded, reused
-
-
-def drop_unreferenced_tensors(gm):
-    """Delete the parameters and buffers no ``get_attr`` reads any more:
-    the raw weights ``convert_pt2e`` replaced and the codes and scales
-    ``predecode_weights`` folded."""
-    referenced = {n.target for n in gm.graph.nodes if n.op == "get_attr"}
-    tensors = list(gm.named_parameters()) + list(gm.named_buffers())
-    for name, _ in tensors:
-        if name in referenced:
-            continue
-        owner, _, leaf = name.rpartition(".")
-        delattr(gm.get_submodule(owner) if owner else gm, leaf)
-
-
 @torch.no_grad()
 def build_generator(
     model_id,
@@ -823,19 +651,20 @@ def build_generator(
     decode_qconfig,
     kivi,
     residual_length,
-    bake,
     codebooks,
     cache_len,
     device,
 ):
-    """Load the model, build and convert both graphs, and wrap them.
+    """Load the model, build and freeze both graphs, and wrap them.
 
     Exports the model twice: a prefill graph over a dynamic-length prompt
     that returns the KV cache, and a single-token decode graph over a
     static KV cache, quantized the way ``test_codegen.py``'s
     ``llama_prefill`` / ``llama_decode_kivi`` paths quantize them, except
-    that the softmax and layer norm stay unquantized.  Both are converted
-    with ``convert_pt2e`` and every weight is decoded once.
+    that the softmax and layer norm stay unquantized.  Both stay prepared:
+    every weight is fake-quantized once (``freeze_weights``), and what the
+    decode graph reads from a split cache's main half once per chunk
+    (``freeze_cache_reads``).
 
     Args:
         model_id: Hub id or local path of the checkpoint.
@@ -846,7 +675,6 @@ def build_generator(
         kivi: Quantize the decode KV cache to KIVI's 2-bit layout.
         residual_length: Positions of that cache kept in full precision
             while their chunk fills.
-        bake: Bake the split cache (``bake_kv_cache``).
         codebooks: JSON of fitted tables to install, or None.
         cache_len: Slots in the decode cache, a multiple of ``SEQ_BLOCK``
             covering the longest prompt plus generation.
@@ -895,26 +723,27 @@ def build_generator(
     )
     if codebooks:
         install_codebooks(prefill, decode, codebooks)
+    mark("freezing the weights")
+    freeze_weights(prefill, decode)
+    refresh = None
+    if split is not None:
+        caches = [
+            name[: -len("_residual")]
+            for name, _ in decode.named_buffers()
+            if name.endswith("_residual")
+        ]
+        refresh = freeze_cache_reads(decode, caches)
+        mark(f"froze the reads of {len(caches)} split caches")
     generator = StaticCacheGenerator(
         prefill,
         decode,
         cache_len,
         split,
+        refresh,
         tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_ids,
         device,
     )
-    mark("converting both graphs")
-    convert_pt2e(prefill)
-    convert_pt2e(decode)
-    if bake and split is not None:
-        generator.install_folds(bake_kv_cache(decode, device))
-        mark(f"baked {len(generator.folds)} KV caches")
-    shared = {}
-    for graph in (prefill, decode):
-        counts = predecode_weights(graph, shared)
-        drop_unreferenced_tensors(graph)
-        mark("%d weights decoded, %d reused from the other graph" % counts)
     del model
     generator.replay = device.type == "cuda"
     if device.type == "cuda":

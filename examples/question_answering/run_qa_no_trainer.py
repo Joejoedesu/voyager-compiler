@@ -800,7 +800,6 @@ def main(args):
         quantizer = get_default_quantizer(
             input_activation=args.activation,
             weight=args.weight,
-            record_histogram=args.record_histogram,
             force_scale_power_of_two=args.force_scale_power_of_two,
         )
         first_batch = next(iter(train_dataloader))

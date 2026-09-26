@@ -4,17 +4,18 @@ import operator
 import os
 from collections import OrderedDict
 from dataclasses import asdict, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
-from torch.fx import GraphModule, Node
+from torch.fx import Graph, GraphModule, Node
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 from torchao.quantization.pt2e.quantizer import (
     EdgeOrNode,
     QuantizationSpecBase,
 )
+from torchao.utils import _assert_and_get_unique_device
 
 from voyager_compiler.codegen.node_info import (
     get_arg_value,
@@ -26,8 +27,11 @@ from voyager_compiler.export_utils import (
     export_model,
 )
 from voyager_compiler.quantization.fake_quantize import (
-    FusedAmaxObsFakeQuantize,
+    DirectCastFakeQuantize,
+    GroupWiseAffineFakeQuantize,
+    MXFakeQuantize,
     _DerivedObserverOrFakeQuantize,
+    _FreezableFlags,
     get_quantization_map,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
@@ -50,9 +54,11 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
     """Create observer or fake quantize objects based on quantization spec
 
     Args:
-       quantization_spec: used to store parameters to create the observer or fake quantizer
-       obs_or_fq_map: this is a map from edge/output to the corresponding observer/fake_quant
-       instance, it may be reused for different edge/output depending on configuration
+       quantization_spec: used to store parameters to create the observer or
+           fake quantizer
+       obs_or_fq_map: this is a map from edge/output to the corresponding
+           observer/fake_quant instance, it may be reused for different
+           edge/output depending on configuration
     """
     if quantization_spec is None:
         return None
@@ -80,16 +86,17 @@ def _get_obs_or_fq_map(
     is_qat: bool,
 ) -> Dict[EdgeOrNode, ObserverOrFakeQuantize]:
     """Generates the EdgeOrNode to observer/fake_quant instances
-    Makes sure that for EdgeOrNode that has the same group_id should have the same observer or fake quant
-    instances
+    Makes sure that for EdgeOrNode that has the same group_id should have the
+    same observer or fake quant instances
     """
     obs_or_fq_map: Dict[EdgeOrNode, ObserverOrFakeQuantize] = {}
     group_id_to_obs_or_fq: Dict[int, ObserverOrFakeQuantize] = {}
     for edge_or_node, qspec in edge_or_node_to_qspec.items():
         group_id = edge_or_node_to_group_id[edge_or_node]
         if group_id not in group_id_to_obs_or_fq:
-            # TODO: maybe edge_or_node_to_qspec should be edge_or_node_to_root_qspec, this will simplify
-            # the implementation for _create_obs_or_fq_from_qspec
+            # TODO: maybe edge_or_node_to_qspec should be
+            # edge_or_node_to_root_qspec, this will simplify the implementation
+            # for _create_obs_or_fq_from_qspec
             group_id_to_obs_or_fq[group_id] = _create_obs_or_fq_from_qspec(
                 qspec, obs_or_fq_map, is_qat
             )
@@ -167,10 +174,9 @@ def get_per_channel_act_quantizer(
 def derive_bias_qparams_fn(
     obs_or_fqs: List[ObserverOrFakeQuantize],
 ) -> Tuple[Tensor, Tensor]:
-    assert (
-        len(obs_or_fqs) == 2
-    ), "Expecting two obs/fqs, one for activation and one for weight, got: {}".format(
-        len(obs_or_fqs)
+    assert len(obs_or_fqs) == 2, (
+        "Expecting two obs/fqs, one for activation and one for weight, "
+        "got: {}".format(len(obs_or_fqs))
     )
     act_obs_or_fq = obs_or_fqs[0]
     weight_obs_or_fq = obs_or_fqs[1]
@@ -184,50 +190,50 @@ def get_default_quantizer(
     output_activation: Optional[QuantizationSpec] = None,
     weight: Optional[QuantizationSpec] = None,
     bias: Optional[QuantizationSpec] = None,
-    record_histogram: bool = False,
     force_scale_power_of_two: bool = False,
     **kwargs: Any,
 ) -> XNNPACKQuantizer:
     """
-    Create a quantizer for the given activation and weight quantization specifications.
+    Create a quantizer for the given activation and weight quantization
+    specifications.
 
     Parameters:
     - activation: The quantization spec for activations.
     - weight: The quantization spec for weights.
-    - record_histogram: Whether to record histogram of input.
-    - force_scale_power_of_two: Whether to force the scaling factor to be a power of two.
+    - force_scale_power_of_two: Whether to force the scaling factor to be a
+      power of two.
 
     Returns:
     - A configured XNNPACKQuantizer.
     """
 
-    observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize.with_args(
-        record_histogram=record_histogram,
-        force_scale_power_of_two=force_scale_power_of_two,
-    )
+    def make_spec(spec_str):
+        spec = QuantizationSpec.from_str(spec_str)
+        spec.observer_or_fake_quant_ctr = (
+            spec.observer_or_fake_quant_ctr.with_args(
+                force_scale_power_of_two=force_scale_power_of_two,
+            )
+        )
+        return spec
 
     qschemes = []
     if input_activation is not None:
-        input_activation = QuantizationSpec.from_str(input_activation)
-        input_activation.observer_or_fake_quant_ctr = observer_or_fake_quant_ctr
+        input_activation = make_spec(input_activation)
         qschemes.append(input_activation.qscheme)
 
     if output_activation is not None:
-        output_activation = QuantizationSpec.from_str(output_activation)
-        output_activation.observer_or_fake_quant_ctr = (
-            observer_or_fake_quant_ctr
-        )
+        output_activation = make_spec(output_activation)
 
     if weight is not None:
-        weight = QuantizationSpec.from_str(weight)
-        weight.observer_or_fake_quant_ctr = observer_or_fake_quant_ctr
+        weight = make_spec(weight)
         qschemes.append(weight.qscheme)
 
     qschemes = [qs for qs in qschemes if qs is not None]
     if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
-        assert (
-            bias is not None
-        ), "Bias quantization is required when quantizing activations and weights."
+        assert bias is not None, (
+            "Bias quantization is required when quantizing activations and "
+            "weights."
+        )
 
     # We will specify derived_from later in the quantizer.
     # We use bias data type to imply the accumulation data type for the output.
@@ -284,7 +290,12 @@ def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
     if not isinstance(model, GraphModule):
         model = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
 
-    return prepare_pt2e(model, quantizer)
+    model = prepare_pt2e(model, quantizer)
+    # Both device lookups are memoized on the module they are given; the
+    # intermediate graph prepare passes in would keep every parameter alive.
+    assert_and_get_unique_device.cache_clear()
+    _assert_and_get_unique_device.cache_clear()
+    return model
 
 
 def _get_module(
@@ -354,10 +365,10 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         node.replace_all_uses_with(quantized_node)
     graph.erase_node(node)
 
-    # We don't need to insert dequantize node for bias
-    if (
-        isinstance(activation_post_process, _DerivedObserverOrFakeQuantize)
-        or activation_post_process.qscheme is None
+    # A bias, and a cast with no scale, get no dequantize node.
+    if isinstance(
+        activation_post_process,
+        (_DerivedObserverOrFakeQuantize, DirectCastFakeQuantize),
     ):
         return
 
@@ -365,7 +376,8 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         if is_gemm_op(user_node):
             user_node.meta["dtype"] = output_dtype
 
-            # Insert dequantize node before the node that appear the earlist in the graph
+            # Insert dequantize node before the node that appear the earlist in
+            # the graph
             node_index_map = {n: i for i, n in enumerate(graph.nodes)}
             all_user_nodes = sorted(
                 user_node.users.keys(),
@@ -736,7 +748,10 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 torch.ops.aten.matmul.default,
                 torch.ops.quantized_ops.linear_mx.default,
                 torch.ops.quantized_ops.matmul_mx.default,
-            ], f"Only GEMM is supported for outlier suppresion, got {user.target}"
+            ], (
+                "Only GEMM is supported for outlier suppresion, got "
+                f"{user.target}"
+            )
 
             weight_node = mx_op_node.args[1]
 
@@ -982,6 +997,197 @@ def sink_obs_or_fq(model: GraphModule) -> GraphModule:
     return model
 
 
+def _is_mutating(node: Node) -> bool:
+    """Whether ``node`` writes to one of its operands."""
+    return (
+        isinstance(node.target, torch._ops.OpOverload)
+        and node.target._schema.is_mutable
+    )
+
+
+def _finish_freezing(model: GraphModule) -> None:
+    """Mark ``model`` frozen, fix its fake-quants' enable flags, and drop
+    what the freezing left unused."""
+    for module in model.modules():
+        if isinstance(module, _FreezableFlags):
+            module.freeze_flags()
+    model.meta["frozen_weights"] = True
+    model.graph.lint()
+    model.recompile()
+    model.delete_all_unused_submodules()
+
+
+@torch.no_grad()
+def freeze_weights(*models: GraphModule) -> None:
+    """Bake each weight's fake-quantization into the weight.
+
+    Every fake-quant reading a parameter runs once and is removed; its users
+    read the fake-quantized value instead.  A buffer, such as a KV cache,
+    changes between calls and is left alone.  The graphs may share parameters
+    -- graphs exported from one model do -- and a shared one is quantized
+    once for all of them: when every fake-quant reading it gives the same
+    value and nothing else reads it, the value is written into the
+    parameter itself, so every holder of the tensor (the source model, the
+    other graphs) sees it too; otherwise each fake-quant's value gets a
+    buffer of its own and the other readers keep the raw weight.  The
+    graphs compute the same values without re-quantizing their weights on
+    every forward.  Call it once every weight scale is final, i.e. after
+    calibration.  A frozen graph is for evaluation only: its remaining
+    fake-quants keep the enable flags they have now, and ``convert_pt2e``
+    rejects it, since quantizing the weights needs the raw ones.
+
+    Args:
+        *models: Prepared graph modules, rewritten in place.
+    """
+    # Each tensor's fake-quants and other readers across the graphs, keyed
+    # by its memory: graphs exported from one model hold the same tensors.
+    readers = {}
+    for model in models:
+        modules = dict(model.named_modules())
+        params = dict(model.named_parameters(remove_duplicate=False))
+        for node in model.graph.nodes:
+            if node.op != "get_attr" or node.target not in params:
+                continue
+            param = params[node.target]
+            key = (param.data_ptr(), tuple(param.shape))
+            _, fake_quants, others = readers.setdefault(key, (param, [], []))
+            for user in node.users:
+                module = _get_module(user, modules)
+                if isinstance(module, FakeQuantizeBase):
+                    fake_quants.append((model, user, module))
+                else:
+                    others.append(user)
+
+    for param, fake_quants, others in readers.values():
+        if not fake_quants:
+            continue
+        values = [module(param) for _, _, module in fake_quants]
+        if not others and all(torch.equal(values[0], v) for v in values):
+            param.copy_(values[0])
+            for _, node, _ in fake_quants:
+                node.replace_all_uses_with(node.args[0])
+                node.graph.erase_node(node)
+            continue
+        for (model, node, _), value in zip(fake_quants, values):
+            with model.graph.inserting_before(node):
+                frozen = create_getattr_from_value(
+                    model, model.graph, node.args[0].target + "_frozen", value
+                )
+            node.replace_all_uses_with(frozen)
+            model.graph.erase_node(node)
+
+    for model in models:
+        _finish_freezing(model)
+
+
+@torch.no_grad()
+def freeze_cache_reads(
+    model: GraphModule, caches: List[str]
+) -> Callable[[], None]:
+    """Precompute what ``model`` computes from caches its caller writes.
+
+    A cache here is a buffer that changes only between calls, and seldom:
+    the main half of a split KV cache (``split_kv_cache``) takes a chunk
+    only when the residual fills.  The graph's own writes to ``caches`` are
+    removed, so the caller must make them.  Everything the graph then
+    computes from the caches and from buffers it never writes -- their
+    fake-quants included -- is the same on every call until the caches
+    change: it moves into a module of its own, and the graph reads the
+    results from buffers.  Freeze the weights first, so their fake-quants
+    are not mistaken for such reads.
+
+    Args:
+        model: Prepared graph module, rewritten in place.
+        caches: Names of the buffers the caller writes.
+
+    Returns:
+        A function recomputing the results from the caches' current
+        contents; call it after writing them.
+
+    Raises:
+        ValueError: The graph reads the value of one of its cache writes.
+    """
+    graph = model.graph
+    caches = set(caches)
+    for node in list(graph.nodes):
+        if (
+            _is_mutating(node)
+            and isinstance(node.args[0], Node)
+            and node.args[0].op == "get_attr"
+            and node.args[0].target in caches
+        ):
+            if node.users:
+                raise ValueError(f"{node} writes a cache and is read")
+            graph.erase_node(node)
+    written = {
+        node.args[0].target
+        for node in graph.nodes
+        if _is_mutating(node)
+        and isinstance(node.args[0], Node)
+        and node.args[0].op == "get_attr"
+    }
+    modules = dict(model.named_modules())
+
+    # Nodes computed only from buffers the graph never writes, mapped to
+    # whether they read a cache.
+    static = {}
+    for node in graph.nodes:
+        inputs = node.all_input_nodes
+        if node.op == "get_attr":
+            if node.target not in written:
+                static[node] = node.target in caches
+        elif all(n in static for n in inputs) and (
+            (node.op == "call_function" and not _is_mutating(node))
+            or isinstance(_get_module(node, modules), FakeQuantizeBase)
+        ):
+            static[node] = any(static[n] for n in inputs)
+
+    results = [
+        node
+        for node, reads_cache in static.items()
+        if reads_cache
+        and node.op != "get_attr"
+        and any(user not in static for user in node.users)
+    ]
+    needed = set()
+    pending = list(results)
+    while pending:
+        node = pending.pop()
+        if node not in needed:
+            needed.add(node)
+            pending.extend(node.all_input_nodes)
+    compute = Graph()
+    copies = {}
+    for node in graph.nodes:
+        if node in needed:
+            copies[node] = compute.node_copy(node, lambda n: copies[n])
+    compute.output(tuple(copies[n] for n in results))
+    computed = GraphModule(model, compute)
+
+    buffers = []
+    for node, value in zip(results, computed()):
+        with graph.inserting_before(node):
+            frozen = create_getattr_from_value(
+                model, graph, node.name + "_frozen", value
+            )
+        buffers.append(fetch_attr(model, frozen.target))
+        node.replace_all_uses_with(
+            frozen, delete_user_cb=lambda user: user not in static
+        )
+    graph.eliminate_dead_code(
+        is_impure_node=lambda n: n.op in {"placeholder", "output"}
+        or _is_mutating(n)
+    )
+    _finish_freezing(model)
+
+    @torch.no_grad()
+    def refresh():
+        for buffer, value in zip(buffers, computed()):
+            buffer.copy_(value)
+
+    return refresh
+
+
 def swap_matmul_inputs(model: GraphModule):
     graph = model.graph
     modules = dict(model.named_modules(remove_duplicate=False))
@@ -1017,11 +1223,15 @@ def swap_matmul_inputs(model: GraphModule):
         input_fq = get_fake_quant_mod(input_node)
         other_fq = get_fake_quant_mod(other_node)
 
-        if other_fq is None or other_fq.outlier_threshold is None:
+        if (
+            not isinstance(other_fq, MXFakeQuantize)
+            or other_fq.outlier_threshold is None
+        ):
             continue
 
         assert (
-            input_fq is None or input_fq.outlier_threshold is None
+            not isinstance(input_fq, MXFakeQuantize)
+            or input_fq.outlier_threshold is None
         ), "Only one input of matmul can have outlier filter"
 
         node.args = (other_node, input_node)
@@ -1049,27 +1259,35 @@ def convert_pt2e(
     output_dtype: str = None,
     eliminate_no_effect: bool = True,
 ):
+    if model.meta.get("frozen_weights"):
+        raise ValueError(
+            "convert_pt2e needs the raw weights that freeze_weights "
+            "replaced; convert a graph that was not frozen"
+        )
+
     modules = dict(model.named_modules(remove_duplicate=False))
 
     swap_matmul_inputs(model)
 
     for node in list(model.graph.nodes):
-        if node.op == "call_module":
-            mod = _get_module(node, modules)
-            assert mod is not None
-            if isinstance(mod, FakeQuantizeBase):
-                if mod.qscheme == QScheme.MICROSCALING:
-                    _replace_observer_with_quantize_mx_node_decomposed(
-                        model, node, modules
-                    )
-                elif mod.qscheme == QScheme.GROUP_WISE_AFFINE:
-                    _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
-                        model, node, modules
-                    )
-                else:
-                    _replace_observer_with_quantize_dequantize_node_decomposed(
-                        model, node, modules, output_dtype
-                    )
+        if node.op != "call_module":
+            continue
+        mod = _get_module(node, modules)
+        assert mod is not None
+        if not isinstance(mod, FakeQuantizeBase):
+            continue
+        if isinstance(mod, MXFakeQuantize):
+            _replace_observer_with_quantize_mx_node_decomposed(
+                model, node, modules
+            )
+        elif isinstance(mod, GroupWiseAffineFakeQuantize):
+            _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
+                model, node, modules
+            )
+        else:
+            _replace_observer_with_quantize_dequantize_node_decomposed(
+                model, node, modules, output_dtype
+            )
 
     if eliminate_no_effect:
         _eliminate_dequantize_with_no_effect(model)

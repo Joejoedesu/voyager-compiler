@@ -23,7 +23,7 @@ operations = [
     'gemm',
 ]
 
-dtypes = ['posit8_1', 'e4m3']
+dtypes = ['posit8_1', 'fp8_e4m3']
 
 
 def run_evaluation(model, ops, dtype, log_file, gpu):

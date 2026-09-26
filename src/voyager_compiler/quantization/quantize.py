@@ -138,7 +138,6 @@ def quantize(model, args, inplace=True):
         args.activation,
         args.weight,
         args.error,
-        args.record_histogram,
         args.force_scale_power_of_two,
     )
 
@@ -163,9 +162,10 @@ def _parse_ops(op_str):
     )
     valid_ops = set(QCONFIG_PROPAGATE_MODULE_CLASS_LIST.keys())
     invalid_ops = ops - valid_ops
-    assert (
-        not invalid_ops
-    ), f"Invalid operation(s) {', '.join(invalid_ops)}. Options are {', '.join(valid_ops)}."
+    assert not invalid_ops, (
+        f"Invalid operation(s) {', '.join(invalid_ops)}. "
+        f"Options are {', '.join(valid_ops)}."
+    )
     return tuple(
         mod for op in ops for mod in QCONFIG_PROPAGATE_MODULE_CLASS_LIST[op]
     )
@@ -296,8 +296,8 @@ def convert(
 def _convert(
     module, mapping=None, inplace=False, custom_module_class_mapping=None
 ):
-    r"""Converts submodules in input mod to a different mod according to `mapping`
-    by calling `from_float` method on the target mod class
+    r"""Converts submodules in input mod to a different mod according to
+    `mapping` by calling `from_float` method on the target mod class
 
     Args:
         mod: input mod
@@ -360,24 +360,29 @@ def swap_module(mod, mapping, custom_module_class_mapping):
         swapped = True
 
     if swapped:
-        # Preserve module's pre forward hooks. They'll be called on quantized input
+        # Preserve module's pre forward hooks. They'll be called on quantized
+        # input
         for pre_hook_fn in mod._forward_pre_hooks.values():
             new_mod.register_forward_pre_hook(pre_hook_fn)
-        # Preserve module's forward hooks. They'll be called on inputs to residual
+        # Preserve module's forward hooks. They'll be called on inputs to
+        # residual
         for hook_fn in mod._forward_hooks.values():
             new_mod.register_forward_hook(hook_fn)
-        # Preserve module's pre backward hooks. They'll be called on input gradients
+        # Preserve module's pre backward hooks. They'll be called on input
+        # gradients
         for pre_hook_fn in mod._backward_pre_hooks.values():
             new_mod.register_full_backward_pre_hook(pre_hook_fn)
-        # Preserve module's backward hooks. They'll be called on input gradients to residual
+        # Preserve module's backward hooks. They'll be called on input
+        # gradients to residual
         for hook_fn in mod._backward_hooks.values():
             new_mod.register_full_backward_hook(hook_fn)
 
         # respect device affinity when swapping modules
         devices = _get_unique_devices_(mod)
-        assert (
-            len(devices) <= 1
-        ), f"swap_module only works with cpu or single-device CUDA modules, but got devices {devices}"
+        assert len(devices) <= 1, (
+            "swap_module only works with cpu or single-device CUDA modules, "
+            f"but got devices {devices}"
+        )
         device = next(iter(devices)) if len(devices) > 0 else None
         if device:
             new_mod.to(device)

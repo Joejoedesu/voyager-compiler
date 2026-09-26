@@ -25,6 +25,7 @@ from voyager_compiler.ops.layout import (
 )
 from voyager_compiler.ops.quantized import (
     calculate_mx_qparam,
+    compiled_on_gpu,
     dequantize,
     expand,
     filter_outlier,
@@ -50,6 +51,7 @@ __all__ = [
     "OIHW_TO_HWIO",
     "POLICY_GEMM_WEIGHT_LAYOUT",
     "calculate_mx_qparam",
+    "compiled_on_gpu",
     "dequantize",
     "expand",
     "filter_outlier",

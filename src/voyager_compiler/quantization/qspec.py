@@ -13,11 +13,16 @@ imports nothing from the package, which is what lets both ``fake_quantize`` and
 
 import re
 from enum import Enum
+from typing import NamedTuple, Optional, Tuple
 
 __all__ = [
+    "FloatFormat",
     "QScheme",
+    "float_format",
+    "int_range",
     "parse_codebook_dtype",
     "parse_spec_fields",
+    "posit_format",
 ]
 
 
@@ -62,37 +67,99 @@ _PARAMS_TYPE = {
 }
 
 
+def int_range(dtype: str) -> Optional[Tuple[int, int]]:
+    """Return the range of an integer dtype.
+
+    Args:
+        dtype: A dtype name; ``int<N>`` is signed, ``uint<N>`` unsigned.
+
+    Returns:
+        ``(min, max)``, or None when ``dtype`` is not an integer.
+    """
+    match = re.fullmatch(r"(u?)int(\d+)", dtype, re.IGNORECASE)
+    if match is None:
+        return None
+    bits = int(match.group(2))
+    if match.group(1):
+        return 0, 2**bits - 1
+    return -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+
+
+class FloatFormat(NamedTuple):
+    """A minifloat: ``bits`` wide, ``ebits`` exponent and ``mbits`` mantissa
+    bits, and ``max_norm`` its largest finite magnitude."""
+
+    bits: int
+    ebits: int
+    mbits: int
+    max_norm: float
+
+    @property
+    def signed(self) -> bool:
+        """Whether a bit is left over for the sign."""
+        return self.bits == self.ebits + self.mbits + 1
+
+
+def float_format(dtype: str) -> Optional[FloatFormat]:
+    """Parse a minifloat dtype, ``fp<B>_e<X>m<Y>``.
+
+    ``B = X + Y + 1`` is signed; ``B = X + Y`` is unsigned, as a scale is.
+    A format with more than four exponent bits keeps its top exponent for
+    inf and NaN; a narrower one spends it on finite values, and
+    ``fp8_e4m3`` (torch's ``float8_e4m3fn``) gives up only its all-ones
+    mantissa there, to NaN.
+
+    Args:
+        dtype: A dtype name.
+
+    Returns:
+        The format, or None when ``dtype`` is not a minifloat.
+
+    Raises:
+        ValueError: ``B`` is neither ``X + Y`` nor ``X + Y + 1``.
+    """
+    match = re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype, re.IGNORECASE)
+    if match is None:
+        return None
+    bits, ebits, mbits = map(int, match.groups())
+    if bits not in (ebits + mbits, ebits + mbits + 1):
+        raise ValueError(
+            f"{dtype}: {bits} bits is neither {ebits} exponent plus {mbits} "
+            "mantissa bits nor that plus a sign bit"
+        )
+    emax = 2 ** (ebits - 1) - 1 if ebits > 4 else 2 ** (ebits - 1)
+    if dtype.lower() == "fp8_e4m3":
+        max_norm = 2**emax * 1.75
+    else:
+        max_norm = 2**emax * (2 - 2.0**-mbits)
+    return FloatFormat(bits, ebits, mbits, max_norm)
+
+
+def posit_format(dtype: str) -> Optional[Tuple[int, int]]:
+    """Parse a posit dtype, ``posit<N>_<es>``.
+
+    Args:
+        dtype: A dtype name.
+
+    Returns:
+        ``(bits, es)``, or None when ``dtype`` is not a posit.
+    """
+    match = re.fullmatch(r"posit(\d+)_(\d+)", dtype, re.IGNORECASE)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def _get_quant_min_max(dtype: str):
-    # Signed integers
-    if match := re.fullmatch(r"int(\d+)", dtype, re.IGNORECASE):
-        nbits = int(match.group(1))
-        max_val = 2 ** (nbits - 1) - 1
-        min_val = -(2 ** (nbits - 1))
-        return min_val, max_val
+    if (bounds := int_range(dtype)) is not None:
+        return bounds
 
-    # Unsigned integers
-    if match := re.fullmatch(r"uint(\d+)", dtype, re.IGNORECASE):
-        nbits = int(match.group(1))
-        return 0, 2**nbits - 1
+    if (fmt := float_format(dtype)) is not None:
+        return -fmt.max_norm, fmt.max_norm
 
-    # Floating-point like fpN_eXmY
-    if match := re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype, re.IGNORECASE):
-        ebits = int(match.group(2))
-        mbits = int(match.group(3)) + 2
-        emax = 2 ** (ebits - 1) - 1 if ebits > 4 else 2 ** (ebits - 1)
-
-        if dtype.lower() == "fp8_e4m3":
-            max_val = 2**emax * 1.75  # max mantissa (1.75)
-        else:
-            max_val = 2**emax * (2 ** (mbits - 1) - 1) / 2 ** (mbits - 2)
-
-        return -max_val, max_val
-
-    # Posit numbers
-    if match := re.fullmatch(r"posit(\d+)_(\d+)", dtype, re.IGNORECASE):
-        nbits = int(match.group(1))
-        es = int(match.group(2))
-        max_val = (2 ** (2**es)) ** (nbits - 2)
+    if (posit := posit_format(dtype)) is not None:
+        bits, es = posit
+        max_val = (2 ** (2**es)) ** (bits - 2)
         return -max_val, max_val
 
     # Lookup tables span their entries' range, or [-1, 1] when the entries
@@ -127,10 +194,11 @@ def parse_codebook_dtype(dtype: str):
     if match is None:
         return None
     index_bits, entry_dtype = match.groups()
-    if entry_dtype is None or re.fullmatch(r"int\d+", entry_dtype):
+    if entry_dtype is None:
         return int(index_bits), entry_dtype
-    fp = re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", entry_dtype)
-    if fp is None or int(fp[1]) != int(fp[2]) + int(fp[3]) + 1:
+    bounds = int_range(entry_dtype)
+    fmt = float_format(entry_dtype)
+    if (bounds is None or bounds[0] == 0) and (fmt is None or not fmt.signed):
         raise ValueError(
             f"{dtype}: a lookup table's entries are int<N> or a signed "
             f"fp<bits>_e<exponent>m<mantissa>, not {entry_dtype}"

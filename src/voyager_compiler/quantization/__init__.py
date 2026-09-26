@@ -6,7 +6,11 @@ with the comma-separated spec strings ``QuantizationSpec.from_str`` parses.
 """
 
 from voyager_compiler.quantization.fake_quantize import (
+    DirectCastFakeQuantize,
     FusedAmaxObsFakeQuantize,
+    GroupWiseAffineFakeQuantize,
+    MXFakeQuantize,
+    fake_quantize_class,
     get_quantization_map,
 )
 from voyager_compiler.quantization.gptq import (
@@ -35,6 +39,8 @@ from voyager_compiler.quantization.quantize import (
 from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
+    freeze_cache_reads,
+    freeze_weights,
     get_default_quantizer,
     prepare_pt2e,
     sink_obs_or_fq,
@@ -53,7 +59,10 @@ __all__ = [
     "Weighting",
     "Histogram",
     "DerivedQuantizationSpec",
+    "DirectCastFakeQuantize",
     "FusedAmaxObsFakeQuantize",
+    "GroupWiseAffineFakeQuantize",
+    "MXFakeQuantize",
     "QConfig",
     "QScheme",
     "QuantizationConfig",
@@ -63,7 +72,10 @@ __all__ = [
     "convert",
     "convert_pt2e",
     "derive_bias_qparams_fn",
+    "fake_quantize_class",
     "fit_codebooks",
+    "freeze_cache_reads",
+    "freeze_weights",
     "get_conv_bn_layers",
     "get_default_quantizer",
     "get_qconfig",

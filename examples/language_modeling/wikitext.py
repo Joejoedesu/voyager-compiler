@@ -16,7 +16,7 @@ from voyager_compiler import (
     add_experiment_args,
     get_default_quantizer,
     prepare_pt2e,
-    convert_pt2e,
+    freeze_weights,
     with_execution_context,
     print_node_scope_tabular,
     get_device_map,
@@ -136,7 +136,6 @@ def main(args):
         input_activation=args.activation,
         weight=args.weight,
         bias=args.bias,
-        record_histogram=args.record_histogram,
         force_scale_power_of_two=args.force_scale_power_of_two,
     )
     quantizer.set_module_name("model.rotary_emb", None)
@@ -175,8 +174,7 @@ def main(args):
             if isinstance(module, FakeQuantizeBase):
                 module.disable_observer()
 
-    if args.convert_model:
-        model = convert_pt2e(model)
+    freeze_weights(model)
 
     model.graph.print_tabular()
 

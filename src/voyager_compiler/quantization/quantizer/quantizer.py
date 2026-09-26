@@ -2,12 +2,14 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 from torch import Tensor
-from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
 from torch.fx import Node
-from torchao.quantization.pt2e import ObserverOrFakeQuantize
+from torchao.quantization.pt2e import (
+    ObserverOrFakeQuantize,
+    ObserverOrFakeQuantizeConstructor,
+)
 from torchao.quantization.pt2e.quantizer.quantizer import QuantizationSpecBase
 
-from voyager_compiler.quantization.fake_quantize import FusedAmaxObsFakeQuantize
+from voyager_compiler.quantization.fake_quantize import fake_quantize_class
 from voyager_compiler.quantization.qspec import QScheme, parse_spec_fields
 
 __all__ = [
@@ -22,8 +24,9 @@ class QuantizationSpec(QuantizationSpecBase):
     """
 
     dtype: str
-    observer_or_fake_quant_ctr: _ObserverOrFakeQuantizeConstructor = (
-        FusedAmaxObsFakeQuantize
+    # None picks the fake-quant class for ``qscheme``.
+    observer_or_fake_quant_ctr: Optional[ObserverOrFakeQuantizeConstructor] = (
+        None
     )
     quant_min: Optional[float] = None
     quant_max: Optional[float] = None
@@ -50,6 +53,9 @@ class QuantizationSpec(QuantizationSpecBase):
             and self.block_size is None
         ):
             raise ValueError("block_size is required for microscaling.")
+
+        if self.observer_or_fake_quant_ctr is None:
+            self.observer_or_fake_quant_ctr = fake_quantize_class(self.qscheme)
 
 
 EdgeOrNode = Union[Tuple[Node, Node], Node]

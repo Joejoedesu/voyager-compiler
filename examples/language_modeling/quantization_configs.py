@@ -5,7 +5,6 @@ import torch
 from torchao.quantization.pt2e.quantizer.utils import annotate_output_qspec
 
 from voyager_compiler import QuantizationSpec, QuantizationConfig
-from voyager_compiler.quantization import FusedAmaxObsFakeQuantize
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +307,7 @@ def set_qconfig(quantizer, qconfigs, force_scale_power_of_two=False):
             return None
         quant_spec = QuantizationSpec.from_str(spec)
         quant_spec.observer_or_fake_quant_ctr = (
-            FusedAmaxObsFakeQuantize.with_args(
+            quant_spec.observer_or_fake_quant_ctr.with_args(
                 force_scale_power_of_two=force_scale_power_of_two,
             )
         )

@@ -3,10 +3,86 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch._dynamo.repro.after_aot as after_aot
 import torch.nn.functional as F
 from torch.library import Library, impl
 
 logger = logging.getLogger(__name__)
+
+
+_cuda_system_info = after_aot._cuda_system_info_comment
+
+
+def _cuda_system_info_or_note():
+    """Return torch's CUDA-info comment, or a note when nvcc cannot run.
+
+    Every GPU compile writes this comment into its repro script by running
+    ``nvcc --version``.  torch catches only a missing nvcc; any other
+    ``OSError``, such as a PATH directory the user cannot open, gets the
+    same note instead of failing the compile.
+    """
+    try:
+        return _cuda_system_info()
+    except OSError:
+        return "# nvcc not runnable\n"
+
+
+after_aot._cuda_system_info_comment = _cuda_system_info_or_note
+
+
+def _compile(fn, dynamic):
+    """Return ``fn`` compiled with ``torch.compile`` to match eager.
+
+    The compile keeps eager's bfloat16 roundings and rounds every division
+    correctly, so it matches eager except where an intermediate is
+    denormal, which the GPU kernel flushes to zero.
+
+    Args:
+        fn: Function to compile.
+        dynamic: ``torch.compile``'s ``dynamic``.  False compiles a static
+            kernel per shape, the fastest when shapes repeat; None
+            recompiles an axis that changes size once as dynamic, for
+            shapes that vary, such as a prompt's length.
+    """
+    return torch.compile(
+        fn,
+        dynamic=dynamic,
+        recompile_limit=64,
+        options={
+            "eager_numerics.division_rounding": True,
+            "emulate_precision_casts": True,
+        },
+    )
+
+
+def compiled_on_gpu(dynamic):
+    """Decorate a function to run compiled on a GPU and as written on a CPU.
+
+    For a function called directly.  An op registers its compiled kernel
+    for the CUDA dispatch key instead, which fake and meta tensors never
+    reach.
+
+    Args:
+        dynamic: ``torch.compile``'s ``dynamic``, as ``_compile`` takes it.
+
+    Returns:
+        A decorator.  The function it returns takes the decorated one's
+        positional arguments, the first a tensor on the device to run on.
+    """
+
+    def decorate(fn):
+        compiled = _compile(fn, dynamic)
+
+        def run(input, *args):
+            return (compiled if input.is_cuda else fn)(input, *args)
+
+        return run
+
+    return decorate
+
+
+# The ops see prompts of every length.
+_OPS_DYNAMIC = None
 
 
 quantized_ops_lib = Library("quantized_ops", "DEF")
@@ -109,6 +185,12 @@ def vmap(
 
     indices = input.view(torch.int16)
 
+    # Chunking bounds the int32 index tensor eager materializes; a compiled
+    # kernel computes each index as it gathers, so it needs no chunks.
+    if torch.compiler.is_dynamo_compiling():
+        output = qmap[indices.to(torch.int32) & 0xFFFF].to(input.dtype)
+        return output.to(input_dtype)
+
     output = torch.empty_like(input, memory_format=torch.contiguous_format)
     indices_flat = indices.reshape(-1)
     output_flat = output.view(-1)
@@ -166,6 +248,9 @@ def _region_view(input: torch.Tensor, codebook: torch.Tensor):
     return input.reshape(split).permute(order), inverse
 
 
+# Inductor cannot lower ``searchsorted`` against boundaries computed in the
+# same graph, so under ``torch.compile`` this runs eagerly.
+@torch.compiler.disable
 def encode(
     input: torch.Tensor,
     codebook: torch.Tensor,
@@ -367,6 +452,26 @@ def dequantize(
     return dequantized
 
 
+def _dequantize_mx(input, scale, code, block_size):
+    """``input``'s codes read back through ``code`` and scaled by their
+    block ``scale``; either may be absent."""
+    # With neither, the compile would trace no ops, and a compile that
+    # traces none stops compiling the function for every later call.
+    if code is None and scale is None:
+        return input
+    return _decode_and_scale(input, scale, code, block_size)
+
+
+@compiled_on_gpu(_OPS_DYNAMIC)
+def _decode_and_scale(input, scale, code, block_size):
+    """``_dequantize_mx`` given a code, a scale or both."""
+    if code is not None:
+        input = decode(input, code)
+    if scale is not None:
+        input = input * expand(scale, input.shape, block_size)
+    return input
+
+
 quantized_ops_lib.define(
     "conv2d_mx(Tensor input, Tensor weight, Tensor? bias=None, "
     "SymInt[2] stride=1, SymInt[2] padding=0, SymInt[2] dilation=1, "
@@ -397,17 +502,8 @@ def conv2d_mx(
 
     assert layout in ("nchw", "nhwc"), layout
 
-    # For codebook quantization, decode input and weight into float values first
-    if input_code is not None:
-        input = decode(input, input_code)
-    if weight_code is not None:
-        weight = decode(weight, weight_code)
-
-    # Replicate scales to match input and weight shapes
-    if input_scale is not None:
-        input = input * expand(input_scale, input.shape, block_size)
-    if weight_scale is not None:
-        weight = weight * expand(weight_scale, weight.shape, block_size)
+    input = _dequantize_mx(input, input_scale, input_code, block_size)
+    weight = _dequantize_mx(weight, weight_scale, weight_code, block_size)
 
     # The dispatcher fills omitted / default-valued args from this Python
     # signature's scalar defaults; the strict op calls below need pairs.
@@ -450,20 +546,10 @@ def linear_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    if input_code is not None:
-        input = decode(input, input_code)
-
-    if input_scale is not None:
-        input = input * expand(input_scale, input.shape, block_size)
-
-    decoded_weight = weight
-    if weight_code is not None:
-        decoded_weight = decode(weight, weight_code)
-
-    if weight_scale is not None:
-        decoded_weight = decoded_weight * expand(
-            weight_scale, weight.shape, block_size
-        )
+    input = _dequantize_mx(input, input_scale, input_code, block_size)
+    decoded_weight = _dequantize_mx(
+        weight, weight_scale, weight_code, block_size
+    )
 
     # Call the operator matching the weight's storage layout: aten for
     # the KC-native layout, the layout twin for a CK-stored weight.
@@ -525,18 +611,8 @@ def matmul_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    if input_code is not None:
-        self = decode(self, input_code)
-    if input_scale is not None:
-        self = self * expand(input_scale, self.shape, block_size)
-
-    decoded_other = other
-    if weight_code is not None:
-        decoded_other = decode(other, weight_code)
-    if weight_scale is not None:
-        decoded_other = decoded_other * expand(
-            weight_scale, other.shape, block_size
-        )
+    self = _dequantize_mx(self, input_scale, input_code, block_size)
+    decoded_other = _dequantize_mx(other, weight_scale, weight_code, block_size)
 
     # Call the operator matching the right operand's storage layout:
     # aten for the CK-native layout, the layout twin for KC storage.
@@ -570,16 +646,6 @@ def _(
     if kwargs.get("weight_layout", "ck") == "kc":
         return torch.ops.quantized_ops.matmul(self, other)
     return torch.ops.aten.matmul(self, other)
-
-
-def _dequantize_mx(input, scale, code, block_size):
-    """``input``'s codes read back through ``code`` and scaled by their
-    block ``scale``; either may be absent."""
-    if code is not None:
-        input = decode(input, code)
-    if scale is not None:
-        input = input * expand(scale, input.shape, block_size)
-    return input
 
 
 quantized_ops_lib.define(
@@ -674,7 +740,7 @@ def sdpa_mx(
     probs = torch.softmax(scores, dim=-1)
     probs, residual_probs = probs[..., :keys], probs[..., keys:]
     if probs_qmap is not None:
-        probs_scale, probs = quantize_mx(
+        probs_scale, probs = torch.ops.quantized_ops.quantize_mx(
             probs,
             probs_qmap,
             [-1],
@@ -882,6 +948,13 @@ def quantize_affine(
     return scale, zero_point, value
 
 
+# On a GPU these ops run compiled: a few fused kernels instead of a pass
+# over the tensor per aten op.  The CUDA key alone takes the compiled
+# kernel, so fake and meta tensors keep the plain one.
+for _op in (quantize, dequantize, quantize_mx, quantize_affine):
+    quantized_ops_lib.impl(_op.__name__, _compile(_op, _OPS_DYNAMIC), "CUDA")
+
+
 quantized_ops_lib.define(
     "filter_outlier(Tensor input, float threshold, float max_pct=0.01) "
     "-> (Tensor, Tensor, Tensor, Tensor)"
@@ -1042,16 +1115,15 @@ def quantize_mx_outlier(
     if indptr_offset:
         indptr = indptr + indptr_offset
 
-    scale = calculate_mx_qparam(
+    scale, inliers = torch.ops.quantized_ops.quantize_mx(
         inliers,
-        axes=axes,
-        block_size=block_size,
-        quant_max=quant_max,
-        force_scale_power_of_two=force_scale_power_of_two,
-        scale_qmap=scale_qmap,
-    )
-    inliers = quantize(
-        inliers, scale, None, axes, block_size, qmap, output_code
+        qmap,
+        axes,
+        block_size,
+        quant_max,
+        force_scale_power_of_two,
+        scale_qmap,
+        output_code,
     )
 
     return data, indices, indptr, scale, inliers
