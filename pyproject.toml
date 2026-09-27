@@ -46,8 +46,7 @@ dev = ["black", "ruff"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Package data for voyager_compiler and all subpackages (e.g. the posit lookup
-# tables under quantization/dtypes/posit_gold).
+# Package data for voyager_compiler and all subpackages.
 "*" = ["*.txt", "*.json", "*.proto"]
 
 [tool.black]

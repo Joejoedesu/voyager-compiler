@@ -24,7 +24,7 @@ from voyager_compiler.codegen import (
     remove_zero_attention_mask,
 )
 from voyager_compiler.quantization import parse_codebook_dtype
-from voyager_compiler.quantization.quantize import get_conv_bn_layers
+from voyager_compiler.export_utils import get_conv_bn_layers
 
 from .utils import get_compile_args, get_transform_args
 

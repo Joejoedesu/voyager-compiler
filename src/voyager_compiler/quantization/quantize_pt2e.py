@@ -2,6 +2,7 @@ import copy
 import logging
 import operator
 import os
+import types
 from collections import OrderedDict
 from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -9,8 +10,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
-from torch.fx import Graph, GraphModule, Node
+from torch.fx import Graph, GraphModule, Node, map_arg
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
+from torchao.quantization.pt2e.qat_utils import _fuse_conv_bn_qat
 from torchao.quantization.pt2e.quantizer import (
     EdgeOrNode,
     QuantizationSpecBase,
@@ -28,6 +30,7 @@ from voyager_compiler.export_utils import (
 )
 from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
+    ErrorFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
     _DerivedObserverOrFakeQuantize,
@@ -36,6 +39,7 @@ from voyager_compiler.quantization.fake_quantize import (
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
+    ErrorQuantizationSpec,
     QScheme,
     QuantizationSpec,
 )
@@ -71,6 +75,15 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
         obs_or_fqs = [obs_or_fq_map[k] for k in edge_or_nodes]
         kwargs["obs_or_fqs"] = obs_or_fqs
         return _DerivedObserverOrFakeQuantize.with_args(**kwargs)()
+    if isinstance(quantization_spec, ErrorQuantizationSpec):
+        return ErrorFakeQuantize(
+            _create_obs_or_fq_from_qspec(
+                quantization_spec.forward, obs_or_fq_map, is_qat
+            ),
+            _create_obs_or_fq_from_qspec(
+                quantization_spec.error, obs_or_fq_map, is_qat
+            ),
+        )
 
     assert isinstance(quantization_spec, QuantizationSpec)
     observer_or_fake_quant_ctr = quantization_spec.observer_or_fake_quant_ctr
@@ -111,23 +124,32 @@ def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
 
 
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
+# Dropouts, each taking ``(input, p, train)``.
+_DROPOUTS = (
+    torch.ops.aten.dropout.default,
+    torch.ops.aten.dropout_.default,
+    torch.ops.aten.feature_dropout.default,
+    torch.ops.aten.feature_dropout_.default,
+)
 
 
 def get_microscaling_quantizer(
-    activation: Optional[QuantizationSpec], weight: Optional[QuantizationSpec]
+    activation: Optional[QuantizationSpec],
+    weight: Optional[QuantizationSpec],
+    output: Optional[ErrorQuantizationSpec] = None,
 ):
     # Microscaling performs quantization along the reduction dimension
     act_qspec = _set_ch_axis(activation, 1)
     weight_qspec = _set_ch_axis(weight, 1)
-    qconfig_conv2d = QuantizationConfig(act_qspec, None, weight_qspec, None)
+    qconfig_conv2d = QuantizationConfig(act_qspec, output, weight_qspec, None)
 
     act_qspec = _set_ch_axis(activation, -1)
     weight_qspec = _set_ch_axis(weight, -1)
-    qconfig_linear = QuantizationConfig(act_qspec, None, weight_qspec, None)
+    qconfig_linear = QuantizationConfig(act_qspec, output, weight_qspec, None)
 
     act0_qspec = _set_ch_axis(activation, -1)
     act1_qspec = _set_ch_axis(activation, -2)
-    qconfig_matmul = QuantizationConfig(act0_qspec, None, act1_qspec, None)
+    qconfig_matmul = QuantizationConfig(act0_qspec, output, act1_qspec, None)
 
     return (
         XNNPACKQuantizer()
@@ -191,6 +213,7 @@ def get_default_quantizer(
     weight: Optional[QuantizationSpec] = None,
     bias: Optional[QuantizationSpec] = None,
     force_scale_power_of_two: bool = False,
+    error: Optional[str] = None,
     **kwargs: Any,
 ) -> XNNPACKQuantizer:
     """
@@ -202,6 +225,9 @@ def get_default_quantizer(
     - weight: The quantization spec for weights.
     - force_scale_power_of_two: Whether to force the scaling factor to be a
       power of two.
+    - error: The quantization spec for gradients, applied in the backward
+      pass to the gradient reaching each conv2d, linear and matmul output,
+      and each attention output under microscaling.
 
     Returns:
     - A configured XNNPACKQuantizer.
@@ -228,6 +254,15 @@ def get_default_quantizer(
         weight = make_spec(weight)
         qschemes.append(weight.qscheme)
 
+    if error is not None:
+        error = make_spec(error)
+
+    def with_error(output):
+        """``output``, with the gradient quantized too when ``error`` is."""
+        if error is None:
+            return output
+        return ErrorQuantizationSpec(output, error)
+
     qschemes = [qs for qs in qschemes if qs is not None]
     if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
         assert bias is not None, (
@@ -248,7 +283,9 @@ def get_default_quantizer(
         assert (
             len(set(qschemes)) == 1
         ), f"Quantization scheme {qschemes[0]} does not work with {qschemes[1]}"
-        return get_microscaling_quantizer(input_activation, weight)
+        return get_microscaling_quantizer(
+            input_activation, weight, with_error(None)
+        )
 
     if weight is not None and weight.qscheme == QScheme.PER_CHANNEL_SYMMETRIC:
         assert weight.ch_axis == 0, (
@@ -260,23 +297,23 @@ def get_default_quantizer(
         input_activation is not None
         and input_activation.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
     ):
+        if error is not None:
+            raise ValueError("Per-channel activations quantize no gradients")
         return get_per_channel_act_quantizer(
             input_activation, output_activation, weight, bias
         )
 
     qconfig = QuantizationConfig(
-        input_activation, output_activation, weight, bias
+        input_activation, with_error(output_activation), weight, bias
     )
     qconfig_matmul = QuantizationConfig(
-        input_activation, output_activation, input_activation, None
+        input_activation, with_error(output_activation), input_activation, None
     )
     return (
         XNNPACKQuantizer()
         .set_object_type(torch.ops.aten.conv2d.default, qconfig)
         .set_object_type(torch.ops.aten.linear.default, qconfig)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
-        .set_object_type(torch.ops.aten.add.Tensor, qconfig)
-        .set_object_type(torch.ops.aten.add_.Tensor, qconfig)
     )
 
 
@@ -295,6 +332,183 @@ def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
     # intermediate graph prepare passes in would keep every parameter alive.
     assert_and_get_unique_device.cache_clear()
     _assert_and_get_unique_device.cache_clear()
+    return model
+
+
+def prepare_qat_pt2e(model: GraphModule, quantizer) -> GraphModule:
+    """Prepare a graph for QAT with each conv-BN fold simulated.
+
+    Every batch norm must follow a conv2d that feeds nothing else; torchao
+    rewrites each pair into the simulated fold: the weight is scaled by the
+    BN factor ``s = gamma / sqrt(running_var + eps)`` before its fake-quant,
+    the conv output is divided by ``s``, and the batch norm keeps
+    normalizing with batch statistics.  A conv without a bias first gets a
+    zero buffer as one, so the quantizer annotates the bias the fold will
+    produce.
+
+    Args:
+        model: Graph exported in training mode.
+        quantizer: Annotates the rewritten graph.
+
+    Returns:
+        The prepared graph, whose ``train()`` and ``eval()`` do nothing:
+        ``set_training`` sets its mode.
+
+    Raises:
+        ValueError: A batch norm does not follow a conv2d alone, or its
+            momentum or eps is not 0.1 or 1e-5, the values torchao's
+            rewrite writes into the graph.
+    """
+    graph = model.graph
+    for bn in list(graph.nodes):
+        if bn.target != torch.ops.aten.batch_norm.default:
+            continue
+        conv = bn.args[0]
+        if conv.target != torch.ops.aten.conv2d.default or len(conv.users) > 1:
+            raise ValueError(f"{bn} does not follow a conv2d alone")
+        momentum, eps = bn.args[6], bn.args[7]
+        if (momentum, eps) != (0.1, 1e-5):
+            raise ValueError(
+                f"{bn} has momentum {momentum} and eps {eps}; the QAT fold "
+                "supports only 0.1 and 1e-5"
+            )
+        if get_arg_value(conv, 2, "bias") is not None:
+            continue
+        weight = conv.args[1]
+        value = fetch_attr(model, weight.target)
+        with graph.inserting_before(conv):
+            bias = create_getattr_from_value(
+                model,
+                graph,
+                weight.target + "_bias",
+                value.new_zeros(value.shape[0]),
+            )
+        conv.args = conv.args[:2] + (bias,) + conv.args[3:]
+    model.recompile()
+
+    # torchao traces its patterns on random inputs; the caller's random
+    # stream stays as it was.
+    with torch.random.fork_rng():
+        _fuse_conv_bn_qat(model)
+    # The rewrite builds each conv's zero bias in the dtype it was traced in.
+    for conv in graph.nodes:
+        if conv.target != torch.ops.aten.conv2d.default:
+            continue
+        bias = get_arg_value(conv, 2, "bias")
+        if bias is None or bias.target != torch.ops.aten.zeros_like.default:
+            continue
+        bias.update_kwarg("dtype", None)
+    model = prepare_pt2e(model, quantizer)
+
+    def _eval(self, mode: bool = True):
+        return self
+
+    model.eval = types.MethodType(_eval, model)
+    model.train = types.MethodType(_eval, model)
+    return model
+
+
+def set_batch_norm_training(model: GraphModule, training: bool) -> None:
+    """Set whether ``model``'s batch norms normalize with batch statistics.
+
+    ``train()`` and ``eval()`` do not reach the ops of an exported graph, so
+    this sets each batch norm's ``training`` argument.  Out of training a
+    batch norm normalizes with its running statistics and leaves them
+    unchanged.
+
+    Args:
+        model: Exported graph, rewritten in place.
+        training: Whether the batch norms use batch statistics.
+    """
+    for node in model.graph.nodes:
+        if node.target == torch.ops.aten.batch_norm.default:
+            node.update_arg(5, training)
+    model.recompile()
+
+
+def set_training(model: GraphModule, training: bool) -> None:
+    """Switch ``model``'s dropouts and batch norms between training and eval.
+
+    Out of training a dropout passes its input through.  Attention's dropout
+    probability is fixed when the graph is exported; it is kept in the
+    node's meta and restored for training.  Batch norms switch as
+    ``set_batch_norm_training`` switches them.
+
+    Args:
+        model: Exported graph, rewritten in place.
+        training: Whether the ops behave as in training.
+    """
+    for node in model.graph.nodes:
+        if node.target in _DROPOUTS:
+            node.update_arg(2, training)
+        elif node.target == _SDPA and len(node.args) > 4:
+            dropout_p = node.meta.setdefault("dropout_p", node.args[4])
+            node.update_arg(4, dropout_p if training else 0.0)
+    set_batch_norm_training(model, training)
+
+
+def disable_observers(model: torch.nn.Module) -> None:
+    """Fix every fake-quant's scale except the gradients', which keep moving.
+
+    Args:
+        model: Prepared graph.
+    """
+    for module in model.modules():
+        if isinstance(module, FakeQuantizeBase):
+            module.disable_observer()
+    for module in model.modules():
+        if isinstance(module, ErrorFakeQuantize):
+            module.error_fq.enable_observer()
+
+
+def prepare_from_args(
+    model: torch.nn.Module,
+    args,
+    example_args: Tuple[Any, ...] = (),
+    example_kwargs: Optional[Dict[str, Any]] = None,
+    dynamic_shapes=None,
+) -> GraphModule:
+    """Export ``model`` and prepare it as the quantization flags ask.
+
+    The flags are the ones ``add_quantization_args`` defines.  The model is
+    exported in training mode, so the graph can be trained as well as
+    evaluated: each conv-BN pair trains through the simulated fold, and
+    ``train()`` and ``eval()`` switch its dropouts and batch norms.
+
+    Args:
+        model: Float model.
+        args: Parsed command-line arguments.
+        example_args: Positional inputs to export with.
+        example_kwargs: Keyword inputs to export with.
+        dynamic_shapes: Dynamic dimensions of the inputs.
+
+    Returns:
+        The prepared graph.
+    """
+    if args.bf16:
+        model.bfloat16()
+    quantizer = get_default_quantizer(
+        input_activation=args.activation,
+        output_activation=args.output_activation,
+        weight=args.weight,
+        bias=args.bias,
+        force_scale_power_of_two=args.force_scale_power_of_two,
+        error=args.error,
+    )
+    exported = export_model(
+        model.train(),
+        example_args,
+        example_kwargs,
+        dynamic_shapes=dynamic_shapes,
+    )
+    model = prepare_qat_pt2e(exported, quantizer)
+
+    def train(self, mode=True):
+        set_training(self, mode)
+        return self
+
+    model.train = types.MethodType(train, model)
+    model.eval = types.MethodType(torch.nn.Module.eval, model)
     return model
 
 
@@ -1254,6 +1468,72 @@ def swap_matmul_inputs(model: GraphModule):
     model.recompile()
 
 
+@torch.no_grad()
+def fold_conv_bn_qat(model: GraphModule) -> None:
+    """Fold each batch norm of a QAT graph into the conv before it.
+
+    ``prepare_qat_pt2e`` leaves every conv-BN pair as the simulated fold,
+    ``conv(x, fq(W * s), fq(zeros)) / s + b`` into the batch norm, with
+    ``s = gamma / sqrt(running_var + eps)``.  With the running statistics
+    taken as final this is ``conv(x, fq(W'), fq(b'))``, where
+    ``W' = W * s`` and ``b' = (b - running_mean) * s + beta``: the fold
+    writes ``W'`` and ``b'`` into the conv's parameters, points the
+    fake-quants at them and removes the rest of the chain.  ``W'`` is
+    computed by the graph's own nodes, so the weight fake-quant sees the
+    values it was trained on.  Any other batch norm is left alone.
+
+    Args:
+        model: Graph prepared by ``prepare_qat_pt2e``, rewritten in place.
+    """
+    graph = model.graph
+    modules = dict(model.named_modules())
+
+    def fake_quant_input(node):
+        """The node ``node`` fake-quantizes, or ``node`` itself."""
+        if isinstance(_get_module(node, modules), FakeQuantizeBase):
+            return node.args[0]
+        return node
+
+    def value(node):
+        """``node``'s value, computed from the parameters it reads."""
+        if node.op == "get_attr":
+            return fetch_attr(model, node.target)
+        args = map_arg(node.args, value)
+        return node.target(*args, **map_arg(node.kwargs, value))
+
+    for bn in list(graph.nodes):
+        if bn.target != torch.ops.aten.batch_norm.default:
+            continue
+        add_bias = bn.args[0]
+        if (
+            add_bias.target != torch.ops.aten.add.Tensor
+            or add_bias.args[0].target != torch.ops.aten.div.Tensor
+        ):
+            continue
+        divide = add_bias.args[0]
+        conv = fake_quant_input(divide.args[0])
+        if conv.target != torch.ops.aten.conv2d.default:
+            continue
+        scaled_weight = fake_quant_input(conv.args[1])
+        zeros = fake_quant_input(conv.args[2])
+        weight, bias = scaled_weight.args[0], zeros.args[0]
+
+        scale = value(divide.args[1]).flatten()
+        mean, beta = value(bn.args[3]), value(bn.args[2])
+        value(weight).copy_(value(scaled_weight))
+        bias_value = value(bias)
+        bias_value.copy_((bias_value - mean) * scale + beta)
+
+        scaled_weight.replace_all_uses_with(weight)
+        zeros.replace_all_uses_with(bias)
+        # Any fake-quant on the conv output now quantizes the folded output.
+        bn.replace_all_uses_with(divide.args[0])
+        graph.erase_node(bn)
+
+    graph.eliminate_dead_code()
+    model.recompile()
+
+
 def convert_pt2e(
     model: GraphModule,
     output_dtype: str = None,
@@ -1264,6 +1544,21 @@ def convert_pt2e(
             "convert_pt2e needs the raw weights that freeze_weights "
             "replaced; convert a graph that was not frozen"
         )
+
+    fold_conv_bn_qat(model)
+
+    # Gradient quantization has no counterpart in inference: an error
+    # fake-quant keeps only its forward part.
+    modules = dict(model.named_modules())
+    for node in list(model.graph.nodes):
+        module = _get_module(node, modules)
+        if not isinstance(module, ErrorFakeQuantize):
+            continue
+        if module.forward_fq is None:
+            node.replace_all_uses_with(node.args[0])
+            model.graph.erase_node(node)
+        else:
+            model.set_submodule(node.target, module.forward_fq)
 
     modules = dict(model.named_modules(remove_duplicate=False))
 

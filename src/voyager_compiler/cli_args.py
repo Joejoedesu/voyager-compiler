@@ -19,7 +19,6 @@ from voyager_compiler.ops.layout import (
     GEMM_WEIGHT_LAYOUTS,
     LAYOUT_POLICIES,
 )
-from voyager_compiler.quantization.quantizer.quantizer import QuantizationSpec
 from voyager_compiler.utils import SLURM_ARGS
 
 __all__ = [
@@ -96,7 +95,6 @@ def add_quantization_args(parser=None):
     parser.add_argument(
         "--error",
         default=None,
-        type=QuantizationSpec.from_str,
         help=(
             "Activation gradient quantization data type and configurations. "
             "Format same as activation."
@@ -122,59 +120,6 @@ def add_quantization_args(parser=None):
         "--bf16",
         action="store_true",
         help="Use bf16 (mixed) precision instead of 32-bit float.",
-    )
-    #  -- legacy / deprecated args (kept for backward compatibility) -----------
-    parser.add_argument(
-        "--pt2e",
-        action="store_true",
-        help=(
-            "Whether to use PyTorch 2 torch.export post-training static "
-            "quantizaion."
-        ),
-    )
-    parser.add_argument(
-        "--quantize_forward",
-        default="gemm",
-        help=(
-            "Forward operations to quantize. Choose from gemm, residual, "
-            "activation, layernorm, and scaling."
-        ),
-    )
-    parser.add_argument(
-        "--quantize_backprop",
-        default="gemm",
-        help=(
-            "Backprop operations to quantize. Choose from gemm, residual, "
-            "activation, layernorm, and scaling."
-        ),
-    )
-    parser.add_argument(
-        "--op_fusion",
-        type=lambda x: x.split(","),
-        default=None,
-        help="Fuse operation with previous GEMM to reduce quantization error.",
-    )
-    parser.add_argument(
-        "--posit_exp",
-        action="store_true",
-        help=(
-            "Whether to use posit approximated exponential function in softmax."
-        ),
-    )
-    parser.add_argument(
-        "--posit_exp_shifted",
-        action="store_true",
-        help=(
-            "Whether to use shifted posit approximated exponential function in "
-            "softmax."
-        ),
-    )
-    parser.add_argument(
-        "--posit_reciprocal",
-        action="store_true",
-        help=(
-            "Whether to use posit approximated reciprocal function in softmax."
-        ),
     )
     return parser
 

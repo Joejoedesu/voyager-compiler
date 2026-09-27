@@ -9,11 +9,11 @@ export stamps on every node.
 
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.fx import Graph, GraphModule, Node
-from transformers.utils import is_torch_greater_or_equal
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,7 @@ __all__ = [
     "create_getattr_from_value",
     "export_model",
     "get_aten_graph_module",
+    "get_conv_bn_layers",
     "get_node_name_to_scope",
     "print_node_scope_tabular",
 ]
@@ -36,8 +37,7 @@ def export_model(
 ):
     """Export ``model`` to a training-safe ``GraphModule``.
 
-    Picks the newest export entry point the installed torch offers, and
-    suppresses the ``_assert_tensor_metadata`` nodes that each ``.to(dtype)``
+    Suppresses the ``_assert_tensor_metadata`` nodes that each ``.to(dtype)``
     would otherwise pin to the dtype seen at trace time.
 
     Args:
@@ -49,39 +49,44 @@ def export_model(
 
     Returns:
         The exported program's ``GraphModule``.
-
-    Raises:
-        RuntimeError: If the installed torch predates 2.0.
     """
-    export_args = (model, args, kwargs)
-    export_kwargs = {"dynamic_shapes": dynamic_shapes, "strict": strict}
-
-    if is_torch_greater_or_equal("2.10"):
-        from torch._export.utils import (
-            _disable_aten_to_metadata_assertions,
+    with _disable_aten_to_metadata_assertions():
+        gm = torch.export.export(
+            model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict
         )
+    return gm.module(check_guards=False)
 
-        with _disable_aten_to_metadata_assertions():
-            gm = torch.export.export(*export_args, **export_kwargs)
-        return gm.module(check_guards=False)
-    elif is_torch_greater_or_equal("2.8"):
-        from torch._export.utils import (
-            _disable_aten_to_metadata_assertions,
-        )
 
-        with _disable_aten_to_metadata_assertions():
-            gm = torch.export.export_for_training(*export_args, **export_kwargs)
-        return gm.module()
-    elif is_torch_greater_or_equal("2.5"):
-        return torch.export.export_for_training(
-            *export_args, **export_kwargs
-        ).module()
-    elif is_torch_greater_or_equal("2.0"):
-        return torch._export.capture_pre_autograd_graph(
-            model, args, kwargs, dynamic_shapes=dynamic_shapes
-        )
-    else:
-        raise RuntimeError(f"Require torch>=2.0, but found {torch.__version__}")
+def get_conv_bn_layers(model: torch.nn.Module) -> List[List[str]]:
+    """Name every ``Conv2d`` directly followed by a ``BatchNorm2d``.
+
+    A pair is two consecutive children of one module, the conv registered
+    right before the batch norm, named as ``torch.ao.quantization``'s
+    ``fuse_modules`` takes them.
+
+    Args:
+        model: Module searched recursively.
+
+    Returns:
+        ``[conv, bn]`` pairs of qualified module names.
+    """
+    layers = []
+    module_names = list(model._modules)
+    for k, name in enumerate(module_names):
+        if len(list(model._modules[name]._modules)) > 0:
+            conv_bn_pairs = get_conv_bn_layers(model._modules[name])
+            layers.extend(
+                [
+                    [f"{name}.{conv}", f"{name}.{bn}"]
+                    for conv, bn in conv_bn_pairs
+                ]
+            )
+        elif (
+            isinstance(model._modules[name], torch.nn.BatchNorm2d)
+            and isinstance(model._modules[module_names[k - 1]], torch.nn.Conv2d)
+        ):
+            layers.append([module_names[k - 1], name])
+    return layers
 
 
 def get_aten_graph_module(

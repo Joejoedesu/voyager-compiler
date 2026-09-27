@@ -17,7 +17,7 @@ from voyager_compiler import (
     fuse_operator,
 )
 from voyager_compiler.quantization import parse_codebook_dtype
-from voyager_compiler.quantization.quantize import get_conv_bn_layers
+from voyager_compiler.export_utils import get_conv_bn_layers
 
 from .utils import get_transform_args, get_compile_args
 
