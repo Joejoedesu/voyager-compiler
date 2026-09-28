@@ -1,25 +1,17 @@
 import torch
+from compilation.pipeline import PreparedModel, compile_prepared
 from torchvision import models
 from tqdm import tqdm
 
 from voyager_compiler import (
-    DerivedQuantizationSpec,
-    QuantizationConfig,
-    QuantizationSpec,
     convert_pt2e,
     export_model,
-    replace_conv2d_with_im2col,
     prepare_pt2e,
-    transform,
-    compile,
-    derive_bias_qparams_fn,
-    extract_input_preprocessor,
-    fuse_operator,
+    replace_conv2d_with_im2col,
 )
-from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import get_transform_args, get_compile_args
+from .utils import configure_quantizer
 
 
 def load_model(args):
@@ -30,7 +22,7 @@ def load_model(args):
         model = models.__dict__[args.model](
             weights=args.model_name_or_path
         ).eval()
-    except Exception as e:
+    except Exception:
         model = models.__dict__[args.model](pretrained=True).eval()
 
         if args.model_name_or_path:
@@ -42,12 +34,8 @@ def load_model(args):
     return model
 
 
-def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
-):
+def prepare_model(model, quantizer, calibration_data, vector_stages, args):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    transform_args = get_transform_args(args, vector_stages)
-    compile_args = get_compile_args(args)
 
     modules_to_fuse = get_conv_bn_layers(model)
     if len(modules_to_fuse) > 0:
@@ -63,57 +51,12 @@ def quantize_and_dump_model(
                 module.stride = 2
                 module.padding = 0
 
+    configure_quantizer("torchvision", model, quantizer, args)
     if "mobilenet" in args.model:
-        quantizer.set_module_name("classifier", None)
-
-        if args.activation is not None and "microscaling" in args.activation:
-            qspec = QuantizationSpec.from_str("int8,qs=per_tensor_symmetric")
-
-            bias_qspec = DerivedQuantizationSpec(
-                derived_from=None,
-                derive_qparams_fn=derive_bias_qparams_fn,
-                dtype=None,
-            )
-
-            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
-            quantizer.set_module_name("features.0.0", qconfig)
-
         model.features[0][0].padding = (3, 3)
         model.features[0][0].weight.data = torch.nn.functional.pad(
             model.features[0][0].weight.data, (2, 2, 2, 2)
         )
-
-    # Some designs do not support quantized fc layers
-    if not args.quantize_fc:
-        quantizer.set_module_name("fc", None)
-
-    if args.residual is not None:
-        qspec = QuantizationSpec.from_str(
-            f"{args.residual},qs=per_tensor_symmetric"
-        )
-        qconfig = QuantizationConfig(qspec, None, None, None)
-        quantizer.set_object_type(torch.ops.aten.add.Tensor, qconfig)
-        quantizer.set_object_type(torch.ops.aten.add_.Tensor, qconfig)
-
-    # Use per-tensor instead of microscaling for conv1
-    if args.activation is not None and "microscaling" in args.activation:
-        dtype = args.activation.split(",")[0]
-        # A lookup table's layer takes its entry dtype, and stays unquantized
-        # when the entries keep the model's.
-        if (codebook := parse_codebook_dtype(dtype)) is not None:
-            dtype = codebook[1]
-        qconfig = None
-        if dtype is not None:
-            qspec = QuantizationSpec.from_str(
-                f"{dtype},qs=per_tensor_symmetric"
-            )
-            bias_qspec = DerivedQuantizationSpec(
-                derived_from=None,
-                derive_qparams_fn=derive_bias_qparams_fn,
-                dtype=None,
-            )
-            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
-        quantizer.set_module_name("^conv1$", qconfig)
 
     example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
     gm = export_model(model, example_args)
@@ -136,19 +79,20 @@ def quantize_and_dump_model(
 
     old_output = gm(*example_args)
 
-    transform(gm, example_args, **transform_args, skip_op_fusion=True)
+    return PreparedModel(
+        gm, example_args, old_output, extract_preprocessor=True
+    )
 
-    gm, preprocess_fn = extract_input_preprocessor(gm)
-    example_args = (preprocess_fn(*example_args),)
 
-    fuse_operator(gm, vector_stages)
-
-    gm.graph.print_tabular()
-
-    new_output = gm(*example_args) if args.debug else None
-
-    compile(gm, example_args, **compile_args)
-    return gm, old_output, new_output, preprocess_fn
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
+    """Compatibility wrapper around preparation and the shared runner."""
+    return compile_prepared(
+        prepare_model(model, quantizer, calibration_data, vector_stages, args),
+        args,
+        vector_stages,
+    )
 
 
 def evaluate(model, dataset):

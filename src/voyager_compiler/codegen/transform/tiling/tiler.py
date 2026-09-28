@@ -12,13 +12,12 @@ to each builder; per-node element widths are read from the nodes themselves.
 """
 
 import gc
-import itertools
 import logging
 import math
 import multiprocessing
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
 import torch
@@ -40,7 +39,6 @@ from voyager_compiler.codegen.node_info import (
     weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
-    BANK_SWITCH_CYCLES,
     _node_dtype_bits,
     _step_classes,
     _sweep_cycles,
@@ -58,30 +56,13 @@ from voyager_compiler.codegen.transform.tiling.search import (
     attention_head_pad,
     gemv_op_tiling,
 )
+from voyager_compiler.hardware_config import AcceleratorConfig
 from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
 from voyager_compiler.shape_prop import ShapeProp, set_node_value
+from voyager_compiler.voyager_adapter import interstellar_memory
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
-
-# Finished output vectors the matrix -> vector path holds before a
-# single-buffered accumulator's array feels the tail's drain rate: the
-# matrix processor's output FIFO (8), the vector pipeline's input FIFO (9)
-# and the stages between.  Measured on the E4M3x16x16 SoC as 20 (MobileBERT
-# GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
-# per L3 step.
-OUTPUT_SLACK = 24
-
-# Cycles the SpMM unit spends per row of each PE-array-wide pass on top of
-# the row's outliers: it drains and restarts its accumulator ring between
-# rows.  Measured on the Sphinx SoC: 7.3-7.5.
-SPMM_ROW_CYCLES = 8
-
-# Block-scale rows the SpMM unit's weight-scale buffer holds
-# (``DoubleBuffer<32>`` in ``SpMMUnit.h``, fixed in the Sphinx silicon).  A
-# streaming weight tile takes one row per K block per inner OC pass, and the
-# hardware wraps the address rather than checking it.
-SPMM_SCALE_ROWS = 32
 
 
 def spmm_scale_rows(mapping):
@@ -148,14 +129,14 @@ class TilerContext:
 
     arch: object
     schedule: object
-    config: object  # AcceleratorConfig
+    config: AcceleratorConfig
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     cache: dict = field(default_factory=dict)
     constraints: dict = field(default_factory=dict)
 
 
 def build_interstellar_tiler(
-    config, dram_access_cost=1000, runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE
+    config, dram_access_cost=None, runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE
 ):
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
@@ -182,32 +163,31 @@ def build_interstellar_tiler(
     so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     """
+    config.require_backend("voyager")
     ic_dim, oc_dim = config.pe_array_size
 
+    if dram_access_cost is not None:
+        # Preserve the explicit legacy override by updating the graph itself.
+        levels = tuple(
+            replace(
+                level,
+                instances=tuple(
+                    (
+                        replace(mem, access_cost=dram_access_cost)
+                        if mem.name == "dram"
+                        else mem
+                    )
+                    for mem in level.instances
+                ),
+            )
+            for level in config.memory.levels
+        )
+        config = replace(config, memory=replace(config.memory, levels=levels))
     architecture = interstellar.Resource(
-        buf_capacity_list=[
-            [1, 1, 1],
-            [
-                config.input_buffer_size * ic_dim,
-                config.accum_buffer_size * oc_dim,
-                config.weight_buffer_size * oc_dim,
-            ],
-            [config.usable_scratchpad_size],
-            [config.dram_size * 1024**3],  # GB -> bytes
-        ],
-        buf_access_cost_list=[
-            [1, 1, 1],
-            [10, 10, 10],
-            [100],
-            [dram_access_cost],
-        ],
-        buf_unit_static_cost_list=[[0, 0, 0], [0, 0, 0], [0], [0]],
-        para_count_list=[ic_dim * oc_dim, 1, 1, 1],
-        memory_partitions=[[0, 1, 2], [0, 1, 2], [0, 0, 0], [0, 0, 0]],
+        **interstellar_memory(config),
         mac_capacity=0,
-        partition_mode=[0, 0, 0, 0],
+        partition_mode=[0] * len(config.memory.levels),
         invalid_underutilized=False,
-        bank_size_list=[None, None, config.bank_size, None],
     )
 
     # L1 IC is outermost; the inner order is pinned to FY > FX > OY > OX.
@@ -416,6 +396,8 @@ def make_size_fn(
     out_outlier_pct=0.0,
     bank_width=None,
     vector_lanes=None,
+    *,
+    spmm_scale_rows_limit,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -559,10 +541,8 @@ def make_size_fn(
         # slice width the coupled ops agreed on.
         if constraint is not None and not constraint.allows(extent):
             return None, 0.0, 1
-        # TEMPORARY WORKAROUND: veto a tile whose block scales overflow the
-        # SpMM unit's fixed 32-row buffer (the RTL wraps and applies the
-        # wrong scales).  Drop once the depth is an accelerator parameter.
-        if is_spmm and spmm_scale_rows(point) > SPMM_SCALE_ROWS:
+        # The typed memory instance owns the SpMM scale-store depth.
+        if is_spmm and spmm_scale_rows(point) > spmm_scale_rows_limit:
             return None, 0.0, 1
 
         # The output is a partial sum in the anchor's dtype until IC is fully
@@ -743,7 +723,7 @@ class RuntimeCalculator:
     scratchpad bus.  The matrix unit charges the systolic passes, each weight
     tile costing the longer of its loading and the rows streamed through it,
     plus the back-pressure of a single-buffered accumulator against
-    ``OUTPUT_SLACK`` of buffering.  The bus charges the words every operand
+    ``self.output_slack`` of buffering.  The bus charges the words every operand
     role moves, summed per bank group of the planner's partition with the
     busiest bank setting the pace: input and weight rows in whole beats,
     packed as the toolchain packs them, with the read interface's lost cycle
@@ -780,6 +760,10 @@ class RuntimeCalculator:
         sram_bandwidth: int,
         dram_bandwidth: int,
         dram_access_latency_cycles: float,
+        bank_switch_cycles: float,
+        output_slack: int,
+        spmm_row_cycles: float,
+        output_stream_beats: int,
         double_buffered_l2: bool = False,
         outlier_rate: float = 0.0,
         batch: int = 1,
@@ -823,6 +807,10 @@ class RuntimeCalculator:
         self.stride = stride
         self.bank_size = bank_size
         self.weight_transposed = weight_transposed
+        self.bank_switch_cycles = bank_switch_cycles
+        self.output_slack = output_slack
+        self.spmm_row_cycles = spmm_row_cycles
+        self.output_stream_beats = output_stream_beats
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -1029,7 +1017,7 @@ class RuntimeCalculator:
 
     def _bank_switch_cycles(self, mapping):
         """Cycles one L3 step's input and weight streams lose to bank
-        switches, per role (``BANK_SWITCH_CYCLES`` each).
+        switches, per role (``self.bank_switch_cycles`` each).
 
         Follow the mapping's L1 input order and the weight FY/FX/IC/OC scan.
         Packing combines adjacent channel groups into a request exactly
@@ -1114,9 +1102,9 @@ class RuntimeCalculator:
                 if orders[loop][2] < orders[le.OC][2]
             )
         return {
-            "input": BANK_SWITCH_CYCLES
+            "input": self.bank_switch_cycles
             * self._stream_switches(mapping, (le.OX, le.OY, le.IC), input_walk),
-            "weight": BANK_SWITCH_CYCLES
+            "weight": self.bank_switch_cycles
             * self._stream_switches(mapping, (le.OC, le.IC), weight_walk, held),
         }
 
@@ -1172,7 +1160,7 @@ class RuntimeCalculator:
                 switches = strided_bank_walk(loops, width, self.bank_size)[0]
             beats = math.ceil(width * 8 / self.sram_bandwidth)
             result[("fused", i)] = switches * max(
-                1, BANK_SWITCH_CYCLES + 1 - beats
+                1, self.bank_switch_cycles + 1 - beats
             )
         return result
 
@@ -1277,7 +1265,7 @@ class RuntimeCalculator:
         every-round buffers (``_tail_stall``) -- and, for an outlier GEMM,
         the SpMM unit, which must deliver the block's sparse correction
         before the vector pipeline releases any of its rows: per 64-column
-        pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
+        pass it walks every row of the block, paying ``self.spmm_row_cycles`` of
         turnaround plus that row's outliers, each gather a bank switch when
         the weight tile spans several banks -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
@@ -1334,7 +1322,7 @@ class RuntimeCalculator:
             # The block scales leave on a requester of their own, one beat
             # per vector, on the output's bank.
             store_cycles += 1
-        vector_beats = store_cycles
+        vector_beats = max(store_cycles, self.output_stream_beats)
         if num_k == 1 and not self.single_k_tail_extra_pass:
             for dims, bits in self.tail_specs:
                 vector_beats = max(
@@ -1351,7 +1339,7 @@ class RuntimeCalculator:
         # tile -- as one burst of the whole tile when the OC passes are
         # adjacent (no filter loops at L1), else as OC1 bursts of one spatial
         # tile -- and the tail drains them at ``vector_beats`` apiece.  The
-        # path absorbs ``OUTPUT_SLACK`` of them; past that the array runs at
+        # path absorbs ``self.output_slack`` of them; past that the array runs at
         # the tail's pace for the rest of the burst.  A double-buffered
         # accumulator parks a tile whose tail moves more than a bus word per
         # vector on some port (the toolchain's ``should_use_direct_path``);
@@ -1371,7 +1359,8 @@ class RuntimeCalculator:
                 burst_cycles *= bursts
                 bursts = 1
             computation_l1_time += bursts * max(
-                0, burst_vectors * vector_beats - burst_cycles - OUTPUT_SLACK
+                0,
+                burst_vectors * vector_beats - burst_cycles - self.output_slack,
             )
 
         # --- L2: outer spatial-tile loop ---
@@ -1477,8 +1466,10 @@ class RuntimeCalculator:
                     / 8
                 )
                 banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
-                switch = BANK_SWITCH_CYCLES * (1 - 1 / banks)
-            spmm_block_time = visits * SPMM_ROW_CYCLES + gathers * (1 + switch)
+                switch = self.bank_switch_cycles * (1 - 1 / banks)
+            spmm_block_time = visits * self.spmm_row_cycles + gathers * (
+                1 + switch
+            )
             block_time = max(block_time, spmm_block_time)
 
         # The first tile's loads overlap nothing; the last parked tile's drain
@@ -1981,10 +1972,12 @@ def _prepare_search(node, tiler, constraint=None):
     # row of elements wider than the port's lanes (int6 attention operands on
     # the 4-bit NF4 port) takes more than one beat.  Without a bank width the
     # port is taken as one input row per cycle.
-    sram_bandwidth = (
-        tiler.config.bank_width * 8
-        if tiler.config.bank_width
-        else min(tiler.config.pe_array_size) * if_bits
+    sram_bandwidth = tiler.config.sram_bandwidth_bits(if_bits)
+    stream = tiler.config.connection("matrix_vector_stream").bandwidth
+    accum_bits = get_dtype_width(anchor.value.dtype)
+    stream_bytes = stream.bytes_per_cycle(tiler.config, accum_bits)
+    output_stream_beats = math.ceil(
+        tiler.config.pe_array_size[1] * accum_bits / 8 / stream_bytes
     )
 
     batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
@@ -2004,6 +1997,10 @@ def _prepare_search(node, tiler, constraint=None):
         sram_bandwidth,
         tiler.config.bytes_per_cycle,
         tiler.config.access_latency_cycles,
+        tiler.config.bank_switch_cycles,
+        tiler.config.output_slack,
+        tiler.config.spmm_row_cycles,
+        output_stream_beats,
         double_buffered_l2=tiler.config.double_buffered_l2,
         batch=batch,
         weight_batch=batch // weight_repeat,
@@ -2042,6 +2039,7 @@ def _prepare_search(node, tiler, constraint=None):
         out_outlier_pct=out_outlier_pct,
         bank_width=tiler.config.bank_width,
         vector_lanes=tiler.config.vector_lanes,
+        spmm_scale_rows_limit=tiler.config.spmm_scale_rows,
     )
     return key, _Search(anchor.name, tiler, layer, rc, size_fn)
 
@@ -2663,7 +2661,6 @@ def attention_op_tiling(
     """
     config = tiler.config
     query, key = node.args[0], node.args[1]
-    head_dim = query.value.shape[-1]
     skv = key.value.shape[-2]
     # Under MX the query and key block along head_dim, the value and the
     # probabilities along the keys, so a key tile holds whole blocks.

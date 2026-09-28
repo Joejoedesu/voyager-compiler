@@ -12,13 +12,12 @@ over ``--spec_length`` tokens at once.
 
 import logging
 import math
-import os
 import re
-import sys
 from contextlib import contextmanager
 from unittest.mock import patch
 
 import torch
+from compilation.pipeline import PreparedModel, compile_prepared
 from datasets import load_dataset
 from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.utils._pytree import tree_flatten
@@ -35,39 +34,26 @@ from transformers import (
 from transformers.integrations.executorch import convert_and_export_with_cache
 
 from voyager_compiler import (
-    QuantizationConfig,
     QuantizationSpec,
     ShapeProp,
-    compile,
     convert_pt2e,
     export_model,
     prepare_pt2e,
     split_kv_cache,
-    transform,
 )
 from voyager_compiler.codegen import (
     remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
 )
-
-from .utils import get_compile_args, get_transform_args
-
-# ``set_qconfig`` lives in the language-modeling example, not the package.
-sys.path.append(
-    os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__), "../../../examples/language_modeling"
-        )
-    )
-)
-from quantization_configs import (  # noqa: E402
+from voyager_compiler.quantization.voyager_llm_configs import (
     KIVI_BLOCK_SIZE,
     KIVI_RESIDUAL_LENGTH,
-    QUANTIZATION_CONFIGS,
-    set_kivi_attention_qconfig,
-    set_qconfig,
-    set_residual_attention_qconfig,
 )
+from voyager_compiler.quantization.voyager_llm_configs import (
+    QUANTIZATION_CONFIGS as QUANTIZATION_CONFIGS,
+)
+
+from .utils import configure_quantizer, get_compile_args, get_transform_args
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +64,7 @@ DECODE_MAX_GEN = 128
 
 # The KV-cache buffers of a split decode graph: the main caches and the
 # residuals ``split_kv_cache`` puts beside them.
-_KV_BUFFER = re.compile(r"^(key|value)_cache_\d+(_residual)?$")
-
-# The rotary embedding's ``inv_freq @ position`` matmul is not an MXU op and
-# stays unquantized.  A regex, so it matches both the prefill scope
-# (``model.rotary_emb``) and the executorch wrapper's (``model.model...``).
-_ROTARY_SCOPE = r"model\.rotary_emb"
+_KV_BUFFER = re.compile(r"(?:^|\.)(key|value)_cache_\d+(?:_|$)")
 
 # The 2-bit KV cache the compiler lowers: KIVI's groups (keys along the
 # sequence per channel, values along the head dim per token), with the
@@ -324,13 +305,19 @@ def kv_cache_state(gm):
     return {
         name: buffer.clone()
         for name, buffer in gm.named_buffers()
-        if _KV_BUFFER.match(name)
+        if _KV_BUFFER.search(name)
     }
 
 
 def restore_kv_cache(gm, state):
     for name, saved in state.items():
-        getattr(gm, name).copy_(saved)
+        gm.get_buffer(name).copy_(saved)
+
+
+def capture_kv_state(gm):
+    """Capture the current representation, including folded codes/qparams."""
+    state = kv_cache_state(gm)
+    return lambda graph: restore_kv_cache(graph, state)
 
 
 def quantize_model(model, tokenizer, quantizer, vector_stages, args):
@@ -369,26 +356,9 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     )
     replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
 
-    quantizer.set_module_name_object_type_order(
-        _ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
-    )
-
-    if args.qconfig is not None:
-        set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.qconfig])
-
+    configure_quantizer("llama", model, quantizer, args, is_decode=is_decode)
     if args.model == "llama_decode_kivi":
-        set_kivi_attention_qconfig(quantizer)
         annotate_kivi_cache(gm)
-    elif is_decode:
-        set_residual_attention_qconfig(quantizer)
-
-    if args.qconfig is not None or args.model == "llama_decode_kivi":
-        fp8_qspec = QuantizationSpec.from_str(
-            "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
-        )
-        qconfig = QuantizationConfig(fp8_qspec, None, None, None)
-        quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-        quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
     # The HF export builds the causal mask in-graph: a ``where`` over the
     # boolean mask that the attention scores' ``add`` reads.  In prefill the
@@ -426,7 +396,9 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     convert_pt2e(gm, args.bias)
 
     flatten_args, _ = tree_flatten((example_args, example_kwargs))
+    kv_state = kv_cache_state(gm)
     old_output = ShapeProp(gm).propagate(*flatten_args)
+    restore_kv_cache(gm, kv_state)
     return (
         gm,
         example_args,
@@ -438,11 +410,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     )
 
 
-def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
-    """Export, quantize, transform and compile the stage ``args.model`` names
-    (``llama_prefill`` / ``llama_decode``).  Returns ``(gm, old_output,
-    new_output)``; ``new_output`` is ``None`` unless ``--debug`` re-runs the
-    lowered graph."""
+def prepare_model(model, tokenizer, quantizer, vector_stages, args):
     (
         gm,
         example_args,
@@ -450,12 +418,22 @@ def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
         old_output,
         transform_args,
         compile_args,
-        _,
+        kv_state,
     ) = quantize_model(model, tokenizer, quantizer, vector_stages, args)
+    return PreparedModel(
+        gm,
+        example_args,
+        old_output,
+        example_kwargs=example_kwargs,
+        restore_state=lambda graph: restore_kv_cache(graph, kv_state),
+        capture_state=capture_kv_state,
+    )
 
-    transform(gm, example_args, example_kwargs, **transform_args)
-    compile(gm, example_args, example_kwargs, **compile_args)
-    gm.graph.print_tabular()
 
-    new_output = gm(*example_args, **example_kwargs) if args.debug else None
-    return gm, old_output, new_output
+def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
+    """Compatibility wrapper around preparation and the shared runner."""
+    return compile_prepared(
+        prepare_model(model, tokenizer, quantizer, vector_stages, args),
+        args,
+        vector_stages,
+    )

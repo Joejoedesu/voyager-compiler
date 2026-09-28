@@ -12,6 +12,7 @@ from voyager_compiler.hardware_config import (
     DEFAULT_PE_ARRAY_SIZE,
     DEFAULT_SCRATCHPAD_OFFSET,
     DEFAULT_WEIGHT_BUFFER_SIZE,
+    VOYAGER,
 )
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
@@ -102,7 +103,7 @@ def add_quantization_args(parser=None):
     )
     parser.add_argument(
         "--force_scale_power_of_two",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Whether to force the scaling factor to be a power of two.",
     )
     parser.add_argument(
@@ -118,7 +119,7 @@ def add_quantization_args(parser=None):
     )
     parser.add_argument(
         "--bf16",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Use bf16 (mixed) precision instead of 32-bit float.",
     )
     return parser
@@ -254,7 +255,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--scratchpad_size",
         type=int,
-        default=None,
+        default=VOYAGER.scratchpad_size,
         help="Total L2 SRAM size (bytes).",
     )
     parser.add_argument(
@@ -268,13 +269,13 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--num_banks",
         type=int,
-        default=None,
+        default=VOYAGER.num_banks,
         help="Number of banks in the accelerator.",
     )
     parser.add_argument(
         "--bank_width",
         type=int,
-        default=None,
+        default=VOYAGER.bank_width,
         help="Memory bank width (bytes) for memory planning.",
     )
     parser.add_argument(
@@ -304,6 +305,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--double_buffered_accum_buffer",
         action="store_true",
+        default=VOYAGER.double_buffered_accum_buffer,
         help="Use a double-buffered accumulation buffer (interstellar tiling).",
     )
     parser.add_argument(
@@ -362,13 +364,13 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--vector_unit_width",
         type=int,
-        default=None,
+        default=VOYAGER.vector_unit_width,
         help="Vector unit lane count; defaults to the PE array columns.",
     )
     parser.add_argument(
         "--matrix_vector_unit_width",
         type=int,
-        default=None,
+        default=VOYAGER.matrix_vector_unit_width,
         help=(
             "Matrix-vector unit width in elements; defaults to the PE array "
             "columns."
@@ -377,7 +379,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--accumulator_width",
         type=int,
-        default=None,
+        default=VOYAGER.accumulator_width,
         help="Channels the vector unit fetches per pooling request "
         "(ACCUMULATOR_WIDTH); defaults to the vector unit lane count.",
     )

@@ -1,49 +1,34 @@
+"""CLI and model dispatch for model × hardware compilation tests."""
+
 import argparse
 import logging
 
 import torch
+from compilation.context import parse_args, write_manifest
+from compilation.pipeline import compile_prepared
 from torch.testing import assert_close
 from torch.utils._pytree import tree_flatten
-from torchvision import models
-from utils.dataset import glue, imagenet
-from utils.models import bert, llama, mobilebert, torchvision_models, vit
-from utils.models.llama import QUANTIZATION_CONFIGS
 
 from voyager_compiler import (
-    OpMatcher,
     add_compile_args,
     add_quantization_args,
     get_default_quantizer,
 )
-from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
     coverage,
     kernel_rows,
     load_calibration,
     report,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
 
 logger = logging.getLogger()
 
 
-def _can_fuse(node):
-    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
-    if hasattr(node, "value") and is_fully_connected(node):
-        input_node = node.args[0]
-        return input_node.meta.get("dtype") is not None
-    return True
-
-
-def _is_constant_div(node):
-    if node.target != torch.ops.aten.div.Tensor:
-        return True
-
-    divisor = node.args[1]
-    if isinstance(divisor, torch.fx.Node):
-        return divisor.value.numel() == 1
-
-    return True
+def compile_adapter(adapter, args, vector_stages, **inputs):
+    prepared = adapter.prepare_model(
+        vector_stages=vector_stages, args=args, **inputs
+    )
+    return compile_prepared(prepared, args, vector_stages)
 
 
 def model_input_name(gm):
@@ -51,20 +36,6 @@ def model_input_name(gm):
     tensor files the accuracy tester loads."""
     return next(n.name for n in gm.graph.nodes if n.op == "placeholder")
 
-
-MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = [
-    "quantize",
-    "quantize_mx",
-    "quantize_mx_outlier",
-    "quantize_affine",
-]
-# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
-# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
-# op, and its slice width follows the consumers.
-GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 
 # Tolerance for comparing the lowered graph's output against the original's.
 # Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
@@ -75,49 +46,19 @@ GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 OUTPUT_RTOL = 5e-2
 OUTPUT_ATOL = 1e-4
 
-VECTOR_PIPELINE = [
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
-        OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher("layer_norm", "softmax"),
-        OpMatcher(*QUANT_OPS),
-    ],
-]
 
-
-def main():
-    torch.manual_seed(0)
-    torch.set_printoptions(sci_mode=False, precision=10)
-    torch.set_num_threads(32)
-    torch.set_grad_enabled(False)
-
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model",
-        help=(
-            "Model to compile. Medusa stages are medusa_prefill and "
-            "medusa_decode."
-        ),
+        help="Model or stage to compile (e.g. resnet18, llama_prefill, llama_decode).",
     )
     parser.add_argument(
         "--model_name_or_path",
         default=None,
         help=(
             "Path to pretrained model or model identifier from "
-            "huggingface.co/models. Use tiny-random for the offline Medusa "
-            "smoke model."
+            "huggingface.co/models."
         ),
     )
     parser.add_argument(
@@ -193,10 +134,9 @@ def main():
     parser.add_argument(
         "--qconfig",
         default=None,
-        choices=sorted(QUANTIZATION_CONFIGS),
         help=(
             "Named per-operand qconfig table for LLMs (from "
-            "examples/language_modeling/quantization_configs.py); also puts "
+            "the selected hardware family); also puts "
             "softmax and layer_norm outputs in fp8."
         ),
     )
@@ -207,7 +147,7 @@ def main():
     )
     parser.add_argument(
         "--conv2d_im2col",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help=(
             "Whether to transform Conv2d operations with small input channels "
             "into linear operations using im2col."
@@ -220,12 +160,12 @@ def main():
     )
     parser.add_argument(
         "--quantize_attention_mask",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Whether to quantize Transformer attention mask to binary values.",
     )
     parser.add_argument(
         "--quantize_fc",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Whether to quantize the fully connected layers.",
     )
     parser.add_argument(
@@ -245,9 +185,55 @@ def main():
         default="WARNING",
         help="Logging level.",
     )
+    parser.add_argument(
+        "--num_threads",
+        type=int,
+        default=32,
+        help="PyTorch CPU threads (default: 32).",
+    )
     add_quantization_args(parser)
     add_compile_args(parser)
-    args = parser.parse_args()
+    parser.add_argument(
+        "--target_hardware",
+        default="voyager",
+        help="Registered hardware target (default: voyager).",
+    )
+    parser.add_argument(
+        "--quantization_recipe",
+        default=None,
+        help="Deployment recipe from the target's hardware family.",
+    )
+    parser.add_argument(
+        "--single_buffer_tail",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--flash_attention_v3",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--bool_mask", action=argparse.BooleanOptionalAction, default=True
+    )
+    return parser
+
+
+def main(argv=None):
+    args = parse_args(build_parser(), argv)
+    run(args)
+
+
+def run(args):
+    torch.manual_seed(0)
+    torch.set_printoptions(sci_mode=False, precision=10)
+    if args.num_threads < 1:
+        raise ValueError("num_threads must be positive")
+    torch.set_num_threads(args.num_threads)
+    torch.set_grad_enabled(False)
+    context = args.compilation_context
+    vector_pipeline = context.backend.fusion_patterns(context.hardware)
+    write_manifest(args)
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -269,6 +255,11 @@ def main():
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
+    # Model dependencies are loaded only after target/policy validation.
+    from torchvision import models
+    from utils.dataset import glue, imagenet
+    from utils.models import bert, llama, mobilebert, torchvision_models, vit
+
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)
 
@@ -279,19 +270,18 @@ def main():
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "resnet")
 
-        gm, old_output, new_output, preprocess_fn = (
-            torchvision_models.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
-                args=args,
-            )
+        gm, old_output, new_output, preprocess_fn = compile_adapter(
+            torchvision_models,
+            args,
+            vector_pipeline,
+            model=model,
+            quantizer=quantizer,
+            calibration_data=imagenet_dataset,
         )
 
-        if args.dump_dataset:
+        if args.dump_dataset or args.evaluate:
             preprocessed_imagenet = imagenet.dump_imagenet(
-                args.dataset_output_dir,
+                args.dataset_output_dir if args.dump_dataset else None,
                 imagenet_dataset,
                 model_input_name(gm),
                 preprocess_fn,
@@ -310,17 +300,20 @@ def main():
         if args.evaluate:
             mobilebert.evaluate(model, eval_dataset)
 
-        if args.dump_dataset:
+        if args.dump_dataset or args.evaluate:
             preprocessed_dataset = glue.dump_dataset(
-                args.dataset_output_dir, eval_dataset, model
+                args.dataset_output_dir if args.dump_dataset else None,
+                eval_dataset,
+                model,
             )
 
-        gm, old_output, new_output = mobilebert.quantize_and_dump_model(
+        gm, old_output, new_output = compile_adapter(
+            mobilebert,
+            args,
+            vector_pipeline,
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
         )
 
         if args.evaluate:
@@ -336,17 +329,20 @@ def main():
         if args.evaluate:
             bert.evaluate(model, eval_dataset)
 
-        if args.dump_dataset:
+        if args.dump_dataset or args.evaluate:
             preprocessed_dataset = glue.dump_dataset(
-                args.dataset_output_dir, eval_dataset, model
+                args.dataset_output_dir if args.dump_dataset else None,
+                eval_dataset,
+                model,
             )
 
-        gm, old_output, new_output = bert.quantize_and_dump_model(
+        gm, old_output, new_output = compile_adapter(
+            bert,
+            args,
+            vector_pipeline,
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
         )
 
         if args.evaluate:
@@ -360,12 +356,13 @@ def main():
     ):
         model, tokenizer = llama.load_model(args)
 
-        gm, old_output, new_output = llama.quantize_and_dump_model(
+        gm, old_output, new_output = compile_adapter(
+            llama,
+            args,
+            vector_pipeline,
             model=model,
             tokenizer=tokenizer,
             quantizer=quantizer,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
         )
     elif args.model == "vit":
         model = vit.load_model(args)
@@ -377,19 +374,18 @@ def main():
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
 
-        gm, old_output, new_output, preprocess_fn = (
-            vit.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
-                args=args,
-            )
+        gm, old_output, new_output, preprocess_fn = compile_adapter(
+            vit,
+            args,
+            vector_pipeline,
+            model=model,
+            quantizer=quantizer,
+            calibration_data=imagenet_dataset,
         )
 
-        if args.dump_dataset:
+        if args.dump_dataset or args.evaluate:
             preprocessed_imagenet = imagenet.dump_imagenet(
-                args.dataset_output_dir,
+                args.dataset_output_dir if args.dump_dataset else None,
                 imagenet_dataset,
                 model_input_name(gm),
                 preprocess_fn,
@@ -409,9 +405,7 @@ def main():
         out_dir = args.report_output_dir
         if out_dir == "." and args.model_output_dir:
             out_dir = args.model_output_dir
-        calibration = (
-            load_calibration(args.calib_in) if args.calib_in else None
-        )
+        calibration = load_calibration(args.calib_in) if args.calib_in else None
         if calibration is not None:
             print(
                 f"[report] {len(calibration.measurements)} measured groups "
@@ -420,7 +414,7 @@ def main():
         print(f"[report] {args.model} -> {out_dir}", flush=True)
         result = report(
             gm,
-            AcceleratorConfig.from_args(args),
+            context.hardware,
             output_dir=out_dir,
             basename=args.report_basename,
             calibration=calibration,
@@ -468,8 +462,6 @@ def main():
         print(f"WARNING: output verification failed: {e}")
         print(old_output)
         print(new_output)
-        if args.model.startswith("medusa_"):
-            raise
 
 
 if __name__ == "__main__":

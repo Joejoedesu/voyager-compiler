@@ -40,8 +40,8 @@ persistent cache, so ``kv_bits`` does not apply to it.
 """
 
 import argparse
-import json
 import functools
+import json
 import multiprocessing
 import operator
 import os
@@ -79,7 +79,6 @@ from transformers.integrations.executorch import (
 
 import voyager_compiler  # noqa: F401  registers voyager.*
 from voyager_compiler import (
-    OpMatcher,
     QScheme,
     QuantizationSpec,
     convert_pt2e,
@@ -93,7 +92,6 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen.aten_classifier import is_compute_op
-from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
     estimate_schedule,
     kernel_rows,
@@ -110,12 +108,13 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig, voyager_config
 from voyager_compiler.quantization.fake_quantize import (
     FakeQuantizeBase,
     FusedAmaxObsFakeQuantize,
 )
 from voyager_compiler.shape_prop import ShapeProp, fake_like
+from voyager_compiler.voyager_adapter import fusion_patterns
 
 try:
     # torchao helper the KIVI 2-bit KV path annotates cache buffers with.
@@ -136,75 +135,25 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 # ``scratchpad_size`` is the whole on-chip L2 SRAM and ``num_banks`` the banks
 # it divides into; double buffering spends two of those banks per buffer rather
 # than changing either number.
-BASELINE_SCRATCHPAD_SIZE = 2 * 1024 * 1024
-BASELINE_NUM_BANKS = 16
-BASELINE_PE = (64, 64)
-BASELINE_FREQUENCY_GHZ = 1.0
-BASELINE_DRAM_BANDWIDTH_GBS = 64.0
-BASELINE_DRAM_ACCESS_LATENCY_NS = 100.0
+BASELINE_HARDWARE = voyager_config(
+    pe_array_size=(64, 64),
+    scratchpad_size=2 * 1024 * 1024,
+    num_banks=16,
+    dram_size=64.0,
+    double_buffered_accum_buffer=True,
+)
+BASELINE_SCRATCHPAD_SIZE = BASELINE_HARDWARE.scratchpad_size
+BASELINE_NUM_BANKS = BASELINE_HARDWARE.num_banks
+BASELINE_PE = BASELINE_HARDWARE.pe_array_size
+BASELINE_FREQUENCY_GHZ = BASELINE_HARDWARE.frequency
+BASELINE_DRAM_BANDWIDTH_GBS = BASELINE_HARDWARE.dram_bandwidth
+BASELINE_DRAM_ACCESS_LATENCY_NS = BASELINE_HARDWARE.dram_access_latency
 BASELINE_PROMPT_LEN = 1024
 
 # Max generation length added to the decode KV cache: the cache must hold the
 # ``kv_len`` context plus room for generation, so ``max_cache_len = kv_len +
 # DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).
 DECODE_MAX_GEN = 128
-
-
-# -------------------------------------------------------------------------
-# Operator-fusion pipeline (copied verbatim from test_codegen.py): fold each
-# MXU op's trailing dequant / activation / requantization into one fused
-# kernel.  Stages that match no node are skipped.
-# -------------------------------------------------------------------------
-def _can_fuse(node):
-    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
-    if hasattr(node, "value") and is_fully_connected(node):
-        return node.args[0].meta.get("dtype") is not None
-    return True
-
-
-def _is_constant_div(node):
-    if node.target != torch.ops.aten.div.Tensor:
-        return True
-    divisor = node.args[1]
-    if isinstance(divisor, torch.fx.Node):
-        return divisor.value.numel() == 1
-    return True
-
-
-MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = [
-    "quantize",
-    "quantize_mx",
-    "quantize_mx_outlier",
-    "quantize_affine",
-]
-# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
-# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
-# op, and its slice width follows the consumers.
-GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
-
-FUSION_PIPELINE = [
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
-        OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher("layer_norm", "softmax"),
-        OpMatcher(*QUANT_OPS),
-    ],
-]
 
 
 # -------------------------------------------------------------------------
@@ -286,12 +235,12 @@ class SweepConfig:
                 if self.bank_width is not None
                 else self.pe[1] * self.act_bits // 8
             ),
-            input_buffer_size=1024,
-            weight_buffer_size=1024,
-            accum_buffer_size=1024,
+            input_buffer_size=BASELINE_HARDWARE.input_buffer_size,
+            weight_buffer_size=BASELINE_HARDWARE.weight_buffer_size,
+            accum_buffer_size=BASELINE_HARDWARE.accum_buffer_size,
             double_buffered_accum_buffer=self.double_buffered_accum_buffer,
             double_buffered_l2=self.pipelined,
-            dram_size=64.0,
+            dram_size=BASELINE_HARDWARE.dram_size,
             dram_bandwidth=self.dram_bandwidth_gbs,
             dram_access_latency=self.dram_access_latency_ns,
             frequency=self.frequency_ghz,
@@ -864,7 +813,7 @@ def _frontend(cfg: SweepConfig):
         gm,
         example_args,
         example_kwargs=example_kwargs,
-        patterns=FUSION_PIPELINE,
+        patterns=fusion_patterns(cfg.acc_config),
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",

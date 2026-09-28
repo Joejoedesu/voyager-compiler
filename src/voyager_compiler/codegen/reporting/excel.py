@@ -20,9 +20,9 @@ from typing import Dict, List
 
 from voyager_compiler.codegen.reporting.calibration import (
     FORM_SHEET,
+    calibration_sheet,
     power_column,
     sheet_rows,
-    calibration_sheet,
 )
 from voyager_compiler.codegen.reporting.model import ScheduleResult
 from voyager_compiler.codegen.reporting.summary import (
@@ -691,6 +691,8 @@ def _architecture(wb, result: ScheduleResult):
         return "" if value is None else fn(value)
 
     lines = [
+        ("hardware_name", cost.name),
+        ("backend", cost.backend),
         ("-- compute --", ""),
         ("pe_rows", int(cost.pe_array_size[0])),
         ("pe_cols", int(cost.pe_array_size[1])),
@@ -735,7 +737,55 @@ def _architecture(wb, result: ScheduleResult):
         ("dram_energy_per_byte_j", cost.dram_energy_per_byte),
         ("ns_per_cycle", 1.0 / float(cost.frequency)),
     ]
-    _table(wb, "Architecture", ["Knob", "Value"], lines, {0: 34, 1: 18})
+    for unit in cost.computation_units:
+        prefix = f"compute.{unit.name}"
+        lines.extend(
+            [
+                (
+                    f"{prefix}.dtypes",
+                    ", ".join(d.name for d in unit.supported_dtypes),
+                ),
+                (
+                    f"{prefix}.operations",
+                    ", ".join(sorted(unit.supported_operations)),
+                ),
+                (f"{prefix}.unrolling", str(unit.spatial_unrolling)),
+                (f"{prefix}.launch_cycles", unit.launch_overhead_cycles),
+                (f"{prefix}.row_cycles", unit.row_overhead_cycles),
+            ]
+        )
+    for level in cost.memory.levels:
+        for mem in level.instances:
+            prefix = f"memory.{level.name}.{mem.name}"
+            lines.extend(
+                [
+                    (
+                        f"{prefix}.size",
+                        f"{mem.size.value} {mem.size.unit.value}",
+                    ),
+                    (
+                        f"{prefix}.targets",
+                        ", ".join(sorted(t.value for t in mem.targets)),
+                    ),
+                    (f"{prefix}.replication", str(mem.replication)),
+                    (f"{prefix}.buffering", mem.buffering),
+                    (f"{prefix}.access_cost", mem.access_cost),
+                    (f"{prefix}.bank_switch_cycles", mem.bank_switch_cycles),
+                ]
+            )
+    for pipeline in cost.isa_pipelines:
+        lines.append((f"isa.{pipeline.name}.stages", str(pipeline.stages)))
+    for edge in cost.connections:
+        prefix = f"link.{edge.name}"
+        lines.extend(
+            [
+                (f"{prefix}.endpoints", f"{edge.source} -> {edge.target}"),
+                (f"{prefix}.bandwidth", str(edge.bandwidth)),
+                (f"{prefix}.latency_ns", maybe(edge.latency_ns)),
+                (f"{prefix}.buffer_depth", edge.buffer_depth),
+            ]
+        )
+    _table(wb, "Architecture", ["Knob", "Value"], lines, {0: 50, 1: 40})
 
 
 def write_excel_report(

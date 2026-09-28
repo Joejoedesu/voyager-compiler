@@ -72,14 +72,15 @@ def dump_imagenet(output_dir, dataset, input_name, preprocess_fn, torch_dtype):
     for i, image_label_pair in enumerate(tqdm(dataset, desc="Dumping dataset")):
         label = image_label_pair["label"]
         image = image_label_pair["image"]
-        dir_name = os.path.join(output_dir, f"{i}_{label}")
-        os.makedirs(dir_name, exist_ok=True)
         image = preprocess_fn(image)
 
         preprocessed_dataset.append(
             {"image": image.to(torch_dtype), "label": label}
         )
-        write_tensor_to_file(
-            image, os.path.join(dir_name, f"{input_name}.bin")
-        )
+        if output_dir is not None:
+            dir_name = os.path.join(output_dir, f"{i}_{label}")
+            os.makedirs(dir_name, exist_ok=True)
+            write_tensor_to_file(
+                image, os.path.join(dir_name, f"{input_name}.bin")
+            )
     return preprocessed_dataset

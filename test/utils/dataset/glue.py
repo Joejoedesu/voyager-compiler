@@ -24,6 +24,7 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 }
 
+
 def retrieve_dataset(model, tokenizer, args):
     raw_datasets = load_dataset("glue", args.task_name)
 
@@ -72,20 +73,26 @@ def dump_dataset(output_dir, dataset, model):
         embedding_output = embeddings(
             input_ids=batch["input_ids"], token_type_ids=batch["token_type_ids"]
         )
-        attention_mask = (1.0 - batch["attention_mask"]) * torch.finfo(torch.float).min
+        attention_mask = (1.0 - batch["attention_mask"]) * torch.finfo(
+            torch.float
+        ).min
         label = int(batch["labels"].item())
 
-        folder = os.path.join(output_dir, f"{step}_{label}")
-        os.makedirs(folder, exist_ok=True)
-
-        preprocessed_dataset.append({
-            "embedding_output": embedding_output,
-            "attention_mask": attention_mask,
-            "labels": batch["labels"]
-        })
-        write_tensor_to_file(
-            embedding_output, os.path.join(folder, "hidden_states.bin")
+        preprocessed_dataset.append(
+            {
+                "embedding_output": embedding_output,
+                "attention_mask": attention_mask,
+                "labels": batch["labels"],
+            }
         )
-        write_tensor_to_file(attention_mask, os.path.join(folder, "attention_mask.bin"))
+        if output_dir is not None:
+            folder = os.path.join(output_dir, f"{step}_{label}")
+            os.makedirs(folder, exist_ok=True)
+            write_tensor_to_file(
+                embedding_output, os.path.join(folder, "hidden_states.bin")
+            )
+            write_tensor_to_file(
+                attention_mask, os.path.join(folder, "attention_mask.bin")
+            )
 
     return preprocessed_dataset

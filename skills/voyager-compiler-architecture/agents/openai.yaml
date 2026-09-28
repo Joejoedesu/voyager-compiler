@@ -1,0 +1,4 @@
+interface:
+  display_name: "Voyager Compiler Architecture"
+  short_description: "Navigate Voyager compilation, target policies, and regressions"
+  default_prompt: "Use $voyager-compiler-architecture to locate the relevant compiler stage and validate a Voyager change."

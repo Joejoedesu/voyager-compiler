@@ -18,13 +18,16 @@ from the previous run, so it can gate a pre-push hook.
 
 import argparse
 import difflib
+import os
 import re
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Event
 
 # Repo root = parent of this file's directory (test/run_ci.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -37,59 +40,17 @@ DIFF_EXCERPT_LINES = 60
 # Command table.
 #
 # Each Command is expanded at runtime into a test_codegen.py argv:
-#     <python> test_codegen.py <model> <SCHEME_ARGS[scheme]>
+#     <python> test_codegen.py <model> --target_hardware <target>
+#         --quantization_recipe <scheme>
 #         --pe_array_size <unrolling> <extra>
 #         --model_output_dir <run_dir>/<label>
-# The shared per-scheme quantization/compile flags live once in SCHEME_ARGS
-# (no --dump_tensors). To add coverage, add a Command (and a new scheme to
-# SCHEME_ARGS if needed).
+# Voyager presets live in quantization.voyager; recipes supplies family lookup.
+# To add coverage,
+# add a Command and, if needed, register the target/family/backend.
 # ---------------------------------------------------------------------------
 
-# Shared quantization/compile flags per scheme.
-SCHEME_ARGS = {
-    "E4M3": (
-        "--activation fp8_e4m3 --weight fp8_e4m3 --bf16 "
-        "--layout_policy systolic"
-    ),
-    "P8_1": (
-        "--activation posit8_1 --weight posit8_1 --bf16 "
-        "--layout_policy systolic"
-    ),
-    "INT8": (
-        "--activation int8,qs=per_tensor_symmetric "
-        "--weight int8,qs=per_tensor_symmetric --bias int24 --bf16 "
-        "--calibration_steps 3 --layout_policy systolic"
-    ),
-    "MXINT8": (
-        "--activation int8,qs=microscaling,bs=16 "
-        "--weight int8,qs=microscaling,bs=16 --force_scale_power_of_two "
-        "--bf16 --layout_policy systolic"
-    ),
-    "MXNF4": (
-        "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
-        "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
-        "--residual fp8_e4m3 --quantize_fc --layout_policy systolic "
-        "--scratchpad_size 2097152 --num_banks 16 --conv2d_im2col"
-    ),
-}
-
-# The interstellar tiler sizes its blocking against a scratchpad and a bank
-# count, and has no answer when they are unset.  Only MXNF4 names its own, so
-# every other scheme is given these -- the same pair MXNF4 asks for.
-DEFAULT_TILER_ARGS = {"--scratchpad_size": "2097152", "--num_banks": "16"}
-
-# One activation element, bytes, per scheme.  Each command's --bank_width is
-# one input beat -- the PE array's column count times this -- which is the
-# word the store bus writes whole, so the memory planner both aligns to it
-# and reserves the tail slack a sub-word store beat overshoots by.
-SCHEME_INPUT_BYTES = {
-    "E4M3": 1,
-    "P8_1": 1,
-    "INT8": 1,
-    "MXINT8": 1,
-    "MXNF4": 0.5,
-}
-assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
+# Recipes are resolved by the selected hardware family inside test_codegen.
+# The CI matrix owns only model, target, recipe, geometry and case overrides.
 
 # Reused per-command extra-flag groups.
 _SINGLE = "--num_hidden_layers 1"
@@ -103,13 +64,15 @@ _LLM_SPMM_DB = _LLM_SPMM + " " + _DB
 
 @dataclass(frozen=True)
 class Command:
-    """One codegen invocation, expanded to argv via SCHEME_ARGS."""
+    """One supported model × hardware × quantization invocation."""
 
     model: str  # test_codegen.py positional argument
-    scheme: str  # key into SCHEME_ARGS
-    unrolling: str  # --pe_array_size value, e.g. "16,16"
+    scheme: str  # key into the family recipe registry
+    # Voyager --pe_array_size; optional for other targets.
+    unrolling: str | None = None
     network: str = ""  # output/label name (defaults to model)
     extra: str = ""  # any per-command extra flags
+    target_hardware: str = "voyager"
 
 
 COMMANDS = [
@@ -157,15 +120,17 @@ TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 
 
 def _label(command):
-    """``<network>/<scheme>/<unrolling>`` — unique per command (unrolling
+    """``<target>/<network>/<scheme>/<unrolling>`` — unique per command (unrolling
     disambiguates commands sharing a network/scheme, e.g. resnet18 E4M3)."""
     network = command.network or command.model
-    unroll = command.unrolling.replace(",", "x")
-    return f"{network}/{command.scheme}/{unroll}"
+    unroll = (
+        command.unrolling.replace(",", "x") if command.unrolling else "default"
+    )
+    return f"{command.target_hardware}/{network}/{command.scheme}/{unroll}"
 
 
 assert len({_label(c) for c in COMMANDS}) == len(COMMANDS), (
-    "COMMANDS have duplicate <network>/<scheme>/<unrolling> labels; give "
+    "COMMANDS have duplicate <target>/<network>/<scheme>/<unrolling> labels; give "
     "colliding commands distinct 'network' names"
 )
 
@@ -179,8 +144,15 @@ def _matches(label, pattern):
     selects ``mobilebert_encoder`` and ``resnet`` selects both resnets); a
     ``a/b`` token matches as an anchored path prefix.
     """
+    pattern = pattern.lower().strip("/")
+    if (
+        label.startswith("voyager/")
+        and "/" in pattern
+        and not pattern.startswith("voyager/")
+    ):
+        label = label.removeprefix("voyager/")
     segs = label.lower().split("/")
-    parts = pattern.lower().strip("/").split("/")
+    parts = pattern.split("/")
     if len(parts) == 1:
         return any(s.startswith(parts[0]) for s in segs)
     return len(parts) <= len(segs) and all(
@@ -188,7 +160,7 @@ def _matches(label, pattern):
     )
 
 
-def _build(command, run_dir):
+def _build(command, run_dir, threads_per_job=None):
     """Expand a Command into ``(label, dest, argv)`` for this run.
 
     The argv runs this repo's test_codegen.py with --model_output_dir pointed
@@ -201,21 +173,22 @@ def _build(command, run_dir):
     dest = run_dir / label
 
     argv = [sys.executable, str(TEST_CODEGEN), command.model, "--debug"]
-    argv += shlex.split(SCHEME_ARGS[command.scheme])
-    argv += ["--pe_array_size", command.unrolling]
+    argv += [
+        "--target_hardware",
+        command.target_hardware,
+        "--quantization_recipe",
+        command.scheme,
+    ]
+    if command.unrolling is not None:
+        argv += ["--pe_array_size", command.unrolling]
     argv += shlex.split(command.extra)
-    for flag, value in DEFAULT_TILER_ARGS.items():
-        if flag not in argv:
-            argv += [flag, value]
-    if "--bank_width" not in argv:
-        cols = int(command.unrolling.split(",")[1])
-        width = int(cols * SCHEME_INPUT_BYTES[command.scheme])
-        argv += ["--bank_width", str(width)]
+    if threads_per_job is not None:
+        argv += ["--num_threads", str(threads_per_job)]
     argv += ["--model_output_dir", str(dest)]
     return label, dest, argv
 
 
-def _run_one(label, dest, argv):
+def _run_one(label, dest, argv, stop=None):
     """Run one command; capture combined output to ``dest/run.log``.
 
     Returns a status string: ``ok`` / ``error`` (nonzero exit) /
@@ -230,9 +203,25 @@ def _run_one(label, dest, argv):
     with open(log_path, "w") as log:
         log.write("$ " + " ".join(shlex.quote(a) for a in argv) + "\n\n")
         log.flush()
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv, cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT
         )
+        try:
+            while proc.poll() is None:
+                if stop is not None and stop.is_set():
+                    return "error"
+                try:
+                    proc.wait(timeout=0.25)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
 
     if proc.returncode != 0:
         return "error"
@@ -244,6 +233,41 @@ def _run_one(label, dest, argv):
     if "Results match" not in log:
         return "numeric_drift"
     return "ok"
+
+
+def _run_cases(commands, run_dir, prev_run, jobs=1, threads_per_job=None):
+    """Execute independent cases concurrently; keep report order deterministic."""
+    stop = Event()
+    results = [None] * len(commands)
+
+    def run(command):
+        if stop.is_set():
+            return None
+        label, dest, argv = _build(command, run_dir, threads_per_job)
+        print(f"starting {label}", flush=True)
+        status = _run_one(label, dest, argv, stop)
+        verdict, excerpt = _compare(label, status, run_dir, prev_run)
+        return label, status, verdict, excerpt
+
+    pool = ThreadPoolExecutor(max_workers=jobs)
+    try:
+        futures = {
+            pool.submit(run, command): idx
+            for idx, command in enumerate(commands)
+        }
+        for completed, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            results[futures[future]] = result
+            label, status, verdict, _ = result
+            suffix = "" if status == "ok" else f" ({status})"
+            print(
+                f"[{completed}/{len(commands)}] {label}: {verdict}{suffix}",
+                flush=True,
+            )
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+    return results
 
 
 def _find_previous_run(out_dir, current):
@@ -270,6 +294,8 @@ def _compare(label, status, run_dir, prev_run):
     if prev_run is None:
         return "NEW", ""
     prev_path = prev_run / label / "model.txt"
+    if not prev_path.exists() and label.startswith("voyager/"):
+        prev_path = prev_run / label.removeprefix("voyager/") / "model.txt"
     if not prev_path.exists():
         return "NEW", ""
 
@@ -307,7 +333,37 @@ def main():
         action="store_true",
         help="List command labels and exit.",
     )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Compare against this fixed timestamp directory instead of the latest run.",
+    )
+    parser.add_argument(
+        "--suite",
+        type=Path,
+        help="File of exact case labels (legacy Voyager labels accepted).",
+    )
+    parser.add_argument(
+        "--target_hardware",
+        action="append",
+        help="Select target hardware (repeatable).",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Concurrent model processes (default: 1).",
+    )
+    parser.add_argument(
+        "--threads-per-job",
+        type=int,
+        help="PyTorch CPU threads per process; parallel runs default to an equal share of available CPUs, capped at 32.",
+    )
     args = parser.parse_args()
+    if args.jobs < 1 or (
+        args.threads_per_job is not None and args.threads_per_job < 1
+    ):
+        parser.error("jobs and threads-per-job must be positive")
 
     commands = COMMANDS
     if args.only:
@@ -317,9 +373,38 @@ def main():
             if any(_matches(_label(c), p) for p in args.only)
         ]
 
+    if args.target_hardware:
+        commands = [
+            c for c in commands if c.target_hardware in args.target_hardware
+        ]
+    if args.suite:
+        requested = {
+            line.split("#", 1)[0].strip()
+            for line in args.suite.read_text().splitlines()
+        } - {""}
+        available = {_label(c): c for c in COMMANDS}
+        canonical = {
+            label if label in available else "voyager/" + label
+            for label in requested
+        }
+        if missing := canonical - available.keys():
+            parser.error(f"Unknown suite labels: {sorted(missing)}")
+        commands = [c for c in commands if _label(c) in canonical]
+    if not commands:
+        parser.error("No compilation cases matched the selection")
+    jobs = min(args.jobs, len(commands))
+    threads_per_job = args.threads_per_job
+    if threads_per_job is None and jobs > 1:
+        cpus = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else (os.cpu_count() or 1)
+        )
+        threads_per_job = max(1, min(32, cpus // jobs))
+
     if args.list:
         for command in commands:
-            _, _, argv = _build(command, Path("<run_dir>"))
+            _, _, argv = _build(command, Path("<run_dir>"), threads_per_job)
             print(" ".join(shlex.quote(a) for a in argv))
         return 0
 
@@ -335,24 +420,24 @@ def main():
     run_dir = out_dir / timestamp
     run_dir.mkdir()
 
-    prev_run = _find_previous_run(out_dir, timestamp)
+    prev_run = (
+        args.baseline.resolve()
+        if args.baseline
+        else _find_previous_run(out_dir, timestamp)
+    )
+    if args.baseline and not (prev_run / "report.txt").is_file():
+        parser.error(f"Baseline is missing a completed report: {prev_run}")
 
     print(f"voyager codegen CI -> {run_dir}")
     if prev_run is not None:
         print(f"comparing model.txt against previous run: {prev_run.name}")
     else:
         print("no previous run found; this run is the baseline")
-    print(f"running {len(commands)} commands\n")
+    print(
+        f"running {len(commands)} commands with {jobs} workers ({threads_per_job or 32} CPU threads each)\n"
+    )
 
-    results = []  # (label, status, verdict, diff_excerpt)
-    for idx, command in enumerate(commands, 1):
-        label, dest, argv = _build(command, run_dir)
-        print(f"[{idx}/{len(commands)}] {label} ... ", end="", flush=True)
-        status = _run_one(label, dest, argv)
-        verdict, excerpt = _compare(label, status, run_dir, prev_run)
-        results.append((label, status, verdict, excerpt))
-        suffix = "" if status == "ok" else f" ({status})"
-        print(f"{verdict}{suffix}")
+    results = _run_cases(commands, run_dir, prev_run, jobs, threads_per_job)
 
     report = _build_report(results, run_dir, prev_run)
     (run_dir / "report.txt").write_text(report)
@@ -408,7 +493,12 @@ def _build_report(results, run_dir, prev_run):
         current_labels = {r[0] for r in results}
         for p in sorted(prev_run.rglob("model.txt")):
             label = str(p.parent.relative_to(prev_run))
-            if label not in current_labels:
+            canonical = (
+                "voyager/" + label
+                if len(p.parent.relative_to(prev_run).parts) == 3
+                else label
+            )
+            if canonical not in current_labels:
                 lines.append(f"  - MISSING: {label} (in {prev_run.name})")
 
     bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]

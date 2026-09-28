@@ -1,32 +1,23 @@
 import torch
+from compilation.pipeline import PreparedModel, compile_prepared
 from tqdm import tqdm
-
 from transformers import ViTForImageClassification
 from transformers.utils import logging
 
 from voyager_compiler import (
-    DerivedQuantizationSpec,
-    QuantizationConfig,
-    QuantizationSpec,
     convert_pt2e,
     export_model,
-    replace_conv2d_with_im2col,
     prepare_pt2e,
-    transform,
-    compile,
-    derive_bias_qparams_fn,
-    extract_input_preprocessor,
-    fuse_operator,
+    replace_conv2d_with_im2col,
 )
 from voyager_compiler.codegen import (
     pad_vit_embeddings_output,
     remove_softmax_dtype_cast,
     remove_zero_attention_mask,
 )
-from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import get_compile_args, get_transform_args
+from .utils import configure_quantizer, get_context
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -91,12 +82,8 @@ def load_model(args):
     )
 
 
-def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
-):
+def prepare_model(model, quantizer, calibration_data, vector_stages, args):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    transform_args = get_transform_args(args, vector_stages)
-    compile_args = get_compile_args(args)
 
     modules_to_fuse = get_conv_bn_layers(model)
     if len(modules_to_fuse) > 0:
@@ -106,46 +93,20 @@ def quantize_and_dump_model(
 
     timm_model = is_timm_model(args)
 
-    quantizer.set_module_name("head" if timm_model else "classifier", None)
-
-    if args.activation is not None and "microscaling" in args.activation:
-        dtype = args.activation.split(",")[0]
-        # A lookup table's layer takes its entry dtype, and stays unquantized
-        # when the entries keep the model's.
-        if (codebook := parse_codebook_dtype(dtype)) is not None:
-            dtype = codebook[1]
-        qconfig = None
-        if dtype is not None:
-            qspec = QuantizationSpec.from_str(
-                f"{dtype},qs=per_tensor_symmetric"
-            )
-            bias_qspec = DerivedQuantizationSpec(
-                derived_from=None,
-                derive_qparams_fn=derive_bias_qparams_fn,
-                dtype=None,
-            )
-            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
-        quantizer.set_module_name(
-            "^patch_embed.proj$"
-            if timm_model
-            else "^vit.embeddings.patch_embeddings.projection$",
-            qconfig,
-        )
+    configure_quantizer("vit", model, quantizer, args, timm_model=timm_model)
 
     example_args = (calibration_data[0]["image"].to(torch_dtype),)
     vector_lanes = (
-        args.pe_array_size[1] if args.pe_array_size is not None else None
+        get_context(args).hardware.vector_lanes
+        if get_context(args).hardware.pe_array_size is not None
+        else None
     )
 
-    embeddings = (
-        TimmEmbeddings(model) if timm_model else model.vit.embeddings
-    )
+    embeddings = TimmEmbeddings(model) if timm_model else model.vit.embeddings
 
     gm = export_model(model, example_args)
     remove_zero_attention_mask(gm, example_args)
-    pad_vit_embeddings_output(
-        gm, embeddings, example_args, unroll=vector_lanes
-    )
+    pad_vit_embeddings_output(gm, embeddings, example_args, unroll=vector_lanes)
 
     if args.conv2d_im2col:
         replace_conv2d_with_im2col(gm)
@@ -163,18 +124,24 @@ def quantize_and_dump_model(
 
     old_output = get_logits(gm(*example_args))
 
-    transform(gm, example_args, **transform_args, skip_op_fusion=True)
+    return PreparedModel(
+        gm,
+        example_args,
+        old_output,
+        extract_preprocessor=True,
+        output_adapter=get_logits,
+    )
 
-    gm, preprocess_fn = extract_input_preprocessor(gm)
-    example_args = (preprocess_fn(example_args[0]),)
 
-    fuse_operator(gm, vector_stages)
-    gm.graph.print_tabular()
-
-    new_output = get_logits(gm(*example_args)) if args.debug else None
-
-    compile(gm, example_args, **compile_args)
-    return gm, old_output, new_output, preprocess_fn
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
+    """Compatibility wrapper around preparation and the shared runner."""
+    return compile_prepared(
+        prepare_model(model, quantizer, calibration_data, vector_stages, args),
+        args,
+        vector_stages,
+    )
 
 
 def evaluate(model, dataset):

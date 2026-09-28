@@ -13,6 +13,8 @@ scheduler and its GEMM / conv2d / pointwise / pool builders),
 ``bufferization`` (the rewrite pass), ``codegen`` (loop-aware output).
 """
 
+from dataclasses import asdict, dataclass
+
 import torch
 from torch.fx.node import has_side_effect
 
@@ -43,6 +45,7 @@ has_side_effect(torch.ops.higher_order.commit)
 
 __all__ = [
     "bufferize_graph",
+    "BufferizationOptions",
     "annotate_tensor_spaces",
     "print_layer_table",
     "flush_tensor_files",
@@ -52,3 +55,15 @@ __all__ = [
     "plan_memory",
     "MemoryPlan",
 ]
+
+
+@dataclass(frozen=True)
+class BufferizationOptions:
+    """Algorithm choices, separate from hardware buffer capacities."""
+
+    single_buffer_tail: bool = False
+    flash_attention_v3: bool = True
+    bool_mask: bool = True
+
+    def kwargs(self):
+        return asdict(self)

@@ -1,4 +1,5 @@
 import torch
+from compilation.pipeline import PreparedModel, compile_prepared
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
@@ -10,11 +11,9 @@ from transformers import (
 from voyager_compiler import (
     convert_pt2e,
     prepare_pt2e,
-    transform,
-    compile,
 )
 
-from .utils import get_transform_args, get_compile_args
+from .utils import configure_quantizer
 
 
 def load_model(args):
@@ -33,15 +32,10 @@ def load_model(args):
     return model, tokenizer
 
 
-def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
-):
+def prepare_model(model, quantizer, calibration_data, vector_stages, args):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
-
-    compile_args = get_compile_args(args)
-    transform_args = get_transform_args(args, vector_stages)
 
     batch = next(iter(calibration_dataloader))
     input_ids = batch["input_ids"]
@@ -77,7 +71,7 @@ def quantize_and_dump_model(
             logits = self.classifier(pooled_output)
             return logits
 
-    quantizer.set_module_name("classifier", None)
+    configure_quantizer("mobilebert", model, quantizer, args)
 
     gm = prepare_pt2e(MobileBertWrapper(), quantizer, example_args)
 
@@ -97,17 +91,18 @@ def quantize_and_dump_model(
 
     old_output = gm(*example_args)
 
-    transform(gm, example_args, **transform_args)
-    gm.graph.print_tabular()
+    return PreparedModel(gm, example_args, old_output)
 
-    # Verifying the lowered graph re-runs it, which is expensive; gate it on
-    # ``--debug`` so a plain compile skips it.  ``None`` signals "not checked".
-    new_output = None
-    if args.debug:
-        new_output = gm(*example_args)
 
-    compile(gm, example_args, **compile_args)
-    return gm, old_output, new_output
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
+    """Compatibility wrapper around preparation and the shared runner."""
+    return compile_prepared(
+        prepare_model(model, quantizer, calibration_data, vector_stages, args),
+        args,
+        vector_stages,
+    )
 
 
 def evaluate(model, dataset):

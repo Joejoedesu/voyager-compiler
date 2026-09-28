@@ -17,3 +17,9 @@ test/*
 wandb
 .vscode
 tools/artifacts/shards/
+
+!test/test_hardware_config.py
+!test/regression_suite.txt
+
+!test/compilation/
+!test/test_compilation.py

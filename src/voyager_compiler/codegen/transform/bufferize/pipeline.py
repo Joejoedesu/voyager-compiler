@@ -67,6 +67,7 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     get_tiling,
 )
 from voyager_compiler.export_utils import export_model
+from voyager_compiler.hardware_config import VOYAGER
 from voyager_compiler.ops.layout import (
     NCHW_TO_NHWC,
     OIHW_TO_HWIO,
@@ -86,7 +87,7 @@ _DEQUANTIZE = torch.ops.quantized_ops.dequantize.default
 # Default software-pipeline depth (2 = double buffering).  Single source of
 # truth for the ``num_slots`` default across the scheduler and op builders; a
 # spec may override it per operand (``_InputSpec`` / ``_OutputSpec.num_slots``).
-_DEFAULT_NUM_SLOTS = 2
+_DEFAULT_NUM_SLOTS = VOYAGER.num_slots
 
 
 def spec_tiled_dims(spec, grid):
