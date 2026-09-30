@@ -1335,6 +1335,19 @@ def _render(model: GraphModule, output_file: str) -> None:
     g = graphviz.Digraph()
     named = dict(model.named_modules(remove_duplicate=False))
     edges = []
+    regions = model.meta.get("sram_regions", [])
+    membership = {
+        name: region["id"] for region in regions for name in region["nodes"]
+    }
+    clusters = {}
+    for region in regions:
+        cluster = graphviz.Digraph(name="cluster_" + region["id"])
+        cluster.attr(
+            label=f"{region['id']} | SRAM resident | {region['parameter_loading']} | {region['sram_bytes']} B",
+            color="steelblue",
+            style="rounded",
+        )
+        clusters[region["id"]] = cluster
 
     for node in model.graph.nodes:
         if node.op == "get_attr" and not require_allocation(node):
@@ -1342,9 +1355,14 @@ def _render(model: GraphModule, output_file: str) -> None:
         label = _node_label(node, named)
         if label is None:
             continue
-        g.node(node.name, label=label, shape="Mrecord")
+        container = (
+            clusters[membership[node.name]] if node.name in membership else g
+        )
+        container.node(node.name, label=label, shape="Mrecord")
         edges += [(node.name, u.name) for u in node.users]
 
+    for cluster in clusters.values():
+        g.subgraph(cluster)
     g.edges(edges)
     g.render(output_file, format="svg", cleanup=True)
 

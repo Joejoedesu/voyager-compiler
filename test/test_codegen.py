@@ -209,6 +209,16 @@ def build_parser():
         default=False,
     )
     parser.add_argument(
+        "--bufferized_flow",
+        choices=("per_kernel", "resident"),
+        default="per_kernel",
+    )
+    parser.add_argument(
+        "--parameter_loading",
+        choices=("preload", "on_demand"),
+        default="on_demand",
+    )
+    parser.add_argument(
         "--flash_attention_v3",
         action=argparse.BooleanOptionalAction,
         default=True,

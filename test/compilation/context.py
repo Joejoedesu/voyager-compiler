@@ -31,6 +31,18 @@ class CompilationContext:
             qconfigs=self.policy.qconfigs,
             **options,
         )
+        if self.policy.quantization_rules is not None:
+            rule_context = dict(
+                target=self.target,
+                hardware=self.hardware,
+                model=args.model,
+                kind=kind,
+                args=args,
+            )
+            quantizer.set_quantization_rules(
+                self.policy.quantization_rules(rule_context),
+                rule_context,
+            )
 
 
 def resolve_context(args):
@@ -81,6 +93,13 @@ def parse_args(parser, argv=None):
             policy = get_family(target.family)
             if policy.finalize_options is not None:
                 policy.finalize_options(args)
+        if (
+            getattr(args, "parameter_loading", "on_demand") == "preload"
+            and getattr(args, "bufferized_flow", "per_kernel") != "resident"
+        ):
+            raise ValueError(
+                "Parameter preload requires --bufferized_flow resident"
+            )
         args.compilation_context = resolve_context(args)
     except (ValueError, NotImplementedError, KeyError) as exc:
         parser.error(str(exc))

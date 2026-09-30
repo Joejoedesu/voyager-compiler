@@ -24,7 +24,7 @@ import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from threading import Event
@@ -359,6 +359,8 @@ def main():
         type=int,
         help="PyTorch CPU threads per process; parallel runs default to an equal share of available CPUs, capped at 32.",
     )
+    parser.add_argument("--bufferized-flow", choices=("per_kernel", "resident"))
+    parser.add_argument("--parameter-loading", choices=("preload", "on_demand"))
     args = parser.parse_args()
     if args.jobs < 1 or (
         args.threads_per_job is not None and args.threads_per_job < 1
@@ -392,6 +394,18 @@ def main():
         commands = [c for c in commands if _label(c) in canonical]
     if not commands:
         parser.error("No compilation cases matched the selection")
+    if (
+        args.parameter_loading == "preload"
+        and args.bufferized_flow != "resident"
+    ):
+        parser.error("preload requires --bufferized-flow resident")
+    overrides = ""
+    if args.bufferized_flow:
+        overrides += " --bufferized_flow " + args.bufferized_flow
+    if args.parameter_loading:
+        overrides += " --parameter_loading " + args.parameter_loading
+    if overrides:
+        commands = [replace(c, extra=c.extra + overrides) for c in commands]
     jobs = min(args.jobs, len(commands))
     threads_per_job = args.threads_per_job
     if threads_per_job is None and jobs > 1:

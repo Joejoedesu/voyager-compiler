@@ -545,6 +545,36 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         )
 
 
+class SharedAmaxObsFakeQuantize(FusedAmaxObsFakeQuantize):
+    """PTQ group observer: collect the union of ranges, including this call.
+
+    Calibration passes values through so visiting one branch cannot change a
+    later branch's statistics through a moving fake-quant scale. Once observers
+    are disabled, all group uses fake-quantize against the same frozen scale.
+    Finite per-call histories are intentionally not used for a shared group.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.register_buffer("group_amax", torch.zeros_like(self.scale))
+
+    def forward(self, x):
+        if self.observer_on():
+            with torch.no_grad():
+                current = x.detach().abs().amax().float()
+                current = torch.where(
+                    torch.isfinite(current), current, self.group_amax
+                )
+                self.group_amax.copy_(torch.maximum(self.group_amax, current))
+                scale = self.group_amax / self.quant_max
+                scale = torch.where(self.group_amax > 0, scale, self.scale)
+                if self.force_scale_power_of_two:
+                    scale = torch.pow(2, torch.ceil(torch.log2(scale)))
+                self.scale.copy_(scale)
+            return x
+        return super().forward(x)
+
+
 class _BlockFakeQuantize(_FakeQuantize):
     """The parts the block schemes share.
 

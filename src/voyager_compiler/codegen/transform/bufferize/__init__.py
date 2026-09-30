@@ -13,7 +13,7 @@ scheduler and its GEMM / conv2d / pointwise / pool builders),
 ``bufferization`` (the rewrite pass), ``codegen`` (loop-aware output).
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import torch
 from torch.fx.node import has_side_effect
@@ -64,6 +64,20 @@ class BufferizationOptions:
     single_buffer_tail: bool = False
     flash_attention_v3: bool = True
     bool_mask: bool = True
+    flow: str = "per_kernel"
+    parameter_loading: str = "on_demand"
+
+    def __post_init__(self):
+        if self.flow not in ("per_kernel", "resident"):
+            raise ValueError("Unknown bufferized flow")
+        if self.parameter_loading not in ("preload", "on_demand"):
+            raise ValueError("Unknown parameter loading strategy")
+        if self.flow == "per_kernel" and self.parameter_loading != "on_demand":
+            raise ValueError("Parameter preload requires the resident flow")
 
     def kwargs(self):
-        return asdict(self)
+        return dict(
+            single_buffer_tail=self.single_buffer_tail,
+            flash_attention_v3=self.flash_attention_v3,
+            bool_mask=self.bool_mask,
+        )

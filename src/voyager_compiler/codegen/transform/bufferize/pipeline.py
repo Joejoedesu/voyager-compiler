@@ -1083,6 +1083,202 @@ def _stamp_bank_groups(gm, bank_groups):
             alloc.meta["bank_group"] = group
 
 
+class ResidentKernel(PipelinedKernel):
+    """Run the same reduction/tail kernel on windows of retained SRAM.
+
+    Kernels execute sequentially; their boundary DMA overlaps tile compute.
+    Input tiles load once into full retained allocations, output tiles store
+    only after reduction completion. Optional streamed weights use one staging
+    slot with guarded reuse.
+    """
+
+    stream_inputs = ()
+    ingress = ()
+    egress = False
+
+    @staticmethod
+    def window(source, spec, grid_index):
+        if spec is None:
+            return source
+        sizes = list(spec.tile_sizes)
+        steps = getattr(spec, "strides", None) or sizes
+        repeat = getattr(spec, "repeat", None) or (1,) * len(sizes)
+        broadcast = getattr(spec, "is_broadcast", (False,) * len(sizes))
+        offsets = [
+            0
+            if g is None or broadcast[d]
+            else (grid_index[g] // repeat[d]) * steps[d]
+            for d, g in enumerate(spec.index_map)
+        ]
+        if getattr(spec, "transposed", False):
+            sizes[-2:] = reversed(sizes[-2:])
+            offsets[-2:] = reversed(offsets[-2:])
+        view = voyager.subview(source, offsets, sizes, [1] * len(sizes))
+        return (
+            view.transpose(-1, -2)
+            if getattr(spec, "transposed", False)
+            else view
+        )
+
+    def first_visit(self, spec, index):
+        # The first grid point naming this tile: unused grid axes are zero,
+        # and repeated coordinates enter at the start of their repeat group.
+        mapped = {g: r for _, g, r in spec_tiled_dims(spec, self.grid)}
+        first = True
+        for g, extent in enumerate(self.grid):
+            if extent > 1:
+                first = first & (
+                    index[g] % mapped[g] == 0 if g in mapped else index[g] == 0
+                )
+        return first
+
+    def forward(self, *inputs):
+        outputs = [
+            voyager.alloc(s.shape, s.dtype, _SRAM) for s in self.out_specs
+        ]
+        scratch = [
+            voyager.alloc(s.shape, s.dtype, _SRAM) for s in self.scratch_specs
+        ]
+        # Load directly into the retained tensor. Different tiles never
+        # overlap, so prefetch needs no duplicate activation staging buffer.
+        retained = {
+            i: voyager.alloc(list(inputs[i].shape), inputs[i].dtype, _SRAM)
+            for i in self.ingress
+        }
+        ingress_sem = {i: voyager.zeros([1], torch.int32) for i in self.ingress}
+        dram_outputs = (
+            [voyager.alloc(s.shape, s.dtype) for s in self.out_specs]
+            if self.egress
+            else []
+        )
+        store_sem = [voyager.zeros([1], torch.int32) for _ in dram_outputs]
+        streams = {
+            i: _BufferedRef(
+                _BufferedRef._IN,
+                self.in_specs[i],
+                self.grid,
+                1,
+                voyager.alloc(
+                    self.in_specs[i].tile_sizes,
+                    inputs[i].dtype,
+                    _SRAM,
+                    num_slots=1,
+                ),
+            )
+            for i in self.stream_inputs
+        }
+
+        def load_window(i, index):
+            spec = self.in_specs[i]
+            src = self.window(inputs[i], spec, index)
+            dst = self.window(retained[i], spec, index)
+            voyager.async_copy(
+                src,
+                dst,
+                [0] * len(spec.tile_sizes),
+                list(spec.tile_sizes),
+                ingress_sem[i],
+            )
+
+        for i in self.ingress:
+            load_window(i, [0] * self.ndim)
+
+        def cond(step, stores):
+            return step < self.num_steps
+
+        def body(step, stores):
+            index = voyager.delinearize_index(step, self.grid)
+            previous = voyager.delinearize_index(step - 1, self.grid)
+            following = voyager.delinearize_index(step + 1, self.grid)
+            # Issue the next first-use load before waiting for this tile.
+            # Revisited input tiles stay in SRAM, including across consumers.
+            for i in self.ingress:
+                effect_cond(
+                    (step + 1 < self.num_steps)
+                    & self.first_visit(self.in_specs[i], following),
+                    lambda i=i: load_window(i, following),
+                )
+                _guarded_wait(
+                    ingress_sem[i], self.first_visit(self.in_specs[i], index)
+                )
+            ins = []
+            for i, (x, spec) in enumerate(zip(inputs, self.in_specs)):
+                if i not in streams:
+                    ins.append(self.window(retained.get(i, x), spec, index))
+                    continue
+                ref = streams[i]
+                tile, sem = get_slot(ref.slots, 0), get_slot(ref.sem, 0)
+
+                def load(ref=ref, x=x, tile=tile, sem=sem):
+                    ref._load_tile(x, tile, index, sem)
+                    voyager.async_wait(sem)
+
+                effect_cond(
+                    (step == 0) | ref._indices_differ(previous, index), load
+                )
+                ins.append(tile)
+            outs = [
+                self.window(x, s, index)
+                for x, s in zip(outputs, self.out_specs)
+            ]
+            self.kernel(index, *ins, *outs, *scratch)
+            next_stores = []
+            for i, dest in enumerate(dram_outputs):
+                spec = self.out_specs[i]
+                changed = step + 1 == self.num_steps
+                for _, g, r in spec_tiled_dims(spec, self.grid):
+                    changed = changed | (index[g] // r != following[g] // r)
+
+                def store(i=i, dest=dest, spec=spec):
+                    # Previous store overlaps this tile's computation. Drain
+                    # its token before posting the next; drain the last at exit.
+                    _guarded_wait(store_sem[i], stores[i] > 0)
+                    dst = self.window(dest, spec, index)
+                    voyager.async_copy(
+                        outs[i],
+                        dst,
+                        [0] * len(spec.tile_sizes),
+                        list(spec.tile_sizes),
+                        store_sem[i],
+                    )
+
+                effect_cond(changed, store)
+                next_stores.append(
+                    torch.sym_ite(changed, stores[i] + 1, stores[i])
+                )
+            return step + 1, tuple(next_stores)
+
+        _, stores = while_loop(cond, body, (0, (0,) * len(dram_outputs)))
+        for i, sem in enumerate(store_sem):
+            _guarded_wait(sem, stores[i] > 0)
+        return tuple(outputs) + tuple(retained.values()) + tuple(dram_outputs)
+
+
+def _resident_options(node, tiler):
+    return dict(
+        resident=tiler is not None and tiler.resident_bytes is not None,
+        stream_inputs=tuple(
+            i
+            for i, n in enumerate(node.all_input_nodes)
+            if n.meta.get("resident_stream_weight")
+        ),
+        ingress=node.meta.get("resident_ingress", ()),
+        egress=node.meta.get("resident_egress", False),
+    )
+
+
+def _covers_once(spec, shape, grid):
+    """Non-overlapping, complete windows; halos/layout transforms stay whole."""
+    if spec is None or spec.transposed or any(spec.pad or ()):
+        return False
+    steps = spec.strides or spec.tile_sizes
+    tiled = {d: -(-grid[g] // r) for d, g, r in spec_tiled_dims(spec, grid)}
+    return all(
+        steps[d] == size and size * tiled.get(d, 1) == shape[d]
+        for d, size in enumerate(spec.tile_sizes)
+    )
+
+
 def build_pipelined_buffers(
     kernel: Callable,
     grid: Tuple[int, ...],
@@ -1096,12 +1292,24 @@ def build_pipelined_buffers(
     kwargs: Optional[dict] = None,
     wrapper: Optional[Callable] = None,
     bank_groups: Optional[Sequence[Optional[int]]] = None,
+    resident: bool = False,
+    stream_inputs: Tuple[int, ...] = (),
+    ingress: Tuple[int, ...] = (),
+    egress: bool = False,
 ) -> torch.fx.GraphModule:
     """Build the bufferized FX graph (a single rolled ``while_loop`` over
     ``voyager.*`` primitives) for ``kernel`` over ``grid``.  Mirrors
     ``build_pointwise_buffers``'s export / finalize / extent-tag flow.
     """
-    cls = AsyncPipelinedKernel if async_pipeline else PipelinedKernel
+    if resident and async_pipeline:
+        raise ValueError(
+            "Resident kernels require sequential reduction scheduling"
+        )
+    cls = (
+        ResidentKernel
+        if resident
+        else (AsyncPipelinedKernel if async_pipeline else PipelinedKernel)
+    )
     pattern = cls(
         kernel,
         grid,
@@ -1110,13 +1318,25 @@ def build_pipelined_buffers(
         scratch_specs=scratch_specs,
         num_slots=num_slots,
     )
+    if resident:
+        pattern.stream_inputs = stream_inputs
+        pattern.ingress = tuple(
+            i
+            for i in ingress
+            if _covers_once(in_specs[i], inputs[i].shape, grid)
+        )
+        pattern.egress = egress
     num_steps = pattern.num_steps
     if wrapper is not None:
         pattern = wrapper(pattern)
     with _lenient_verifier():
         gm = export_model(pattern, inputs, kwargs=kwargs)
     gm = _finalize_exported_gm(gm)
-    if bank_groups is not None:
+    if resident:
+        gm.meta["resident_ingress"] = pattern.ingress
+        gm.meta["resident_egress"] = pattern.egress
+        gm.meta["resident_steps"] = num_steps
+    if bank_groups is not None and not resident:
         _stamp_bank_groups(gm, bank_groups)
     _tag_loop_extents(gm, [[(0, num_steps, 1)]])
     # Stamp a concrete-offset ``.value`` on every node (incl. loop / cond
@@ -2254,8 +2474,19 @@ def build_conv2d(
     sh, sw = _pair(get_arg_value(anchor, 3, "stride", 1))
     ph, pw = _pair(get_arg_value(anchor, 4, "padding", 0))
     dh, dw = _pair(get_arg_value(anchor, 5, "dilation", 1))
+    native_padding = (
+        tiler is not None
+        and tiler.resident_bytes is not None
+        and bool(ph or pw)
+    )
+    if native_padding and (ny != 1 or nx != 1):
+        # Explicit caller tilings can bypass the constrained search. They
+        # must not turn an interior tile edge into a padded image boundary.
+        return None
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
+    if native_padding:
+        ih, iw = H, W
 
     l3_order = l3_order or CONV_L3_ORDER
     gN, gC = 0, 4
@@ -2272,8 +2503,16 @@ def build_conv2d(
         project((tn, tc, ih, iw), in_dims),
         project((gN, gC, gY, gX), in_dims),  # logical N, C, H, W
         (False,) * 4,
-        strides=project((tn, tc, toh * sh, tow * sw), in_dims),
-        pad=project((0, 0, ph, pw), in_dims),
+        strides=project(
+            (
+                tn,
+                tc,
+                H if native_padding else toh * sh,
+                W if native_padding else tow * sw,
+            ),
+            in_dims,
+        ),
+        pad=None if native_padding else project((0, 0, ph, pw), in_dims),
         pad_value=pad_value,
     )
     w_spec = _InputSpec(
@@ -2334,8 +2573,16 @@ def build_conv2d(
             project((tn, tc // bs, ih, iw), in_dims),
             project((gN, gC, gY, gX), in_dims),
             (False,) * 4,
-            strides=project((tn, tc // bs, toh * sh, tow * sw), in_dims),
-            pad=project((0, 0, ph, pw), in_dims),
+            strides=project(
+                (
+                    tn,
+                    tc // bs,
+                    H if native_padding else toh * sh,
+                    W if native_padding else tow * sw,
+                ),
+                in_dims,
+            ),
+            pad=None if native_padding else project((0, 0, ph, pw), in_dims),
             pad_value=1.0,
         )
         # A grouped weight has a single (or partial) in-channel, so its
@@ -2375,7 +2622,14 @@ def build_conv2d(
 
     def _conv(in_tile, w_tile, bias, kw):
         return target(
-            in_tile, w_tile, bias, [sh, sw], [0, 0], [dh, dw], groups, **kw
+            in_tile,
+            w_tile,
+            bias,
+            [sh, sw],
+            [ph, pw] if native_padding else [0, 0],
+            [dh, dw],
+            groups,
+            **kw,
         )
 
     def _fix_stride(t):
@@ -2430,6 +2684,7 @@ def build_conv2d(
         num_slots=num_slots,
         async_pipeline=async_pipeline,
         bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
+        **_resident_options(node, tiler),
     )
     if num_k > 1 or info is not None:
         outline_dps_ops(gm)
@@ -2743,7 +2998,9 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         (
             None
             if isinstance(a, torch.fx.Node)
-            else tuple(a) if isinstance(a, (list, tuple)) else a
+            else tuple(a)
+            if isinstance(a, (list, tuple))
+            else a
         )
         for a in (dequant.args if dequant is not None else ())
     ]
@@ -2843,6 +3100,7 @@ def build_gemm(
         bank_groups=_bank_group_list(
             node, plan.in_specs, plan.out_specs, scratch_specs
         ),
+        **_resident_options(node, tiler),
     )
     if plan.outline_dps:
         outline_dps_ops(gm)
@@ -3039,6 +3297,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         scratch_specs=scratch_specs,
         num_slots=num_slots,
         bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
+        **_resident_options(node, tiler),
     )
 
     if node.op == "call_module" and anchor is not None:
@@ -3143,6 +3402,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
             (input_t,),
             num_slots=num_slots,
             bank_groups=_bank_group_list(node, [in_spec], out_specs),
+            **_resident_options(node, tiler),
         )
 
     # Fused: run the whole submodule per tile.  The pool's input loads the halo;
@@ -3186,6 +3446,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         tuple(inputs),
         num_slots=num_slots,
         bank_groups=_bank_group_list(node, in_specs, out_specs),
+        **_resident_options(node, tiler),
     )
     outline_dps_ops(gm)
     return gm

@@ -35,6 +35,8 @@ def get_compile_args(args):
         "dump_tensors": args.dump_tensors,
         "runtime_tolerance": args.runtime_tolerance,
         "bufferization_options": BufferizationOptions(
+            flow=getattr(args, "bufferized_flow", "per_kernel"),
+            parameter_loading=getattr(args, "parameter_loading", "on_demand"),
             single_buffer_tail=getattr(args, "single_buffer_tail", False),
             flash_attention_v3=getattr(args, "flash_attention_v3", True),
             bool_mask=getattr(args, "bool_mask", True),

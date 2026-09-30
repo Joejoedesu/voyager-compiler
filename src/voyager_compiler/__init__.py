@@ -297,9 +297,33 @@ def _compile_voyager(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
 
-    gen_compute_graph(model, os.path.join(output_dir, output_file))
+    render_model = model
+    if (
+        bufferization_options is not None
+        and bufferization_options.flow == "resident"
+    ):
+        from voyager_compiler.codegen.transform.bufferize.residency import (
+            clone_graph,
+        )
 
+        render_model = clone_graph(model)
+    else:
+        gen_compute_graph(model, os.path.join(output_dir, output_file))
     lower_to_buffers(model, config, runtime_tolerance, bufferization_options)
+    if render_model is not model:
+        import json
+
+        render_model.meta["sram_regions"] = model.meta.get("sram_regions", [])
+        gen_compute_graph(render_model, os.path.join(output_dir, output_file))
+        with open(os.path.join(output_dir, "sram_regions.json"), "w") as f:
+            json.dump(
+                {
+                    key: model.meta.get(key, [])
+                    for key in ("sram_regions", "sram_fallbacks")
+                },
+                f,
+                indent=2,
+            )
     if before_emit is not None:
         before_emit(model)
     return emit_program(model, flatten_args, output_dir, dump_tensors)
@@ -323,13 +347,45 @@ def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
         else runtime_tolerance
     )
     tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
+    original = None
+    if options.flow == "resident":
+        from voyager_compiler.codegen.transform.bufferize.residency import (
+            clone_graph,
+            plan_resident_regions,
+        )
+
+        original = clone_graph(model)
+        plan_resident_regions(model, tiler, options.parameter_loading)
     bufferize_graph(
         model,
         pipelined=config.double_buffered_l2,
         tiler=tiler,
         **options.kwargs(),
     )
-    plan_memory(model, config)
+    from voyager_compiler.codegen.transform.bufferize.memory_planning import (
+        MemoryPlanningError,
+    )
+
+    try:
+        plan_memory(model, config)
+    except MemoryPlanningError as exc:
+        if original is None or not model.meta.get("sram_regions"):
+            raise
+        # A final placement failure invalidates provisional regions, not the
+        # model. Rebuild from the untouched graph using the original flow.
+        model.graph = original.graph
+        model.meta["sram_regions"] = []
+        model.meta["sram_fallbacks"].append(
+            dict(reason=str(exc), action="whole graph per_kernel")
+        )
+        tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
+        bufferize_graph(
+            model,
+            pipelined=config.double_buffered_l2,
+            tiler=tiler,
+            **options.kwargs(),
+        )
+        plan_memory(model, config)
     print_bufferized_graph(model)
 
     return model

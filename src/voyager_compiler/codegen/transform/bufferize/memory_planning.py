@@ -749,6 +749,10 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
 # ---------------------------------------------------------------------------
 
 
+class MemoryPlanningError(ValueError):
+    """A valid buffer graph cannot be placed in the physical memory."""
+
+
 def plan_memory(model: GraphModule, config) -> MemoryPlan:
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
 
@@ -803,7 +807,7 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
             if reserved
             else ""
         )
-        raise ValueError(
+        raise MemoryPlanningError(
             f"[plan_memory] scratchpad plan needs {scratchpad_bytes} bytes"
             f"{note} > scratchpad_size {capacity}; peak concurrency "
             f"{peak_bytes} B across {len(live)} live scratchpad buffers:"

@@ -173,6 +173,8 @@ class XNNPACKQuantizer(Quantizer):
 
     def __init__(self):
         super().__init__()
+        self.quantization_rules = ()
+        self.rule_context = None
         self.global_config: Optional[QuantizationConfig] = None
         self.object_type_config: Dict[
             Union[Callable, str], Optional[QuantizationConfig]
@@ -184,6 +186,12 @@ class XNNPACKQuantizer(Quantizer):
         self.module_name_object_type_order_config: OrderedDict[
             Tuple[str, Callable, int], Optional[QuantizationConfig]
         ] = {}
+
+    def set_quantization_rules(self, rules, context=None):
+        """Select graph constraints applied immediately before observer injection."""
+        self.quantization_rules = tuple(rules)
+        self.rule_context = context
+        return self
 
     def set_global(
         self, quantization_config: QuantizationConfig
@@ -278,6 +286,14 @@ class XNNPACKQuantizer(Quantizer):
                 model,
                 self.global_config,
                 _get_not_module_type_or_name_filter(tp_list, module_name_list),
+            )
+        if self.quantization_rules:
+            from voyager_compiler.quantization.rules import (
+                scan_quantization_rules,
+            )
+
+            scan_quantization_rules(
+                model, self.quantization_rules, self.rule_context
             )
         return model
 

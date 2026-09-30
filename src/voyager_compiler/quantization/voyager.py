@@ -157,6 +157,14 @@ def _llama(quantizer, args, qconfigs, is_decode):
         quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
 
+def quantization_rules(context):
+    from voyager_compiler.quantization.rules import CONCAT_INT8
+
+    # Applicability is checked against each operation's resolved specs, so a
+    # per-model precision override participates even under a different recipe.
+    return (CONCAT_INT8,)
+
+
 def _voyager_policy():
     compile_defaults = dict(
         layout_policy="systolic", scratchpad_size=2097152, num_banks=16
@@ -201,7 +209,11 @@ def _voyager_policy():
         ),
     }
     return FamilyPolicy(
-        recipes, QUANTIZATION_CONFIGS, configure_model, finalize_options
+        recipes,
+        QUANTIZATION_CONFIGS,
+        configure_model,
+        finalize_options,
+        quantization_rules,
     )
 
 

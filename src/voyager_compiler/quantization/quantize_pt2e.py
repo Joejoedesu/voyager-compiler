@@ -107,9 +107,9 @@ def _get_obs_or_fq_map(
     for edge_or_node, qspec in edge_or_node_to_qspec.items():
         group_id = edge_or_node_to_group_id[edge_or_node]
         if group_id not in group_id_to_obs_or_fq:
-            # TODO: maybe edge_or_node_to_qspec should be
-            # edge_or_node_to_root_qspec, this will simplify the implementation
-            # for _create_obs_or_fq_from_qspec
+            from voyager_compiler.quantization.rules import _resolve
+
+            qspec = _resolve(qspec)
             group_id_to_obs_or_fq[group_id] = _create_obs_or_fq_from_qspec(
                 qspec, obs_or_fq_map, is_qat
             )
@@ -359,6 +359,10 @@ def prepare_qat_pt2e(model: GraphModule, quantizer) -> GraphModule:
             momentum or eps is not 0.1 or 1e-5, the values torchao's
             rewrite writes into the graph.
     """
+    if getattr(quantizer, "quantization_rules", ()):
+        raise ValueError(
+            "Observer-sharing graph rules currently support PTQ, not QAT"
+        )
     graph = model.graph
     for bn in list(graph.nodes):
         if bn.target != torch.ops.aten.batch_norm.default:
@@ -669,7 +673,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     assert modules is not None
     assert isinstance(node.target, str)
     activation_post_process = modules[node.target]
-    device = assert_and_get_unique_device(activation_post_process)
+    assert_and_get_unique_device(activation_post_process)
 
     input_node = node.args[0]
     input_dtype = activation_post_process.dtype

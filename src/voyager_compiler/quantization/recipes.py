@@ -29,6 +29,7 @@ class FamilyPolicy:
     qconfigs: Mapping
     configure_model: Callable
     finalize_options: Callable | None = None
+    quantization_rules: Callable | None = None
 
 
 _FAMILIES = {}

@@ -106,12 +106,14 @@ Start with `test/test_codegen.py`, which owns the CLI and model dispatch.
 | Generic recipe/family types and lookup | `src/voyager_compiler/quantization/recipes.py` |
 | Voyager presets, registration, and model rules | `src/voyager_compiler/quantization/voyager.py` |
 | Voyager LLM tables and annotation helpers | `src/voyager_compiler/quantization/voyager_llm_configs.py` |
+| Observer-time operation rules and shared calibration groups | `src/voyager_compiler/quantization/rules.py` |
 | Resolve CLI options once and write run metadata | `test/compilation/context.py` |
 | Model loading, export, calibration, reference state | `test/utils/models/` |
 | Shared transform/compile/verification orchestration | `test/compilation/pipeline.py` |
 | Public backend dispatch and Voyager stage entry points | `src/voyager_compiler/__init__.py` |
 | Tiling and cost search | `src/voyager_compiler/codegen/transform/tiling/` |
 | Explicit buffers, tile loops, copies, waits, views | `src/voyager_compiler/codegen/transform/bufferize/` |
+| SRAM-region eligibility, placement trials, and boundary transfers | `src/voyager_compiler/codegen/transform/bufferize/residency.py` |
 | Schedule estimation and calibration reports | `src/voyager_compiler/codegen/reporting/` |
 
 Non-obvious invariants:
@@ -151,6 +153,158 @@ and slot count remain hardware properties. Other backends need not use these
 stages or Voyager IR. This refactor does not restore or unify the retired
 per-node emitter.
 
+## Observer-time quantization rules
+
+After normal operator/model annotations and before PT2E injects observers,
+`XNNPACKQuantizer` runs its selected `QuantizationRule`s. A rule supplies a name,
+operation targets, a graph collector returning edges/outputs that must share
+parameters, and an applicability predicate over their resolved specs and target
+context. The scanner merges overlapping groups and validates their specs before
+writing `SharedQuantizationSpec` annotations. Graph folding is independent and
+is not needed to establish these observer groups.
+
+`FamilyPolicy.quantization_rules(context)` selects rules. The context contains
+the target, hardware instance, model, model kind, and resolved CLI options, so a
+family can vary its selection by hardware instance and model. A family without
+that callback has no graph constraints. Direct library callers can use
+`quantizer.set_quantization_rules(rules, context)`.
+
+Voyager selects `CONCAT_INT8`: static per-tensor INT8 concat chains, including
+supported reshape/transpose/alias views, share a calibrated scale. Applicability
+uses resolved per-operation specs, including mixed-precision overrides. The
+scanner constrains participating edges and concat/view outputs; a source's other
+consumers remain separate. Conflicting precision/range/observer settings within
+the required group fail explicitly. Implicit PT2E observer sharing is disabled
+on affected fan-out consumers to prevent a same-dtype sibling from inadvertently
+joining the group.
+
+`SharedAmaxObsFakeQuantize` collects the cumulative maximum across every branch
+and calibration call, including the current call. It passes values through
+while observing, so changing branch order cannot change downstream statistics
+through a moving fake-quant scale. Disabling observers enables fake quantization
+with the common frozen scale; conversion uses that scale directly. Per-call
+finite histories are intentionally not used for these groups. The first rule
+supports symmetric per-tensor amax PTQ; QAT with graph rules is rejected, and
+per-channel, microscaling, and group-wise affine schemes are not automatically
+merged. `model.meta['quantization_rule_groups']` records rule names and members.
+
+## Resident bufferization
+
+`BufferizationOptions.flow` / `--bufferized_flow` selects `per_kernel` (the
+original default) or `resident`. The new flow analyzes existing fused ISA
+nodes before DRAM load/store construction. A region shares on-chip storage
+between its kernels; its members remain separate ISA operations.
+
+```sh
+python test/test_codegen.py resnet18 --target_hardware voyager \
+  --quantization_recipe INT8 --pe_array_size 16,16 \
+  --bufferized_flow resident --parameter_loading on_demand \
+  --model_output_dir /tmp/resnet-sram --debug
+```
+
+Residency is proposed before consulting the DRAM-streaming scheduler. Each
+proposal reserves whole activation tensors and checks their lifetimes with the
+actual allocator. Matrix kernels are then scheduled with those operands pinned
+in SRAM: the search charges the simultaneously live, bank-rounded allocations
+plus reduction workspace, without pricing DRAM transfers on internal edges.
+Eligible boundary input loads and output stores are priced with their first-use
+traffic and pipeline overlap. This lets boundary kernels select multiple compute
+tiles even when the full tensors fit in SRAM. The search score averages reuse
+and reduction phases; the emitted loop is walked for the final timing report.
+Its cache key includes the live allocation budget, weight placement, and boundary
+roles, so an internal-only or streaming schedule cannot answer a boundary query. Pointwise and
+pooling kernels at a region boundary use their existing tiling builders;
+internal pointwise kernels retain whole SRAM operands. Region
+growth preserves graph order and connected dependencies. Retained branches and
+multiple outputs extend lifetimes until their final access or boundary store.
+Compatible contiguous views remain aliases; views needing an offset/layout
+change or exposing a later external mutation retain the original path.
+Compute destinations are allocated
+before their instructions, so they cannot reuse banks that the same instruction
+is still reading.
+
+The initial bank policy is conservative: distinct simultaneously-live buffers
+occupy disjoint whole banks. This satisfies all member kernels' concurrent
+accesses without assuming that kernel-local bank groups can be merged. It can
+reject a region that a more elaborate bank-sharing schedule could execute.
+Address reuse after last access uses the existing allocator. The ordinary
+convolution/GEMM builders retain their compute grid, reduction accumulation,
+and fused-tail completion rules, but access resident operands using SRAM
+subviews instead of DMA slots. A completed output tile is written into its
+resident tensor; multiple compute tiles are not a residency rejection reason.
+
+Padded dense and supported 3x3 depthwise convolutions use Voyager's native
+boundary-zero generation (Matrix InputController / DwCUnit). Their SRAM inputs
+remain unpadded and their compute instructions retain the convolution padding;
+there is no padded DMA or SRAM-to-SRAM staging copy. The outer spatial grid
+keeps the entire image visible to each invocation, while IC/OC tiling, split
+reductions, and hardware-internal L1 spatial tiling remain available. This
+prevents internal tile edges from being mistaken for image boundaries. The
+search constraint and its cache identity enforce this rule; explicit spatial
+tilings that violate it fall back. Native padding currently requires symmetric
+padding of at most three, equal spatial strides, dilation one, and no input
+codebook. Depthwise additionally requires a 3x3, multiplier-one kernel and the
+backend's supported stride geometry. Other cases retain the original path.
+Boundary ingress can pipeline unpadded channel windows; its cost uses the actual
+input dimensions, including for stride-two convolutions.
+
+The scheduled proposal is allocated again with its actual scratch/staging
+buffers. Provisional addresses are cleared before every allocation. Both
+byte-capacity and bank-granularity failures are recorded, and a rejected
+extension closes the last feasible region. A failed search is reported as
+no resident schedule found, not proof that residency is physically impossible.
+An infeasible singleton uses `per_kernel`. A failure in
+final whole-graph allocation rebuilds the original graph through `per_kernel`;
+unexpected compiler errors are not swallowed.
+
+The two `--parameter_loading` strategies are:
+
+- `preload`: load a region's weights, biases, and stored quantization parameters
+  before its first kernel. They consume capacity from region entry until last use.
+- `on_demand`: first try loading each parameter at first use and retaining it
+  until last use within the region. If placement/scheduling fails, retry with
+  ordinary dense matrix weights streamed through a single tile buffer while
+  activations stay pinned. Consecutive uses of the same weight tile reuse it.
+  This bounded retry currently excludes GEMV, MX weight-scale pairs, and sparse
+  formats. Each element of a retained parameter transfers once per region;
+  that transfer may be tiled. Streamed weights may reload according to the
+  compute grid. This is the default strategy.
+
+Neither strategy promises persistence across model invocations. Region records
+include `streamed_parameters` to distinguish retained and streamed weights.
+
+Instruction-immediate scalars and lookup tables retain their existing treatment;
+scalar-producing kernels use the original scalar path rather than region DMA.
+Activation ingress/egress uses the existing DMA and wait primitives, pipelined
+with the boundary kernel's compute tiles. The first input tile is primed before
+the loop; each next first-use tile is prefetched directly into its window of the
+full SRAM allocation before waiting for the current tile. Grid revisits and
+later consumers reuse those windows without another load. This adds no duplicate
+activation staging buffers. Input windows must be non-overlapping and cover the
+whole tensor; halo or transposed input windows retain the whole-load path.
+Preloaded parameters still load before the region's first kernel.
+
+An externally visible output tile stores after its reduction and fused tail
+finish, while the next tile computes. The final store is drained before leaving
+the kernel. The SRAM output remains available to other region members, including
+when that intermediate is also an external output. Internal edges use SRAM
+buffers directly, without SRAM-to-SRAM DMA. A one-tile pointwise operation keeps
+the simpler whole-operation path, since there is no next tile to overlap.
+Execution is sequential between kernels; compute dependencies are preserved
+without an additional asynchronous cross-kernel schedule. Pooling halo transfers, external
+mutations, sparse kernels, explicit reduction workspaces, dynamic operands, and
+unsupported layouts use the original builders. An in-place ISA tail operating
+on a fresh internal intermediate is allowed.
+
+For `resident`, the compiled SVG is rendered after the final placement decision,
+using the original kernel graph. Graphviz boxes identify accepted regions, their
+parameter strategy, and bank-rounded SRAM footprint. `sram_regions.json` records
+the same accepted regions and fallback reasons. Existing schedule reports count
+the emitted boundary transfers, so activation/weight DRAM bytes reflect the
+chosen flow. A fully resident single-input/output graph needs only activation
+ingress and egress, plus its parameter transfers. Each accepted region occupies
+one contiguous layer range in `layers.txt`, including all of its boundary stores.
+
 `--debug` executes the final bufferized graph for every model. Previously,
 vision/BERT/MobileBERT verified the transformed graph before compilation.
 A newly visible numerical warning is therefore not automatically a regression:
@@ -178,6 +332,13 @@ at 32 PyTorch threads per process. `--threads-per-job N` overrides this budget.
 Serial execution keeps the previous 32-thread default. Start with two workers:
 large models require separate memory, and excessive concurrency can slow the
 suite. Interrupting a run cancels queued cases and terminates active processes.
+
+The CI driver also accepts `--bufferized-flow resident` and
+`--parameter-loading preload|on_demand`, forwarding them to every selected case.
+Use a separate output directory for each flow/strategy. Compare the default
+flow to the fixed reference; Residency planning intentionally changes emitted programs,
+so validate its numerical results and transfer counts separately. `NEW` means
+a new artifact was produced, not that it matched the default-flow reference.
 
 Use the checkout's active Python environment (in this workspace,
 `/home/zhouhua/Research/ML/ml-env/bin/python`).

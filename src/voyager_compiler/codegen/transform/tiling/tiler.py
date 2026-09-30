@@ -25,6 +25,7 @@ import torch
 import interstellar
 from voyager_compiler.codegen.node_info import (
     _pair,
+    bound_operands,
     get_anchor_node,
     get_arg_value,
     is_bmm,
@@ -133,6 +134,11 @@ class TilerContext:
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     cache: dict = field(default_factory=dict)
     constraints: dict = field(default_factory=dict)
+    # A provisional placement pins all operands in SRAM. This is the live,
+    # bank-rounded footprint, including other kernels' retained tensors.
+    # None selects the original DRAM-streaming search.
+    resident_bytes: Optional[int] = None
+    stream_weights: bool = False
 
 
 def build_interstellar_tiler(
@@ -398,6 +404,8 @@ def make_size_fn(
     vector_lanes=None,
     *,
     spmm_scale_rows_limit,
+    resident_bytes=None,
+    stream_weights=False,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -688,6 +696,22 @@ def make_size_fn(
         )
         if groups is None:
             return (float("inf"),) * 3
+
+        if resident_bytes is not None and level == 2:
+            # Operands already have whole-tensor allocations. Compute tiles
+            # are views, not additional DMA slots. Only reduction workspace
+            # adds storage to that provisional placement.
+            workspace = regions * (
+                math.ceil(scratch / bank_size) * bank_size
+                if bank_size
+                else scratch
+            )
+            staging = (
+                _alloc_bytes(counts[_FL], fl_bits) if stream_weights else 0
+            )
+            if bank_size:
+                staging = math.ceil(staging / bank_size) * bank_size
+            return (resident_bytes, workspace, staging)
 
         out = [0.0, 0.0, 0.0]
         if not bank_size:
@@ -1593,6 +1617,15 @@ class RuntimeCalculator:
             * blockings[le.OX][1]
             * blockings[le.OX][2]
         )
+        if getattr(self, "resident_input_hw", None) is not None:
+            # Native padded resident invocations load the actual unpadded
+            # image, which may differ from the output extent (e.g. stride 2).
+            input_elems = (
+                partitionings[le.IC][0]
+                * blockings[le.IC][1]
+                * blockings[le.IC][2]
+                * math.prod(self.resident_input_hw)
+            )
         weight_elems = (
             partitionings[le.IC][0]
             * blockings[le.IC][1]
@@ -1679,6 +1712,50 @@ class RuntimeCalculator:
             "output": output_tiles * sum(output_sizes),
             "tail": sum(t * s for (_, t), s in zip(tail_dmas, tail_sizes)),
         }
+
+        if getattr(self, "resident", False):
+            self.dram_bytes = dict.fromkeys(self.dram_bytes, 0)
+            boundary = getattr(self, "resident_boundary", (False,) * 5)
+            # A retained window loads on its first visit, not every time an
+            # outer output-channel/batch loop revisits it. The byte footprint
+            # stays pinned; these costs choose the boundary's compute grid.
+            incoming = [
+                s for s, enabled in zip(input_sizes, boundary[:2]) if enabled
+            ]
+            weights = [
+                s for s, enabled in zip(weight_sizes, boundary[2:4]) if enabled
+            ]
+            unique_input = self.batch * math.prod(
+                blockings[d][3] for d in _IF_DIMS
+            )
+            unique_weight = self.weight_batch * math.prod(
+                blockings[d][3] for d in _FL_DIMS
+            )
+            self.dram_bytes["input"] = unique_input * sum(incoming)
+            self.dram_bytes["weight"] = unique_weight * sum(weights)
+            self.dram_bytes["output"] = (
+                output_tiles * sum(output_sizes) if boundary[4] else 0
+            )
+            step = matrix_cycles
+            if num_k > 1 or self.single_k_tail_extra_pass:
+                step += vector_cycles / num_k
+            # Rank the grid with exposed first loads/last stores and overlap.
+            # Reuse and reduction phases are averaged for this search score;
+            # the emitted loop's exact timing comes from estimate_schedule.
+            total = _sweep_cycles(
+                [
+                    (store if boundary[4] else 0, output_tiles),
+                    (transfer(*incoming), unique_input),
+                    (transfer(*weights), unique_weight),
+                ],
+                l3_blocks,
+                step,
+            )
+            if getattr(self, "stream_weights", False):
+                # The bounded large-weight retry still has one staging slot.
+                total += weight_steps * transfer(weight_sizes[0])
+                self.dram_bytes["weight"] += weight_steps * weight_sizes[0]
+            return total
 
         dmas = [
             (store, output_tiles),
@@ -1928,6 +2005,33 @@ def _prepare_search(node, tiler, constraint=None):
             d if d is not None else v.dtype for d, v in zip(tracked, vals)
         ]
 
+    ingress = {
+        node.all_input_nodes[i] for i in node.meta.get("resident_ingress", ())
+    }
+    if tiler.resident_bytes is not None and is_conv2d(anchor):
+        padding = _pair(get_arg_value(anchor, 4, "padding", 0))
+        if any(padding):
+            # A native padded invocation must see the full image boundary.
+            # L1 spatial tiling remains free; only the outer SRAM-view grid
+            # keeps H/W whole. IC/OC tiling and reduction are still searched.
+            dims = (
+                NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
+            )
+            _, _, h, w = unproject(anchor.value.shape, dims)
+            constraint = TileConstraint(exact=((le.OY, h), (le.OX, w))).merged(
+                constraint
+            )
+    bound = bound_operands(node, sub_gm)
+    boundary = tuple(
+        bound.get(n, n) in ingress
+        for n in (
+            anchor.args[0],
+            anchor.kwargs.get("input_scale"),
+            anchor.args[1],
+            anchor.kwargs.get("weight_scale"),
+        )
+    ) + (bool(node.meta.get("resident_egress")),)
+
     key = _layer_cache_key(anchor) + (
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
@@ -1940,6 +2044,9 @@ def _prepare_search(node, tiler, constraint=None):
         outlier_pct,
         out_outlier_pct,
         outlier_rate,
+        tiler.resident_bytes,
+        tiler.stream_weights,
+        boundary,
     )
 
     layer = _extract_layer_from_node(anchor)
@@ -2001,7 +2108,9 @@ def _prepare_search(node, tiler, constraint=None):
         tiler.config.output_slack,
         tiler.config.spmm_row_cycles,
         output_stream_beats,
-        double_buffered_l2=tiler.config.double_buffered_l2,
+        double_buffered_l2=(
+            tiler.config.double_buffered_l2 and tiler.resident_bytes is None
+        ),
         batch=batch,
         weight_batch=batch // weight_repeat,
         has_tail=has_tail,
@@ -2019,6 +2128,30 @@ def _prepare_search(node, tiler, constraint=None):
         bank_size=tiler.config.bank_size,
         weight_transposed=transposed,
     )
+    rc.resident = tiler.resident_bytes is not None
+    rc.stream_weights = tiler.stream_weights
+    native_padding = (
+        rc.resident
+        and is_conv2d(anchor)
+        and any(_pair(get_arg_value(anchor, 4, "padding", 0)))
+    )
+    if native_padding:
+        dims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
+        rc.resident_input_hw = unproject(anchor.args[0].value.shape, dims)[2:]
+    # Match the direct-window ingress contract: transposed weights and
+    # convolution halos/gaps retain whole loads outside the tile loop.
+    dense_input = (
+        native_padding
+        or not is_conv2d(anchor)
+        or (layer.hfil == layer.wfil == layer.hstd == layer.wstd == 1)
+    )
+    rc.resident_boundary = (
+        boundary[0] and dense_input,
+        boundary[1] and dense_input,
+        boundary[2] and not transposed,
+        boundary[3] and not transposed,
+        boundary[4],
+    )
 
     # Built up front rather than per attempt: each one reads the node, which
     # only the parent may do.  They close over it, so they cannot be pickled --
@@ -2031,8 +2164,8 @@ def _prepare_search(node, tiler, constraint=None):
         has_tail=has_tail,
         single_k_tail_extra_pass=single_k_tail_extra_pass,
         tail_keeps_shape=tail_keeps_shape,
-        scratch_regions=scratch_regions,
-        num_slots=tiler.config.num_slots,
+        scratch_regions=1 if rc.resident else scratch_regions,
+        num_slots=1 if rc.resident else tiler.config.num_slots,
         batch=batch,
         weight_batch=batch // weight_repeat,
         outlier_pct=outlier_pct,
@@ -2040,6 +2173,8 @@ def _prepare_search(node, tiler, constraint=None):
         bank_width=tiler.config.bank_width,
         vector_lanes=tiler.config.vector_lanes,
         spmm_scale_rows_limit=tiler.config.spmm_scale_rows,
+        resident_bytes=tiler.resident_bytes,
+        stream_weights=tiler.stream_weights,
     )
     return key, _Search(anchor.name, tiler, layer, rc, size_fn)
 
@@ -2427,6 +2562,14 @@ def get_tiling(node, tiler=None):
     # on the vector unit and has a search of its own.
     constraint = tiler.constraints.get(anchor)
     if is_fully_connected(anchor):
+        if tiler.resident_bytes is not None:
+            if tiler.stream_weights:
+                raise RuntimeError(
+                    f"{anchor.name}: no tiling fits on chip (resident GEMV weight streaming unsupported)"
+                )
+            # The complete operand placement has already been checked. GEMV
+            # needs no cross-tile reduction workspace in this whole view.
+            return gemm_batch + (1, 1, 1), None
         counts = gemv_op_tiling(node, tiler.config, constraint)
         return gemm_batch + counts, None
 

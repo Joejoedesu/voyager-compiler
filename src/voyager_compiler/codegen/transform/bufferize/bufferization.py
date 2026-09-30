@@ -59,9 +59,6 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     build_pointwise,
     build_pool,
 )
-from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
-    build_sparse_gemm,
-)
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     BASE_TABLE_TAG,
     GEOMETRY_META,
@@ -69,8 +66,8 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     build_quantize_mx_outlier,
     merge_base_tables,
 )
-from voyager_compiler.codegen.transform.bufferize.view_lowering import (
-    lower_views,
+from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
+    build_sparse_gemm,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
@@ -79,6 +76,9 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _passed_whole,
     _ScratchSpec,
     _subgraph,
+)
+from voyager_compiler.codegen.transform.bufferize.view_lowering import (
+    lower_views,
 )
 from voyager_compiler.codegen.transform.tiling.sparse import plan_csr_slices
 from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
@@ -124,7 +124,7 @@ _VOYAGER_FILL = torch.ops.voyager.fill.default
 _SUBVIEW = torch.ops.voyager.subview.default
 
 
-def annotate_tensor_spaces(gm: GraphModule) -> None:
+def annotate_tensor_spaces(gm: GraphModule, *, validate_compute=True) -> None:
     """Alloc-only memory model: mark the *buffers* and validate that every tile
     computation lands in one.
 
@@ -145,9 +145,19 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
     Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
     when an op's result is the body's output, the check threads to the users of
     the loop / cond node in the parent graph.  A violation raises.
+
+    Provisional residency proposals may set ``validate_compute=False`` before
+    streamed operands acquire staging buffers. The lowered graph must always
+    pass the default validation before allocation/emission.
     """
     codebooks = _collect_codebook_nodes(gm)
-    _annotate_and_validate(gm, codebooks, parent_hop=None, parent_ctx=None)
+    _annotate_and_validate(
+        gm,
+        codebooks,
+        parent_hop=None,
+        parent_ctx=None,
+        validate_compute=validate_compute,
+    )
 
 
 def _is_compute(node: Node) -> bool:
@@ -280,7 +290,9 @@ def _validate_compute(node: Node, codebooks: set, ctx: tuple) -> None:
         )
 
 
-def _walk_region(gm, hop, operands, graph_args, codebooks, ctx) -> None:
+def _walk_region(
+    gm, hop, operands, graph_args, codebooks, ctx, validate_compute=True
+) -> None:
     """Walk each body / branch of ``hop`` with its placeholders seeded from the
     operands bound to them, so a tile view inside resolves to the right
     buffer."""
@@ -292,11 +304,17 @@ def _walk_region(gm, hop, operands, graph_args, codebooks, ctx) -> None:
         for operand, ph in zip(operands, phs):
             if (space := _space(operand)) is not None:
                 ph.meta["space"] = space
-        _annotate_and_validate(sub, codebooks, hop, ctx)
+        _annotate_and_validate(
+            sub, codebooks, hop, ctx, validate_compute=validate_compute
+        )
 
 
 def _annotate_and_validate(
-    gm: GraphModule, codebooks: set, parent_hop, parent_ctx
+    gm: GraphModule,
+    codebooks: set,
+    parent_hop,
+    parent_ctx,
+    validate_compute=True,
 ) -> None:
     ctx = (gm, parent_hop, parent_ctx)
     for node in gm.graph.nodes:
@@ -327,16 +345,39 @@ def _annotate_and_validate(
             operands = list(node.args[2])
             if len(node.args) > 3:
                 operands += list(node.args[3])
-            _walk_region(gm, node, operands, (node.args[1],), codebooks, ctx)
+            _walk_region(
+                gm,
+                node,
+                operands,
+                (node.args[1],),
+                codebooks,
+                ctx,
+                validate_compute,
+            )
         elif node.target is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            _walk_region(gm, node, operands, node.args[1:3], codebooks, ctx)
+            _walk_region(
+                gm,
+                node,
+                operands,
+                node.args[1:3],
+                codebooks,
+                ctx,
+                validate_compute,
+            )
         elif node.target is _COMMIT:
             _walk_region(
-                gm, node, list(node.args[1:]), (node.args[0],), codebooks, ctx
+                gm,
+                node,
+                list(node.args[1:]),
+                (node.args[0],),
+                codebooks,
+                ctx,
+                validate_compute,
             )
         elif _is_compute(node):
-            _validate_compute(node, codebooks, ctx)
+            if validate_compute:
+                _validate_compute(node, codebooks, ctx)
         elif node.target is _VOYAGER_INSERT:
             src, dst = node.args[0], node.args[1]
             # The Scratchpad rule is about datapath tiles.  A cloned buffer
@@ -497,9 +538,7 @@ def propagate_logical_dtypes(
             )
         elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            _thread_hop(
-                gm, node, operands, (node.args[1], node.args[2]), rules
-            )
+            _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
         elif t is _COMMIT:
             _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
         elif rules.get(t) is not None:
@@ -636,8 +675,7 @@ def _nest_output_values(sub_gm) -> list:
     if not isinstance(outs, (tuple, list)):
         outs = [outs]
     return [
-        getattr(n, "value", None) if isinstance(n, Node) else None
-        for n in outs
+        getattr(n, "value", None) if isinstance(n, Node) else None for n in outs
     ]
 
 
@@ -897,6 +935,8 @@ def bufferize_graph(
     for gm, node, scope in _sites(model):
         modules.add(gm)
         graph = gm.graph
+        if node.meta.get("sram_lowered"):
+            continue
         if node.op not in ("call_module", "call_function"):
             continue
 
@@ -932,9 +972,9 @@ def bufferize_graph(
                     async_pipeline=pipelined,
                     tiler=tiler,
                 )
-            elif anchor.kwargs.get(
-                "A_indptr"
-            ) is not None or gemm_produces_csr(node):
+            elif anchor.kwargs.get("A_indptr") is not None or gemm_produces_csr(
+                node
+            ):
                 # A GEMM whose activation carries an outlier CSR: same dense
                 # nest, plus the per-step gather of the row tile's blocks.
                 sub_gm = build_sparse_gemm(
@@ -957,9 +997,7 @@ def bufferize_graph(
                 sub_gm = (
                     build_attention_fa3(node, tiler=tiler, bool_mask=bool_mask)
                     if flash_attention_v3
-                    else build_attention(
-                        node, num_slots=num_slots, tiler=tiler
-                    )
+                    else build_attention(node, num_slots=num_slots, tiler=tiler)
                 )
             elif csr_quantize_node(node) is not None:
                 # A row-swept producer: the quantize needs a per-K-slice tiling
@@ -983,9 +1021,7 @@ def bufferize_graph(
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):
-                sub_gm = build_pointwise(
-                    node, num_slots=num_slots, tiler=tiler
-                )
+                sub_gm = build_pointwise(node, num_slots=num_slots, tiler=tiler)
             else:
                 sub_gm = None
 
@@ -1094,9 +1130,9 @@ def bufferize_graph(
         else:
             dtypes = node.meta.get("dtype")
             for user in list(node.users):
-                assert (
-                    user.target is operator.getitem
-                ), f"multi-output fused node {node} has non-getitem user {user}"
+                assert user.target is operator.getitem, (
+                    f"multi-output fused node {node} has non-getitem user {user}"
+                )
                 idx = user.args[1]
                 res = results[idx]
                 if (
