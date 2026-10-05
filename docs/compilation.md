@@ -36,9 +36,10 @@ registered target without embedding its quantization rules in the adapter.
 A target instance has a name, family, backend, hardware factory and optional
 recipe overrides. Multiple instances can share one family's policies while
 providing different hardware factories or overriding individual recipes.
-Currently only the `voyager` instance/backend is registered; its CLI geometry
-variants remain separate test cases. Gemmini and Trainium implementations are
-future work, and their names are not accepted until registered.
+This checkout registers `voyager`, `trainium-v2`, and `trainium-v3`. Voyager's
+CLI geometry variants remain separate test cases. Trainium reuses the shared
+bufferized pipeline and converts its emitted collaterals to NKI; see
+[Trainium support and limits](trainium.md). Gemmini is not registered here.
 
 Quantization resolution has two parts: the named `--quantization_recipe`
 selects instance-specific defaults, falling back to the family, with optional
@@ -66,8 +67,8 @@ IR, without changing `model.txt`.
 An instance selects a family, a backend and a hardware factory. The hardware
 factory constructs the target's own graph; it must not adopt Voyager topology
 or parser defaults accidentally. A backend provides validation, fusion policy,
-transformation and compilation. Only the Voyager backend is implemented.
-Unknown targets, missing backends and unsupported Voyager topologies fail.
+transformation and compilation. Voyager and Trainium backends are implemented
+here. Unknown targets, missing backends and unsupported topologies fail.
 
 `quantization/recipes.py` defines the generic `Recipe` and `FamilyPolicy` types
 and the family registration/lookup functions. It contains no hardware-specific

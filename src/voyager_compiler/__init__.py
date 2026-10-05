@@ -240,7 +240,9 @@ def _transform_voyager(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    config.require_backend("voyager")
+    from voyager_compiler.lowering import validate_bufferized_target
+
+    validate_bufferized_target(config)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -292,7 +294,9 @@ def _compile_voyager(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    config.require_backend("voyager")
+    from voyager_compiler.lowering import validate_bufferized_target
+
+    validate_bufferized_target(config)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -339,7 +343,9 @@ def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
         BufferizationOptions,
     )
 
-    config.require_backend("voyager")
+    from voyager_compiler.lowering import validate_bufferized_target
+
+    validate_bufferized_target(config)
     options = options or BufferizationOptions()
     tolerance = (
         DEFAULT_RUNTIME_TOLERANCE

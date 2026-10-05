@@ -67,6 +67,8 @@ def get_target(name="voyager"):
 
 
 class VoyagerBackend:
+    uses_bufferized_flow = True
+
     def validate(self, config):
         from voyager_compiler.voyager_adapter import interstellar_memory
 
@@ -94,3 +96,13 @@ register_backend("voyager", VoyagerBackend())
 register_target(
     Target("voyager", "voyager", "voyager", AcceleratorConfig.from_args)
 )
+
+from voyager_compiler.quantization.trainium import (
+    register_policy as _trainium_policy,
+)
+from voyager_compiler.trainium.hardware import (
+    register_targets as _trainium_targets,
+)
+
+_trainium_policy()
+_trainium_targets()

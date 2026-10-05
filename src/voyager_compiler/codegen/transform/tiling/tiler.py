@@ -58,9 +58,12 @@ from voyager_compiler.codegen.transform.tiling.search import (
     gemv_op_tiling,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.lowering import (
+    interstellar_memory,
+    validate_bufferized_target,
+)
 from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
 from voyager_compiler.shape_prop import ShapeProp, set_node_value
-from voyager_compiler.voyager_adapter import interstellar_memory
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -139,6 +142,9 @@ class TilerContext:
     # None selects the original DRAM-streaming search.
     resident_bytes: Optional[int] = None
     stream_weights: bool = False
+    matrix_only: bool = False
+    mapping_policy: object = None
+    interstellar_cost_tradeoff: bool = True
 
 
 def build_interstellar_tiler(
@@ -169,7 +175,17 @@ def build_interstellar_tiler(
     so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     """
-    config.require_backend("voyager")
+    validate_bufferized_target(config)
+    from voyager_compiler.codegen.transform.tiling.policy import (
+        VoyagerMappingPolicy,
+    )
+    from voyager_compiler.targets import get_backend
+
+    factory = getattr(
+        get_backend(config.backend), "mapping_policy", VoyagerMappingPolicy
+    )
+    mapping_policy = factory(config)
+    matrix_only = mapping_policy.search_fully_connected
     ic_dim, oc_dim = config.pe_array_size
 
     if dram_access_cost is not None:
@@ -189,52 +205,15 @@ def build_interstellar_tiler(
             for level in config.memory.levels
         )
         config = replace(config, memory=replace(config.memory, levels=levels))
+    memory_spec = interstellar_memory(config)
     architecture = interstellar.Resource(
-        **interstellar_memory(config),
+        **memory_spec,
         mac_capacity=0,
-        partition_mode=[0] * len(config.memory.levels),
+        partition_mode=[0] * len(memory_spec["buf_capacity_list"]),
         invalid_underutilized=False,
     )
 
-    # L1 IC is outermost; the inner order is pinned to FY > FX > OY > OX.
-    # OX/OY innermost is never slower -- the L1 sweep costs
-    # ``max(loading, reused_tile) * remaining``, monotone in the reused
-    # tile -- and the arrangement of the loops above them ties on both
-    # runtime and energy, so FX/FY are fixed to the representative the
-    # search's first-seen tie-break picked anyway.  FX=2/FY=3 assumes a
-    # square kernel (equal FX/FY blocking); a non-square model may prefer
-    # them swapped.
-    schedule_constraint = {
-        "schedule_hint": {
-            "IC": {
-                "level0": {"order": 1, "partitioning_size": ic_dim},
-                "level1": {"order": -1},
-                "level2": {"order": 0},
-                "level3": {"order": 0},
-            },
-            "OC": {
-                "level0": {"order": 0, "partitioning_size": oc_dim},
-            },
-            "OX": {
-                "level1": {"order": 0},
-            },
-            "OY": {
-                "level1": {"order": 1},
-            },
-            "FX": {
-                "level0": {"blocking_size": 1, "partitioning_size": 1},
-                "level1": {"order": 2},
-                "level2": {"blocking_size": 1, "partitioning_size": 1},
-                "level3": {"blocking_size": 1, "partitioning_size": 1},
-            },
-            "FY": {
-                "level0": {"blocking_size": 1, "partitioning_size": 1},
-                "level1": {"order": 3},
-                "level2": {"blocking_size": 1, "partitioning_size": 1},
-                "level3": {"blocking_size": 1, "partitioning_size": 1},
-            },
-        }
-    }
+    schedule_constraint = mapping_policy.schedule()
     schedule_data = interstellar.extract_input.extract_schedule_info(
         schedule_constraint, 4
     )
@@ -248,6 +227,9 @@ def build_interstellar_tiler(
         schedule=schedule,
         config=config,
         runtime_tolerance=runtime_tolerance,
+        matrix_only=matrix_only,
+        mapping_policy=mapping_policy,
+        interstellar_cost_tradeoff=not mapping_policy.speed_only,
     )
 
 
@@ -1816,13 +1798,15 @@ class RuntimeCalculator:
         return total_time
 
 
-def _extract_layer_from_node(node):
+def _extract_layer_from_node(node, matrix_only=False):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
     Return None for layers that should be skipped (depthwise, FC with batch=1,
     3-channel first conv, unsupported weight shapes).
     """
-    if is_depthwise_conv(node) or is_fully_connected(node):
+    if is_depthwise_conv(node) or (
+        is_fully_connected(node) and not matrix_only
+    ):
         return None
 
     weight_shape = node.args[1].shape
@@ -1912,7 +1896,7 @@ def _prepare_search(node, tiler, constraint=None):
     anchor = get_anchor_node(node)
     if (
         not is_gemm_op(anchor)
-        or is_fully_connected(anchor)
+        or (is_fully_connected(anchor) and not tiler.matrix_only)
         or anchor.meta.get("l2_tiling") is not None
     ):
         return None
@@ -2049,7 +2033,7 @@ def _prepare_search(node, tiler, constraint=None):
         boundary,
     )
 
-    layer = _extract_layer_from_node(anchor)
+    layer = _extract_layer_from_node(anchor, matrix_only=tiler.matrix_only)
     if layer is None:
         return key, None
 
@@ -2156,10 +2140,13 @@ def _prepare_search(node, tiler, constraint=None):
     # Built up front rather than per attempt: each one reads the node, which
     # only the parent may do.  They close over it, so they cannot be pickled --
     # hence a forked worker rather than a spawned one.
-    size_fn = make_size_fn(
-        anchor,
-        out_dtype,
-        fused_specs,
+    size_fn, rc = tiler.mapping_policy.prepare(
+        make_size_fn,
+        rc,
+        int(anchor.value.shape[0]) if is_conv2d(anchor) else 1,
+        node=anchor,
+        out_dtype=out_dtype,
+        fused_specs=fused_specs,
         constraint=constraint,
         has_tail=has_tail,
         single_k_tail_extra_pass=single_k_tail_extra_pass,
@@ -2200,6 +2187,8 @@ def _run_search(search):
             search.rc.calculate_runtime,
             verbose=False,
             runtime_tolerance=search.tiler.runtime_tolerance,
+            cost_calc_func=getattr(search.rc, "calculate_memory_cost", None),
+            cost_tradeoff=search.tiler.interstellar_cost_tradeoff,
         )
     except AssertionError as e:
         # The optimizer reports "nothing fits" with a bare assert, so match
@@ -2561,7 +2550,7 @@ def get_tiling(node, tiler=None):
     # Interstellar maps a systolic array and skips a batch-1 GEMM; that one runs
     # on the vector unit and has a search of its own.
     constraint = tiler.constraints.get(anchor)
-    if is_fully_connected(anchor):
+    if is_fully_connected(anchor) and not tiler.matrix_only:
         if tiler.resident_bytes is not None:
             if tiler.stream_weights:
                 raise RuntimeError(
@@ -2614,6 +2603,12 @@ def get_tiling(node, tiler=None):
         "runtime_calculator": search.rc,
         "layer": search.layer,
     }
+
+    plan = tiler.mapping_policy.bufferization(
+        search.rc, tiler.arch, search.layer, mapping, bank_groups, scratch_slots
+    )
+    anchor.meta["tiling"]["buffer_plan"] = plan
+    anchor.meta["tiling"]["scratch_slots"] = plan.scratch_slots
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 

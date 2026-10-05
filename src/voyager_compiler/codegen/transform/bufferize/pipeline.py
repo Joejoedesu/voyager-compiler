@@ -42,6 +42,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     commit,
     oracle_disabled,
 )
+from voyager_compiler.codegen.transform.bufferize.plan import buffer_plan
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _build_fused_gm,
     _compute_input_spec,
@@ -1507,7 +1508,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
             out_tiling = None
         else:
             ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
-            out_tiling = project((1, nk, ny, nx), odims)  # physical counts
+            out_tiling = project(
+                (buffer_plan(anchor).batch_tiles, nk, ny, nx), odims
+            )  # physical counts
     else:
         nb = anchor.value.ndim - 2
         order = l3_order or GEMM_L3_ORDER
@@ -2376,7 +2379,7 @@ def _gemm_scratch_and_kernel(
         # count is the tiler's per-node call (the scratch ladder winner,
         # stamped with the tiling).
         sync = not split_k_tail_fusible or split is not None
-        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
+        scratch_slots = buffer_plan(anchor).scratch_slots
         slots = scratch_slots if sync else 1
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(
@@ -2468,7 +2471,13 @@ def build_conv2d(
     if groups != 1 or tiling is None:
         tiling = (1, 1, 1, 1)
     ny, nx, nk, nc = tiling
-    tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
+    tn, toh, tow, tc, tk = (
+        N // buffer_plan(anchor).batch_tiles,
+        oH // ny,
+        oW // nx,
+        C // nc,
+        K // nk,
+    )
     num_k = nc
 
     sh, sw = _pair(get_arg_value(anchor, 3, "stride", 1))
@@ -2492,7 +2501,11 @@ def build_conv2d(
     gN, gC = 0, 4
     gK, gY, gX = (1 + l3_order.index(d) for d in CONV_L3_ORDER)
     counts = {"K": nk, "Y": ny, "X": nx}
-    grid = (1,) + tuple(counts[d] for d in l3_order) + (nc,)
+    grid = (
+        (buffer_plan(anchor).batch_tiles,)
+        + tuple(counts[d] for d in l3_order)
+        + (nc,)
+    )
     in_code = anchor.kwargs.get("input_code")
     pad_value = (
         float(in_code.value.abs().argmin())
@@ -2521,6 +2534,7 @@ def build_conv2d(
         project((gK, gC, None, None), w_dims),
         (False,) * 4,
     )
+    buffer_plan(anchor).apply_inputs(in_spec, w_spec)
     bias_spec = _InputSpec((tk,), (gK,), (False,))
     # The output(s) tile onto the (N, K, oH, oW) grid dims (C reduction
     # dropped); a fused op may produce several (``quantize_mx``).
@@ -2658,6 +2672,7 @@ def build_conv2d(
         bias = in_tiles[bias_idx] if (bias_idx is not None and first) else None
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
+    buffer_plan(anchor).apply_outputs(out_specs)
     scratch_specs, kernel = _gemm_scratch_and_kernel(
         conv2d_kernel,
         fused_gm,
@@ -2854,6 +2869,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
+    buffer_plan(anchor).apply_inputs(act_spec, weight_spec)
     weight_spec.transposed = transposed
     weight_spec.repeat = weight_repeat
     bias_spec = _InputSpec((tn,), (gn,), (False,))
@@ -3072,6 +3088,7 @@ def build_gemm(
     if plan is None:
         return None
 
+    buffer_plan(plan.anchor).apply_outputs(plan.out_specs)
     scratch_specs, kernel = _gemm_scratch_and_kernel(
         plan.gemm_kernel,
         plan.fused_gm,

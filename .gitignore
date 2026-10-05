@@ -23,3 +23,5 @@ tools/artifacts/shards/
 
 !test/compilation/
 !test/test_compilation.py
+!test/test_trainium.py
+!test/test_trainium_cost.py

@@ -372,6 +372,9 @@ def _search_tiling(
         fits at any sharing level.
     """
 
+    from voyager_compiler.targets import get_backend
+
+    target_search = getattr(get_backend(config.backend), "tile_search", None)
     slot_size = config.usable_scratchpad_size // config.num_slots
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
@@ -386,9 +389,21 @@ def _search_tiling(
             order=order,
             last_dim=last_dim,
             pinned=pinned,
-            exhaustive=cost_fn is not None,
+            exhaustive=cost_fn is not None or target_search is not None,
         ):
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
+
+            if target_search is not None:
+                candidate = target_search(
+                    config, node, tile_sizes, tiled_shapes, tiling
+                )
+                if candidate is not None:
+                    total_size, latency, traffic = candidate
+                    if total_size <= slot_size:
+                        scored.append(
+                            (latency, traffic, tile_sizes, tiled_shapes)
+                        )
+                continue
 
             total_size = scratchpad_bytes(
                 node, tiled_shapes, config, extra_sharing
@@ -405,6 +420,10 @@ def _search_tiling(
             scored.append((latency, traffic, tile_sizes, tiled_shapes))
 
         if scored:
+            if target_search is not None:
+                best = min(scored, key=lambda s: s[0])
+                node.meta["tiling_runtime"] = best[0]
+                return best[2], [], best[0]
             budget = min(s[0] for s in scored) * (1.0 + tolerance)
             best = min(
                 (s for s in scored if s[0] <= budget),
@@ -456,7 +475,7 @@ def construct_tiled_shape(full_shape, tiled_dim: int, dims):
     if not comp:
         raise ValueError("dims cannot be empty.")
     if any(i < 0 or i >= N for i in comp):
-        raise IndexError(f"dims must be in [0, {N-1}]. Got {dims}.")
+        raise IndexError(f"dims must be in [0, {N - 1}]. Got {dims}.")
 
     # Distribute prime factors of R across compressed dims (greedy balance)
     tiled = {i: 1 for i in comp}
@@ -775,7 +794,9 @@ def _vector_op_tiling_limits(node, vector_unit_width):
             (
                 math.lcm(block_size if i in axes else 1, vector_unit_width)
                 if i == ndim - 1
-                else block_size if i in axes else 1
+                else block_size
+                if i in axes
+                else 1
             )
             for i in range(ndim)
         )

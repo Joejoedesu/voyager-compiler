@@ -556,6 +556,13 @@ def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
     buffer that is address-disjoint is bank-disjoint from it automatically —
     one allocator pass places both.
     """
+    from voyager_compiler.targets import get_backend
+
+    placement = getattr(
+        get_backend(config.backend), "place_local_buffers", None
+    )
+    if placement is not None:
+        return placement(model, bufs, config)
     bank = config.bank_size
     groups: Dict[tuple, List[Node]] = {}
     if bank:

@@ -999,6 +999,8 @@ def opt_mapping_point_generator_function(
     runtime_calc_func=None,
     verbose=False,
     runtime_tolerance=0.0,
+    cost_calc_func=None,
+    cost_tradeoff=True,
 ):
     """
     Mapping point generator.
@@ -1014,6 +1016,11 @@ def opt_mapping_point_generator_function(
         runtime_tolerance: How much longer than the best runtime a mapping may
             take and still be considered, as a fraction.  0.0 keeps only the
             fastest mappings, and the least-energy one among them wins.
+        cost_calc_func: Optional target metric with the runtime callback's
+            argument order. When present, it replaces energy on the frontier.
+        cost_tradeoff: When false, select minimum modeled runtime only,
+            retaining the first candidate on exact ties. The runtime tolerance
+            and energy/traffic tie-break do not affect selection.
     """
     parallel_levels = resource.para_index
     ideal_perf = cost_model.get_ideal_performance(layer, resource)
@@ -1047,12 +1054,18 @@ def opt_mapping_point_generator_function(
             else:
                 runtime = float("inf")
 
-            cost = cost_model.get_total_cost(
-                resource,
-                mapping_point,
-                layer,
-                verbose,
+            cost = (
+                cost_calc_func(resource, layer, mapping_point)
+                if cost_calc_func is not None
+                else cost_model.get_total_cost(
+                    resource, mapping_point, layer, verbose
+                )
             )
+
+            if not cost_tradeoff:
+                if not frontier or runtime < frontier[0][0]:
+                    frontier = [(runtime, cost, mapping_point)]
+                continue
 
             # An equal (runtime, energy) counts as dominated, so the
             # first-seen mapping wins the tie, as the old rule did.
@@ -1065,13 +1078,16 @@ def opt_mapping_point_generator_function(
 
     assert frontier, "No valid mapping point found."
 
-    best_runtime = min(fr for fr, _, _ in frontier)
-    threshold = best_runtime * (1.0 + runtime_tolerance)
-    # Least energy among those fast enough; ties broken by lower runtime.
-    smallest_runtime, smallest_cost, best_mapping_point = min(
-        ((fr, fc, mp) for fr, fc, mp in frontier if fr <= threshold),
-        key=lambda e: (e[1], e[0]),
-    )
+    if cost_tradeoff:
+        best_runtime = min(fr for fr, _, _ in frontier)
+        threshold = best_runtime * (1.0 + runtime_tolerance)
+        # Least energy among those fast enough; ties broken by lower runtime.
+        smallest_runtime, smallest_cost, best_mapping_point = min(
+            ((fr, fc, mp) for fr, fc, mp in frontier if fr <= threshold),
+            key=lambda e: (e[1], e[0]),
+        )
+    else:
+        smallest_runtime, smallest_cost, best_mapping_point = frontier[0]
 
     _, utilized = partitioned_loop_string(
         best_mapping_point.loop_partitionings,
