@@ -11,7 +11,7 @@ from voyager_compiler import (
 )
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import configure_quantizer
+from .utils import configure_quantizer, get_context
 
 
 def load_model(args):
@@ -76,6 +76,9 @@ def prepare_model(model, quantizer, calibration_data, vector_stages, args):
             gm(inputs.to(torch_dtype))
 
     convert_pt2e(gm, args.bias)
+    finalize = get_context(args).policy.finalize_graph
+    if finalize is not None:
+        finalize(gm)
 
     old_output = gm(*example_args)
 

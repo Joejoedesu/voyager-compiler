@@ -309,10 +309,38 @@ Gemmini profile. The new types can describe its physical engines, memory
 geometry, access paths, and shared transfer limits. Its tensor layouts,
 partition-aware allocation, PSUM bank choices, and scheduling remain separate
 work. Likewise, Gemmini's selected dataflows and instruction-specific shape
-rules belong in its adapter. Neither backend is implemented by this IR change.
+rules belong in its adapter. The pinned Gemmini backend in this checkout consumes these declarations through
+its own mapping policy; Trainium lowering remains separate work.
 
 Intentionally deferred from the brainstorm: (6) tile/shape constraints,
 (7) dataflow and transformation capabilities, (9) tensor-to-memory mappings,
 (12) a separate named-resource registry, (13) resource reservation contracts,
-and (14) transfer capability rules. SoC/ROB modeling and same-mode pipelining
-are also outside this implementation.
+and general transfer-layout capability rules. Bounded transfer command geometry
+is now supported as described below. SoC/ROB modeling and same-mode pipelining
+remain outside this implementation.
+
+
+## Transfer contracts used by extensible backends
+
+`Connection` additionally supports `transfer_geometry`, `service_bandwidth` and
+`service_resource`. `TransferGeometry(max_rows, max_row_bytes)` expresses the
+maximum physical rectangle encoded by one command; program extents remain in
+operations. `command_count(rows, row_bytes)` is the shared rectangular expansion
+rule. An endpoint service rate can be lower than its external bandwidth.
+`service_resource` names an existing graph component (for example a controller)
+whose service is shared. `shared_with` identifies shared bus bandwidth.
+
+`latency_ns=None` inherits latency from the canonical shared connection, while
+an explicit zero remains zero. `startup_ns` accounts for per-command overhead.
+`tiling/transfers.py` groups demand by bus and service-resource identities, so
+independent paths may overlap while shared resources accumulate demand. Queue
+capacities are physical facts; command submission bursts remain compiler policy.
+
+Gemmini describes its pinned load geometry as 16 rows by 64 bytes and ordinary
+INT8 stores as 16 rows by 16 bytes. The converter and estimator consume these
+same limits. Hardware validation still rejects unsupported generated instances.
+Default Voyager graphs leave these optional fields unset; their adapter rejects
+unsupported transfer contracts rather than silently claiming to use them.
+
+See [the shared-flow extension interfaces](compilation.md#extensible-bufferized-targets)
+for policy, buffer plans, placement and realization ownership.

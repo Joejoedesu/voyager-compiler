@@ -10,6 +10,8 @@ slot, calls ``kernel(grid_index, *in_slots, *out_slots)`` which writes each
 output SRAM slot, then stores each out slot to DRAM.
 """
 
+from voyager_compiler.codegen.transform.bufferize.plan import buffer_plan
+
 import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -1105,9 +1107,11 @@ class ResidentKernel(PipelinedKernel):
         repeat = getattr(spec, "repeat", None) or (1,) * len(sizes)
         broadcast = getattr(spec, "is_broadcast", (False,) * len(sizes))
         offsets = [
-            0
-            if g is None or broadcast[d]
-            else (grid_index[g] // repeat[d]) * steps[d]
+            (
+                0
+                if g is None or broadcast[d]
+                else (grid_index[g] // repeat[d]) * steps[d]
+            )
             for d, g in enumerate(spec.index_map)
         ]
         if getattr(spec, "transposed", False):
@@ -1507,7 +1511,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
             out_tiling = None
         else:
             ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
-            out_tiling = project((1, nk, ny, nx), odims)  # physical counts
+            out_tiling = project(
+                (buffer_plan(anchor).batch_tiles, nk, ny, nx), odims
+            )  # physical counts
     else:
         nb = anchor.value.ndim - 2
         order = l3_order or GEMM_L3_ORDER
@@ -2376,7 +2382,7 @@ def _gemm_scratch_and_kernel(
         # count is the tiler's per-node call (the scratch ladder winner,
         # stamped with the tiling).
         sync = not split_k_tail_fusible or split is not None
-        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
+        scratch_slots = buffer_plan(anchor).scratch_slots
         slots = scratch_slots if sync else 1
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(
@@ -2468,7 +2474,13 @@ def build_conv2d(
     if groups != 1 or tiling is None:
         tiling = (1, 1, 1, 1)
     ny, nx, nk, nc = tiling
-    tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
+    tn, toh, tow, tc, tk = (
+        N // buffer_plan(anchor).batch_tiles,
+        oH // ny,
+        oW // nx,
+        C // nc,
+        K // nk,
+    )
     num_k = nc
 
     sh, sw = _pair(get_arg_value(anchor, 3, "stride", 1))
@@ -2492,7 +2504,11 @@ def build_conv2d(
     gN, gC = 0, 4
     gK, gY, gX = (1 + l3_order.index(d) for d in CONV_L3_ORDER)
     counts = {"K": nk, "Y": ny, "X": nx}
-    grid = (1,) + tuple(counts[d] for d in l3_order) + (nc,)
+    grid = (
+        (buffer_plan(anchor).batch_tiles,)
+        + tuple(counts[d] for d in l3_order)
+        + (nc,)
+    )
     in_code = anchor.kwargs.get("input_code")
     pad_value = (
         float(in_code.value.abs().argmin())
@@ -2521,6 +2537,7 @@ def build_conv2d(
         project((gK, gC, None, None), w_dims),
         (False,) * 4,
     )
+    buffer_plan(anchor).apply_inputs(in_spec, w_spec)
     bias_spec = _InputSpec((tk,), (gK,), (False,))
     # The output(s) tile onto the (N, K, oH, oW) grid dims (C reduction
     # dropped); a fused op may produce several (``quantize_mx``).
@@ -2658,6 +2675,7 @@ def build_conv2d(
         bias = in_tiles[bias_idx] if (bias_idx is not None and first) else None
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
+    buffer_plan(anchor).apply_outputs(out_specs)
     scratch_specs, kernel = _gemm_scratch_and_kernel(
         conv2d_kernel,
         fused_gm,
@@ -2854,6 +2872,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
+    buffer_plan(anchor).apply_inputs(act_spec, weight_spec)
     weight_spec.transposed = transposed
     weight_spec.repeat = weight_repeat
     bias_spec = _InputSpec((tn,), (gn,), (False,))
@@ -2998,9 +3017,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         (
             None
             if isinstance(a, torch.fx.Node)
-            else tuple(a)
-            if isinstance(a, (list, tuple))
-            else a
+            else tuple(a) if isinstance(a, (list, tuple)) else a
         )
         for a in (dequant.args if dequant is not None else ())
     ]
@@ -3072,6 +3089,7 @@ def build_gemm(
     if plan is None:
         return None
 
+    buffer_plan(plan.anchor).apply_outputs(plan.out_specs)
     scratch_specs, kernel = _gemm_scratch_and_kernel(
         plan.gemm_kernel,
         plan.fused_gm,
@@ -3182,7 +3200,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     the reservation *is* the declaration.  Returns the gm, or ``None``.
     """
     anchor = get_anchor_node(node)
-    tiling = vector_op_tiling(node, tiler.config)
+    tiling = vector_op_tiling(node, tiler.config, policy=tiler.mapping_policy)
     if node.op != "call_module" and tiling is None:
         return None
 
@@ -3309,6 +3327,7 @@ _POOL2D_SUPPORTED = {
     torch.ops.aten.max_pool2d.default,
     torch.ops.aten.avg_pool2d.default,
     torch.ops.quantized_ops.max_pool2d.default,
+    torch.ops.quantized_ops.avg_pool2d.default,
 }
 
 
@@ -3328,12 +3347,18 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
 
-    tiling = pool_op_tiling(node, tiler.config)
+    tiling = pool_op_tiling(node, tiler.config, policy=tiler.mapping_policy)
     if node.op != "call_module" and tiling is None:
         return None
 
     bound = bound_operands(node, node.meta.get("submodule"))
-    in_node = bound.get(anchor.args[0], anchor.args[0])
+    source = anchor.args[0]
+    if (
+        source not in bound
+        and source.target == torch.ops.quantized_ops.dequantize.default
+    ):
+        source = source.args[0]
+    in_node = bound.get(source, source)
     input_t = in_node.value.clone()
 
     val = node.value
@@ -3437,7 +3462,19 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    kernel = _single_pass_kernel(submod, len(outputs))
+    # The DMA halo already contains the boundary padding. Apply this to fused
+    # pooling too; retaining the original padding would pad the tile twice.
+    tiled_submod = copy_graph_module(submod)
+    for sn in tiled_submod.graph.nodes:
+        if sn.name == anchor.name:
+            args = list(sn.args)
+            if len(args) > 3:
+                args[3] = [0, 0]
+                sn.args = tuple(args)
+            else:
+                sn.kwargs = {**sn.kwargs, "padding": [0, 0]}
+    tiled_submod.recompile()
+    kernel = _single_pass_kernel(tiled_submod, len(outputs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

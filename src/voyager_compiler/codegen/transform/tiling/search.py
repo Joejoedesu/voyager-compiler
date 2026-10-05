@@ -346,6 +346,7 @@ def _search_tiling(
     cost_fn=None,
     tolerance=0.0,
     pinned=None,
+    policy=None,
 ):
     """
     Generic driver over the valid tilings, scoring each by the scratchpad it
@@ -372,7 +373,24 @@ def _search_tiling(
         fits at any sharing level.
     """
 
-    slot_size = config.usable_scratchpad_size // config.num_slots
+    if policy is None:
+        from voyager_compiler.targets import get_backend
+
+        policy = get_backend(config.backend).mapping_policy(config)
+    slot_size = policy.nonmatrix_slot_size(node, config.num_slots)
+    anchor = get_anchor_node(node)
+    cost_fn = policy.nonmatrix_cost(str((anchor or node).target), node, cost_fn)
+
+    def default_footprint(node, shapes, config, sharing):
+        from .contracts import NonMatrixFootprint
+
+        return NonMatrixFootprint(
+            scratchpad_bytes(node, shapes, config, sharing),
+            [
+                members
+                for _, members in _bank_groups(node, shapes, config, sharing)
+            ],
+        )
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
     # footprint at ``G * bank_size``: with as many groups as banks nothing
@@ -390,19 +408,29 @@ def _search_tiling(
         ):
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
-            total_size = scratchpad_bytes(
-                node, tiled_shapes, config, extra_sharing
+            footprint = policy.nonmatrix_footprint(
+                node, tiled_shapes, extra_sharing, default_footprint
             )
 
-            if total_size > slot_size:
+            if footprint.slot_bytes > slot_size:
                 continue
 
             if cost_fn is None:
-                scored.append((0, 0, tile_sizes, tiled_shapes))
+                scored.append(
+                    (0, 0, tile_sizes, tiled_shapes, footprint.bank_groups)
+                )
                 break
 
             latency, traffic = cost_fn(node, tile_sizes, tiled_shapes, tiling)
-            scored.append((latency, traffic, tile_sizes, tiled_shapes))
+            scored.append(
+                (
+                    latency,
+                    traffic,
+                    tile_sizes,
+                    tiled_shapes,
+                    footprint.bank_groups,
+                )
+            )
 
         if scored:
             budget = min(s[0] for s in scored) * (1.0 + tolerance)
@@ -410,12 +438,7 @@ def _search_tiling(
                 (s for s in scored if s[0] <= budget),
                 key=lambda s: (s[1], s[0]),
             )
-            groups = [
-                members
-                for _, members in _bank_groups(
-                    node, best[3], config, extra_sharing
-                )
-            ]
+            groups = best[4]
             return best[2], groups, best[0]
 
     logger.debug(f"Failed to tile {node} into a {slot_size}-byte slot.")
@@ -625,7 +648,7 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     return shapes
 
 
-def gemv_op_tiling(node, config, constraint=None):
+def gemv_op_tiling(node, config, constraint=None, policy=None):
     """Per-dim tile counts for a matrix-vector GEMM, bare or fused.
 
     Called from ``get_tiling`` during bufferization, so it sees the layout the
@@ -694,6 +717,7 @@ def gemv_op_tiling(node, config, constraint=None):
         multiple_of=tuple(multiple),
         shape_builder_fn=_build_gemv_shape_map,
         config=config,
+        policy=policy,
         cost_fn=(
             partial(gemv_tile_latency, config=config)
             if config.dram_bandwidth is not None
@@ -795,7 +819,7 @@ def _output_shape(node):
     )
 
 
-def vector_op_tiling(node, config):
+def vector_op_tiling(node, config, policy=None):
     """Per-dim tile counts for a vector op, bare or fused.
 
     Called from the builders during bufferization, so it sees whatever fusion
@@ -824,7 +848,11 @@ def vector_op_tiling(node, config):
     limits = _vector_op_tiling_limits(anchor, config.vector_lanes)
     if limits is None:
         return None
-    last_dim, multiple_of = limits
+    if policy is None:
+        from voyager_compiler.targets import get_backend
+
+        policy = get_backend(config.backend).mapping_policy(config)
+    last_dim, multiple_of = policy.vector_limits(anchor, limits)
 
     logger.info(f"Running L2 tiling for vector op: {node}")
 
@@ -844,6 +872,7 @@ def vector_op_tiling(node, config):
         last_dim=last_dim,
         shape_builder_fn=_build_vector_op_shape_map,
         config=config,
+        policy=policy,
         cost_fn=cost_fn,
     )
     if found is None:
@@ -1004,11 +1033,14 @@ def _pool_shapes(node, anchor, in_tile, out_tile):
     plus whatever a fused tail loads of its own -- diced by the output block,
     the way the builder dices it.  ``anchor`` resolves the halo to the node the
     kernel really loads, which a fused ``call_module`` cannot name itself."""
-    shapes = normalize_shape(
-        anchor,
-        {"input": in_tile},
-        bound_operands(node, node.meta.get("submodule")),
-    )
+    bound = bound_operands(node, node.meta.get("submodule"))
+    source = anchor.args[0]
+    if (
+        source not in bound
+        and source.target == torch.ops.quantized_ops.dequantize.default
+    ):
+        source = source.args[0]
+    shapes = {bound.get(source, source): in_tile}
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
     if node is not anchor:
         for n in node.all_input_nodes:
@@ -1038,7 +1070,11 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     tile_N, tile_H, tile_W, tile_C = tile_sizes
 
     stride = _pair(get_arg_value(anchor, 2, "stride", 1))
-    dilation = _pair(get_arg_value(anchor, 4, "dilation", 1))
+    dilation = (
+        _pair(get_arg_value(anchor, 4, "dilation", 1))
+        if "max_pool" in str(anchor.target)
+        else (1, 1)
+    )
     kernel_size = _pair(get_arg_value(anchor, 1, "kernel_size"))
 
     tile_H_in = _pool_input_extent(
@@ -1087,7 +1123,7 @@ def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     return _pool_shapes(node, anchor, in_tile, out_tile)
 
 
-def pool_op_tiling(node, config):
+def pool_op_tiling(node, config, policy=None):
     """Per-dim tile counts for a pooling op, bare or fused.
 
     Called from ``build_pool`` during bufferization, so it sees whatever fusion
@@ -1121,7 +1157,10 @@ def pool_op_tiling(node, config):
     name = str(anchor.target)
     nhwc = anchor.target in NHWC_OP_VARIANTS.values()
 
-    if name.endswith("max_pool2d.default"):
+    if (
+        name.endswith(("max_pool2d.default", "avg_pool2d.default"))
+        and "adaptive" not in name
+    ):
         if nhwc:
             N, H_out, W_out, C = anchor.shape
         else:
@@ -1147,6 +1186,7 @@ def pool_op_tiling(node, config):
         order=order,
         shape_builder_fn=shape_builder_fn,
         config=config,
+        policy=policy,
     )
     if found is None:
         raise RuntimeError(

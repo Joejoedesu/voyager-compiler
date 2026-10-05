@@ -393,11 +393,21 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--runtime_tolerance",
         type=float,
-        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()
+        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.02) in compile()
         help="How much longer than the best modeled runtime an interstellar "
         "tiling may take and still be chosen, as a fraction; among those, the "
-        "one with the least DRAM traffic wins.  0 = only the fastest "
-        "(default: 0.01).",
+        "one with the lowest target cost wins (Voyager energy; Gemmini DRAM "
+        "bytes). 0 = only the fastest, still breaking ties by cost "
+        "(default: 0.02). Ignored by Interstellar when cost tradeoff is off.",
+    )
+    parser.add_argument(
+        "--interstellar-cost-tradeoff",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow Interstellar to trade modeled runtime for lower cost "
+        "within runtime_tolerance (default: on). Off selects runtime only, "
+        "with first-seen exact ties. Gemmini cost is DRAM bytes; Voyager "
+        "uses its energy model. Does not change vector/attention tilers.",
     )
 
     # -- reporting (timing / DRAM-traffic estimator) ------------------------

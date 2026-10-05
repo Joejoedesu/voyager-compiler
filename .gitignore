@@ -23,3 +23,11 @@ tools/artifacts/shards/
 
 !test/compilation/
 !test/test_compilation.py
+!test/test_gemmini.py
+!test/test_gemmini_scheduling.py
+!test/test_mapping_policy.py
+!test/test_gemmini_dma.py
+results/
+
+!test/test_extensibility.py
+!test/test_interstellar_selection.py

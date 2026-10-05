@@ -329,6 +329,39 @@ def replace_conv2d_with_im2col(model: GraphModule):
     return model
 
 
+def normalize_global_average_pool(model: GraphModule):
+    """Expose spatial mean as pooling so the existing halo/channel tiler applies."""
+    for node in model.graph.nodes:
+        if node.target in (
+            torch.ops.aten.adaptive_avg_pool2d.default,
+            torch.ops.quantized_ops.adaptive_avg_pool2d.default,
+        ):
+            src = node.args[0]
+            if len(src.shape) == 4 and tuple(node.args[1]) == (1, 1):
+                kernel = tuple(src.shape[2:])
+                node.target = torch.ops.aten.avg_pool2d.default
+                node.args = (src, kernel, kernel, (0, 0), False, True)
+                node.kwargs = {}
+            continue
+        if node.target != torch.ops.aten.mean.dim:
+            continue
+        src = node.args[0]
+        dims = node.args[1]
+        keepdim = (
+            node.args[2]
+            if len(node.args) > 2
+            else node.kwargs.get("keepdim", False)
+        )
+        if len(src.shape) == 4 and {d % 4 for d in dims} == {2, 3} and keepdim:
+            node.target = torch.ops.aten.avg_pool2d.default
+            kernel = tuple(src.shape[2:])
+            node.args = (src, kernel, kernel, (0, 0), False, True)
+            node.kwargs = {}
+    model.graph.lint()
+    model.recompile()
+    return model
+
+
 def extract_input_preprocessor(model: GraphModule, input_name=None):
     """
     Extract the input preprocessing operations from the given FX GraphModule

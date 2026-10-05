@@ -202,8 +202,9 @@ class OpMatcher:
     targets: Tuple[torch._ops.OpOverload]
     predicate: Optional[Callable[[Node], bool]] = None
 
-    def __init__(self, *ops, predicate=None):
+    def __init__(self, *ops, predicate=None, allow_input_dequantize=False):
         self.predicate = predicate
+        self.allow_input_dequantize = allow_input_dequantize
 
         # Resolve symbolic ops
         targets = []
@@ -240,10 +241,17 @@ def _transform_voyager(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    config.require_backend("voyager")
+    from voyager_compiler.targets import validate_bufferized_target
+
+    validate_bufferized_target(config)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
+
+    from voyager_compiler.targets import get_backend
+
+    backend = get_backend(config.backend)
+    backend.prepare_graph(model, config)
 
     fold_constant_generators(model)
     inline_autocast_modules(model)
@@ -252,7 +260,9 @@ def _transform_voyager(
     fuse_quantize_dequantize_with_producer(model)
 
     if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, *config.pe_array_size)
+        pad_matrix_op_dimensions(
+            model, *config.pe_array_size, skip_rgb=backend.skip_rgb_padding
+        )
 
     if layout_policy == "systolic":
         normalize_conv2d_layout(model)
@@ -286,13 +296,36 @@ def _compile_voyager(
     runtime_tolerance=None,
     bufferization_options=None,
     before_emit=None,
+    interstellar_cost_tradeoff=True,
+    mapping_policy=None,
+    context=None,
 ):
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    os.makedirs(output_dir, exist_ok=True)
+    from voyager_compiler.compilation import CompilerContext
 
-    config.require_backend("voyager")
+    context = context or CompilerContext.resolve(
+        config,
+        mapping_policy,
+        cost_tradeoff=interstellar_cost_tradeoff,
+        runtime_tolerance=runtime_tolerance,
+    )
+    if context.hardware != config or (
+        mapping_policy is not None and context.policy is not mapping_policy
+    ):
+        raise ValueError(
+            "Compilation context differs from explicit hardware/policy"
+        )
+    mapping_policy = context.policy
+    runtime_tolerance = context.runtime_tolerance
+    interstellar_cost_tradeoff = context.cost_tradeoff
+    os.makedirs(output_dir, exist_ok=True)
+    context.write(output_dir)
+
+    from voyager_compiler.targets import validate_bufferized_target
+
+    validate_bufferized_target(config)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -309,7 +342,15 @@ def _compile_voyager(
         render_model = clone_graph(model)
     else:
         gen_compute_graph(model, os.path.join(output_dir, output_file))
-    lower_to_buffers(model, config, runtime_tolerance, bufferization_options)
+    lower_to_buffers(
+        model,
+        config,
+        runtime_tolerance,
+        bufferization_options,
+        interstellar_cost_tradeoff=interstellar_cost_tradeoff,
+        mapping_policy=mapping_policy,
+        context=context,
+    )
     if render_model is not model:
         import json
 
@@ -329,7 +370,15 @@ def _compile_voyager(
     return emit_program(model, flatten_args, output_dir, dump_tensors)
 
 
-def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
+def lower_to_buffers(
+    model,
+    config,
+    runtime_tolerance=None,
+    options=None,
+    interstellar_cost_tradeoff=True,
+    mapping_policy=None,
+    context=None,
+):
     """Voyager lowering and allocation; no artifact emission or real execution.
 
     Shapes must already be propagated. The graph is mutated in place, as in
@@ -338,15 +387,40 @@ def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
     from voyager_compiler.codegen.transform.bufferize import (
         BufferizationOptions,
     )
+    from voyager_compiler.targets import validate_bufferized_target
 
-    config.require_backend("voyager")
+    validate_bufferized_target(config)
+    from voyager_compiler.compilation import CompilerContext
+
+    context = context or CompilerContext.resolve(
+        config,
+        mapping_policy,
+        cost_tradeoff=interstellar_cost_tradeoff,
+        runtime_tolerance=runtime_tolerance,
+    )
+    if context.hardware != config or (
+        mapping_policy is not None and context.policy is not mapping_policy
+    ):
+        raise ValueError(
+            "Compilation context differs from explicit hardware/policy"
+        )
+    mapping_policy = context.policy
+    runtime_tolerance = context.runtime_tolerance
+    interstellar_cost_tradeoff = context.cost_tradeoff
+    model.meta["compiler_context"] = context
     options = options or BufferizationOptions()
     tolerance = (
         DEFAULT_RUNTIME_TOLERANCE
         if runtime_tolerance is None
         else runtime_tolerance
     )
-    tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
+    tiler = build_interstellar_tiler(
+        config,
+        runtime_tolerance=tolerance,
+        interstellar_cost_tradeoff=interstellar_cost_tradeoff,
+        mapping_policy=mapping_policy,
+    )
+    model.meta["bufferized_policy"] = tiler.mapping_policy
     original = None
     if options.flow == "resident":
         from voyager_compiler.codegen.transform.bufferize.residency import (
@@ -378,7 +452,12 @@ def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
         model.meta["sram_fallbacks"].append(
             dict(reason=str(exc), action="whole graph per_kernel")
         )
-        tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
+        tiler = build_interstellar_tiler(
+            config,
+            runtime_tolerance=tolerance,
+            interstellar_cost_tradeoff=interstellar_cost_tradeoff,
+            mapping_policy=mapping_policy,
+        )
         bufferize_graph(
             model,
             pipelined=config.double_buffered_l2,
@@ -418,12 +497,23 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
+    context=None,
 ):
     """Transform through the selected hardware backend (Voyager by default)."""
     from voyager_compiler.targets import get_backend
 
     if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
+        config = (
+            context.hardware
+            if context is not None
+            else AcceleratorConfig(pe_array_size=None)
+        )
+    if context is not None:
+        if context.hardware != config:
+            raise ValueError(
+                "Transformation context differs from explicit hardware"
+            )
+        model.meta["compiler_context"] = context
     return get_backend(config.backend).transform(
         model,
         example_args,
@@ -448,6 +538,9 @@ def compile(
     runtime_tolerance=None,
     bufferization_options=None,
     before_emit=None,
+    interstellar_cost_tradeoff=True,
+    mapping_policy=None,
+    context=None,
 ):
     """Compile through the selected backend, preserving in-place graph semantics.
 
@@ -457,7 +550,11 @@ def compile(
     from voyager_compiler.targets import get_backend
 
     if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
+        config = (
+            context.hardware
+            if context is not None
+            else AcceleratorConfig(pe_array_size=None)
+        )
     return get_backend(config.backend).compile(
         model,
         example_args,
@@ -469,4 +566,7 @@ def compile(
         runtime_tolerance=runtime_tolerance,
         bufferization_options=bufferization_options,
         before_emit=before_emit,
+        interstellar_cost_tradeoff=interstellar_cost_tradeoff,
+        mapping_policy=mapping_policy,
+        context=context,
     )

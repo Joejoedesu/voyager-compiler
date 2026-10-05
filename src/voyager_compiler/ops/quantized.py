@@ -340,7 +340,7 @@ def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
 quantized_ops_lib.define(
     "quantize(Tensor input, Tensor scale, Tensor? zero_point=None, "
     "SymInt[]? axes=None, int? block_size=None, Tensor? qmap=None, "
-    "Tensor? output_code=None) -> Tensor"
+    "Tensor? output_code=None, str? rounding=None) -> Tensor"
 )
 
 
@@ -353,6 +353,7 @@ def quantize(
     block_size: Optional[int] = None,
     qmap: torch.Tensor = None,
     output_code: Optional[torch.Tensor] = None,
+    rounding: Optional[str] = None,
 ) -> torch.Tensor:
     """Quantization for the Tensor using scales and zero points to map
     from floating point to quantized values
@@ -377,6 +378,20 @@ def quantize(
         parameters are not stored in the Tensor, we are storing them in
         function arguments instead
     """
+    if rounding is not None:
+        if rounding != "nearest_even_int8" or any(
+            v is not None for v in (zero_point, axes, block_size, output_code)
+        ):
+            raise ValueError(
+                "Native INT8 rounding requires symmetric per-tensor quantization"
+            )
+        return (
+            (input.float() / scale.float())
+            .round()
+            .clamp(-128, 127)
+            .to(input.dtype)
+        )
+
     assert qmap is not None, "qmap must be provided for quantization"
 
     if block_size is not None:

@@ -36,9 +36,9 @@ registered target without embedding its quantization rules in the adapter.
 A target instance has a name, family, backend, hardware factory and optional
 recipe overrides. Multiple instances can share one family's policies while
 providing different hardware factories or overriding individual recipes.
-Currently only the `voyager` instance/backend is registered; its CLI geometry
-variants remain separate test cases. Gemmini and Trainium implementations are
-future work, and their names are not accepted until registered.
+The `voyager` and pinned `gemmini` instances/backends are registered. Voyager
+CLI geometry variants remain separate test cases. Gemmini uses the shared
+bufferized flow and an explicit ISA consumer. Other names require registration.
 
 Quantization resolution has two parts: the named `--quantization_recipe`
 selects instance-specific defaults, falling back to the family, with optional
@@ -66,7 +66,7 @@ IR, without changing `model.txt`.
 An instance selects a family, a backend and a hardware factory. The hardware
 factory constructs the target's own graph; it must not adopt Voyager topology
 or parser defaults accidentally. A backend provides validation, fusion policy,
-transformation and compilation. Only the Voyager backend is implemented.
+transformation and compilation. Voyager and the pinned Gemmini backend are implemented.
 Unknown targets, missing backends and unsupported Voyager topologies fail.
 
 `quantization/recipes.py` defines the generic `Recipe` and `FamilyPolicy` types
@@ -363,3 +363,192 @@ than hardcoding exceptions. Compare the same execution stage and initial state
 when assessing warnings; reproduce against old source instead of loosening
 tolerances. Record environmental failures separately from compiler failures.
 Do not claim success from an import-only, skipped, or incomplete selected suite.
+
+
+## Extensible bufferized targets
+
+This checkout starts from clean `voyager-base` commit
+`54ecee2a62b46b7bb72a7d33f3a7d4351d0c22da`. It incorporates the validated 10-05
+Gemmini implementation as a second backend and refactors the common boundaries.
+The original checkout and Gemmini source/runtime are not modified.
+
+The shared flow is:
+
+```text
+hardware IR + explicit target policy -> resolved CompilerContext
+  -> target legalization/fusion + shared graph transformations
+  -> Interstellar or nonmatrix candidate enumeration
+  -> target footprint and execution estimates
+  -> SelectedMapping + KernelBufferPlan
+  -> shared buffer/semaphore construction and lifetime analysis
+  -> target-aware placement
+  -> unchanged model.txt / layers.txt / tensor files
+  -> context-selected instruction realization
+```
+
+Hardware facts, compiler preferences and selected plans are different objects.
+`CompilerContext` in `voyager_compiler/compilation.py` binds one hardware instance,
+mapping policy and objective. `BufferizedBackend` and `BufferizedPolicy` in
+`targets.py` specify the extension contracts. The model frontend's context keeps
+quantization-family policy separate and carries the resolved compiler context.
+
+| Boundary | Hooks and ownership | What another target implements |
+| --- | --- | --- |
+| Legalization | Backend `validate`, `prepare_graph`, `fusion_patterns`, `skip_rgb_padding` | Supported forms, graph normalization, padding and fusion requirements |
+| Mapping | Backend `interstellar_memory`; policy `schedule`, `prepare_matrix` | Search-level adaptation, legal loop/spatial restrictions, candidate footprint and timing callbacks |
+| Candidate result | Policy `partition`, `evaluate`; internal `SelectedMapping`, `CandidateEvaluation`, `StorageRequirement` | The chosen buffer plan, estimated cycles, physical footprints and diagnostics |
+| Nonmatrix mapping | Policy `vector_limits`, `nonmatrix_slot_size`, `nonmatrix_footprint`, `nonmatrix_cost` | Limits, per-slot capacity, paired byte footprint/bank groups and scoring for shared pointwise/pool/GEMV enumeration |
+| Placement | Policy `place_local_buffers` | Local bank/alignment constraints; shared lifetime and alias analysis remain in use |
+| Realization and reproducibility | Backend `realize`, `restore_mapping_policy`; policy `options` | ISA lowering/submission and reconstruction of supported tuning choices |
+
+The nonmatrix footprint callback returns `NonMatrixFootprint(slot_bytes,
+bank_groups)`: grouping and its byte charge travel together. A target can replace
+both instead of inheriting Voyager grouping while changing only a capacity.
+The cost hook can supply a scorer even when the legacy path uses largest-fit
+selection. The search algorithm itself remains shared.
+
+Voyager's matrix storage and timing formulas now live in
+`tiling/voyager_model.py`, reached through `VoyagerMappingPolicy`. Existing
+`RuntimeCalculator`/`make_size_fn` imports from `tiler.py` remain compatibility
+aliases. The default objective, candidate order and tie-breaking are preserved.
+Gemmini minimizes modeled execution cycles, without the energy tradeoff.
+
+Gemmini constructs a `MappingTraversal` for common loop extents and transfer
+recurrence; it no longer instantiates a Voyager calculator or aliases a
+`matrix_vector_stream` hardware connection. Its estimator's `evaluate` returns
+an explicit result. Search caches that result together with the mapping;
+bufferization does not recover the winner from the estimator's last candidate.
+The older `calculate_runtime` entry remains for reporting compatibility.
+
+`StorageRequirement` describes bytes, copies and alignment within one memory
+replica. `resources_fit` sums the aligned footprints against each named store's
+available byte capacity. Gemmini uses one `matrix_storage` description for
+candidate scoring and early capacity pruning. Accumulator slot sizing is also
+used by ISA placement. Voyager keeps its existing group-aware fit/allocation
+checks, including exact resident placement trials. Capacity accounting is not
+proof of arbitrary bank placement; the final allocator still checks it.
+
+`KernelBufferPlan` determines operand buffering, batch splitting and physical
+accumulator generations. It does not allocate addresses or replace the storage
+plan. The existing resident flow retains its live-byte budget, boundary DMA,
+weight-streaming choices and final-allocation fallback. Gemmini explicitly
+rejects the resident flow until it has a corresponding implementation.
+
+### Configure once, compile and realize
+
+```python
+from voyager_compiler import transform, compile
+from voyager_compiler.compilation import CompilerContext
+from voyager_compiler.gemmini.hardware import lean_config
+from voyager_compiler.gemmini.mapping import GemminiMappingPolicy, GemminiTuning
+from voyager_compiler.gemmini.scheduling import SubmissionPolicy
+from voyager_compiler.targets import get_backend
+
+hardware = lean_config()
+policy = GemminiMappingPolicy(hardware, GemminiTuning(
+    submission=SubmissionPolicy(32, 4, 4),
+    separate_accumulator_banks=True,
+    pointwise_wide_working_sets=2,
+))
+context = CompilerContext.resolve(hardware, policy)
+# graph is the exported/quantized FX graph; inputs and output_dir are caller-owned.
+transform(graph, inputs, context=context,
+          patterns=get_backend(hardware.backend).fusion_patterns(hardware),
+          layout_policy="systolic")
+compile(graph, inputs, context=context, output_dir=output_dir)
+context.realize(output_dir)
+```
+
+Compilation records the context under `compiler` in the existing
+`compilation.json`, preserving other metadata. This is not a new executable
+collateral. The standalone Gemmini `convert(output_dir)` restores the selected
+policy from that record, validates the hardware fingerprint, and refuses an
+inconsistent explicit policy. Old artifacts without the record require an
+explicit context/policy, rather than silently assuming defaults. Restoration
+uses registered backend factories; metadata cannot import arbitrary Python code.
+For Voyager, `realize` returns its existing `model.txt` consumer input.
+
+To add a backend, implement and register its hardware factory, family recipes,
+backend and mapping policy in target-owned modules. Import that registration
+module before resolving its target. Shared-flow adoption is opt-in. The present
+matrix builders still require the four search levels and supported loop forms;
+a backend must describe a valid adaptation or reject it. These interfaces do
+not imply arbitrary hierarchy, dataflow, operator or ISA support.
+
+Gemmini's nonmatrix estimator still uses the prior conservative model by explicit
+policy choice. Its pointwise workspace allowance and 32/4/4 submission bursts are
+tunable heuristics, not hardware facts. No per-kernel tile presets are introduced.
+The refactor supplies the replacement hooks; it does not claim a universal
+cycle-accurate execution model or automatically optimal buffering for all targets.
+
+### Validation and publishing
+
+Focused verification (including resident-flow tests):
+
+```sh
+PYTHONPATH=src:test python -m unittest test_extensibility test_hardware_config \
+  test_compilation test_gemmini test_gemmini_scheduling test_mapping_policy \
+  test_gemmini_dma test_interstellar_selection
+```
+
+Use the fixed-baseline procedure above for the 11 default regression cases.
+Gemmini's reproducible runners are `scripts/gemmini_autocomp.py`,
+`scripts/gemmini_resnet.py` and `scripts/gemmini_validate.py`; the kernel runner
+accepts `--submission-quanta EX LD ST`, `--[no-]separate-accumulator-banks`, and
+`--pointwise-wide-working-sets`. It passes tuning once to compilation, then
+converts using the persisted context. Simulator and model assets are external
+inputs; generated programs/logs/results are ignored by Git.
+
+Acceptance evidence is recorded in `results/extensibility/acceptance.json` in
+this workspace. See the validation result below for the executed scope.
+
+The following commands are instructions for the owner. No branch, commit or
+push is performed by the refactor:
+
+```sh
+cd /home/zhouhua/Research/ML/AGEN-voyager/voyager-extensible
+git switch -c feature/voyager-extensible
+git diff --check
+git status --short
+git add .gitignore README.md docs src scripts test
+git diff --cached --stat
+git diff --cached
+# After reviewing the staged changes:
+git commit -m "Refactor shared compiler interfaces for extensible accelerator backends"
+git push -u origin feature/voyager-extensible
+```
+
+`origin` is `https://github.com/Joejoedesu/voyager-compiler.git`. These commands
+include the new source/tests and omit ignored simulation outputs and model
+assets. The sibling checkouts remain separate working copies.
+
+
+### Validation result for this checkout
+
+| Check | Result | Local evidence |
+| --- | --- | --- |
+| Focused suite | 79 tests pass, including resident flow and extension contracts | [log](../results/extensibility/tests-acceptance.log) |
+| Shared traversal follow-up | 35 tests pass after deduplicating the traversal helpers | [log](../results/extensibility/model-final.log) |
+| Default regression | 11/11 emitted programs, layer files and numerical-warning signatures match the fixed pre-change baseline | [comparison](../results/extensibility/regression-verification.json) |
+| Standard Gemmini kernels | 9/9 fresh VCS runs pass; executable streams and cycle counts unchanged from 10-05 | [cycles](../results/extensibility/kernels/comparison.json), [equivalence](../results/extensibility/kernel-equivalence.json) |
+| Persisted nondefault policy | Fresh VCS Gemm0 with 8/2/2 bursts passes at 586,670 cycles; converter restores tuning from metadata | [result](../results/extensibility/tuned/gemm0/vcs/result.json) |
+| ResNet50 | Fresh compilation/conversion matches all 105 streams; authenticated saved VCS outputs match the fresh final reference | [validation](../results/extensibility/resnet50/replay/validation.json) |
+
+Default kernel cycles, Gemm0–5 then Conv0–2: 528,290; 812,517; 806,819;
+805,260; 806,818; 806,459; 1,886,132; 1,848,459; 1,830,172. The 8/2/2 override
+is slower than default and establishes correctness of policy persistence only.
+Default tuning remains unchanged.
+
+ResNet50 retains 24,153,732 cycles using explicitly reused VCS evidence. Every
+regenerated executable stream, memory manifest and local input/reference file
+matches; saved records authenticate against simulator/build and input/output
+hashes. Actual hardware outputs were chained and decoded against the fresh
+reference. This is not a fresh full-network simulation. Its timing sums
+independent CPU-free segments and excludes host staging and output decoding.
+
+[Acceptance record](../results/extensibility/acceptance.json) and
+[reference integrity](../results/extensibility/reference-integrity.json) are
+local ignored artifacts. The source/tests/documentation can be published using
+the commands above; external model weights, simulator binaries and large
+validation outputs are not included. Earlier development failures remain in the
+ignored results directory; the linked records are the completed acceptance runs.

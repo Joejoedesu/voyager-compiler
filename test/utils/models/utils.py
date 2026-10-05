@@ -21,6 +21,7 @@ def get_transform_args(args, vector_stages):
     return {
         "patterns": vector_stages,
         "config": get_context(args).hardware,
+        "context": get_context(args).compiler,
         "layout_policy": args.layout_policy,
         "gemv_weight_layout": args.gemv_weight_layout,
         "fuse_reshape": not args.disable_reshape_fusion,
@@ -30,10 +31,14 @@ def get_transform_args(args, vector_stages):
 def get_compile_args(args):
     return {
         "config": get_context(args).hardware,
+        "context": get_context(args).compiler,
         "output_dir": args.model_output_dir,
         "output_file": args.model,
         "dump_tensors": args.dump_tensors,
         "runtime_tolerance": args.runtime_tolerance,
+        "interstellar_cost_tradeoff": getattr(
+            args, "interstellar_cost_tradeoff", True
+        ),
         "bufferization_options": BufferizationOptions(
             flow=getattr(args, "bufferized_flow", "per_kernel"),
             parameter_loading=getattr(args, "parameter_loading", "on_demand"),

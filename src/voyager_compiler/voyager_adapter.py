@@ -38,6 +38,9 @@ def interstellar_memory(config):
         or edge.source_port is not None
         or edge.target_port is not None
         or edge.startup_ns != 0
+        or edge.transfer_geometry is not None
+        or edge.service_resource is not None
+        or edge.service_bandwidth is not None
         for edge in config.connections
     ):
         raise NotImplementedError(

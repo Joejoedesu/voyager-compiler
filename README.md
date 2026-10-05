@@ -10,6 +10,13 @@ After quantization, the compiler lowers models through hardware-aware operator f
 
 End-to-end examples of using the Voyager Compiler can be found in test/test_codegen.py, which demonstrates model ingestion, quantization, compilation, and instruction generation.
 
+## Accelerator backend adoption
+
+The shared bufferized flow supports explicit hardware, mapping and realization
+interfaces. See [compilation and target adoption](docs/compilation.md#extensible-bufferized-targets)
+for the Voyager/Gemmini implementations, context API, validation and branch
+publishing instructions.
+
 ## Verified Models
 
 Validated on the following ML models:

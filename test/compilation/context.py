@@ -21,6 +21,7 @@ class CompilationContext:
     backend: object
     policy: object
     recipe: str | None
+    compiler: object = None
 
     def configure_quantizer(self, kind, model, quantizer, args, **options):
         self.policy.configure_model(
@@ -59,12 +60,24 @@ def resolve_context(args):
     if hardware.backend != target.backend:
         raise ValueError("Target hardware and backend disagree")
     backend.validate(hardware)
+    from voyager_compiler.compilation import CompilerContext
+
+    compiler = (
+        CompilerContext.resolve(
+            hardware,
+            cost_tradeoff=getattr(args, "interstellar_cost_tradeoff", True),
+            runtime_tolerance=getattr(args, "runtime_tolerance", None),
+        )
+        if getattr(backend, "uses_bufferized_flow", False)
+        else None
+    )
     return CompilationContext(
         target,
         hardware,
         backend,
         policy,
         getattr(args, "quantization_recipe", None),
+        compiler,
     )
 
 

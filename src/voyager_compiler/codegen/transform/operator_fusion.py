@@ -32,7 +32,10 @@ logger = logging.getLogger(__name__)
 
 
 def _nodes_sequential(
-    nodes: List[Node], order: Dict[Node, int], hoisted: bool = True
+    nodes: List[Node],
+    order: Dict[Node, int],
+    hoisted: bool = True,
+    allow_input_dequantize: bool = False,
 ) -> bool:
     """Whether ``nodes`` can run as one group: each a user of the one before it,
     and a ``dequantize`` only ever sitting on a GEMM.
@@ -53,6 +56,10 @@ def _nodes_sequential(
         if (
             n.target == torch.ops.quantized_ops.dequantize.default
             and not is_gemm_op(n.args[0])
+            # An explicitly supplied pattern may begin with an input decode
+            # (for example, decode -> pool -> quantize). It consumes an
+            # external tensor and needs no preceding compute in this group.
+            and not (allow_input_dequantize and n is nodes[0])
         ):
             return False
         if hoisted and prev_node is not None:
@@ -124,7 +131,14 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate, order, hoisted=False):
+                if _nodes_sequential(
+                    candidate,
+                    order,
+                    hoisted=False,
+                    allow_input_dequantize=getattr(
+                        pattern[0], "allow_input_dequantize", False
+                    ),
+                ):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True
@@ -719,7 +733,7 @@ def _tail_fits(
         True if some pattern admits the chain.
     """
     if tail and tail[0].target == torch.ops.quantized_ops.dequantize.default:
-            tail = tail[1:]
+        tail = tail[1:]
     add = torch.ops.aten.add.Tensor
     for pattern in patterns:
         if not pattern[0].matches(anchor):

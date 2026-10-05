@@ -626,6 +626,36 @@ class Bandwidth:
 
 
 @dataclass(frozen=True)
+class TransferGeometry:
+    """Maximum rectangle encoded by one transfer command, in physical bytes.
+
+    Tensor extents/dependencies belong to the program. These are interface
+    capabilities, not a selected software tile or an instruction burst policy.
+    """
+
+    max_rows: int
+    max_row_bytes: int
+
+    def __post_init__(self):
+        for value in (self.max_rows, self.max_row_bytes):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(
+                    "Transfer dimensions must be positive integers"
+                )
+
+    def command_count(self, rows, row_bytes):
+        if rows < 0 or row_bytes < 0:
+            raise ValueError("Transfer extent cannot be negative")
+        return math.ceil(rows / self.max_rows) * math.ceil(
+            row_bytes / self.max_row_bytes
+        )
+
+
+@dataclass(frozen=True)
 class Connection:
     name: str
     source: str
@@ -638,8 +668,20 @@ class Connection:
     target_port: Optional[str] = None
     shared_with: Optional[str] = None
     startup_ns: float = 0
+    # Endpoint throughput can be lower than its share of the physical bus.
+    # This limit does not consume bandwidth on behalf of other connections.
+    service_bandwidth: Optional[Bandwidth] = None
+    transfer_geometry: Optional[TransferGeometry] = None
+    # Commands on the same controller serialize endpoint service.
+    service_resource: Optional[str] = None
 
     def __post_init__(self):
+        if self.transfer_geometry is not None and not isinstance(
+            self.transfer_geometry, TransferGeometry
+        ):
+            raise TypeError("Transfer geometry must be TransferGeometry")
+        if self.service_resource is not None and not self.service_resource:
+            raise ValueError("Transfer service resource cannot be empty")
         if (self.bandwidth is None) == (self.shared_with is None):
             raise ValueError(
                 "A connection needs its own bandwidth or a shared connection reference"
@@ -648,6 +690,10 @@ class Connection:
             self.bandwidth, Bandwidth
         ):
             raise TypeError("Connection bandwidth must be Bandwidth")
+        if self.service_bandwidth is not None and not isinstance(
+            self.service_bandwidth, Bandwidth
+        ):
+            raise TypeError("Connection service bandwidth must be Bandwidth")
         if not math.isfinite(self.startup_ns) or self.startup_ns < 0:
             raise ValueError("Transfer startup must be finite and nonnegative")
         if self.latency_ns is not None and (
@@ -733,6 +779,13 @@ class AcceleratorConfig:
         if len({c.name for c in self.connections}) != len(self.connections):
             raise ValueError("Connection names must be unique")
         for edge in self.connections:
+            if (
+                edge.service_resource is not None
+                and edge.service_resource not in names
+            ):
+                raise ValueError(
+                    f"Unknown transfer service resource {edge.service_resource!r}"
+                )
             if edge.source not in names or edge.target not in names:
                 raise ValueError(f"Unknown endpoint on connection {edge.name}")
             if edge.source == edge.target:
@@ -759,10 +812,12 @@ class AcceleratorConfig:
                         raise ValueError(
                             f"Port direction disagrees with connection {edge.name}"
                         )
-            if budget.bandwidth.memory_port is not None:
-                self.memory_instance(budget.bandwidth.memory_port)
-            for ref in budget.bandwidth.unrolling:
-                self.unroll(ref)
+            for rate in (budget.bandwidth, edge.service_bandwidth):
+                if rate is not None:
+                    if rate.memory_port is not None:
+                        self.memory_instance(rate.memory_port)
+                    for ref in rate.unrolling:
+                        self.unroll(ref)
         for unit in self.computation_units:
             for dim in unit.spatial_unrolling:
                 self.unroll(UnrollingRef(unit.name, dim.dimension))

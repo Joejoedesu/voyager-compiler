@@ -446,6 +446,7 @@ def pad_matrix_op_dimensions(
     C_unroll,
     K_unroll,
     fold_cache: bool = FOLD_PAD_INTO_CACHE,
+    skip_rgb: bool = True,
 ) -> GraphModule:
     """
     Pad inputs and weights to conv2d nodes in a torch.fx.GraphModule so that
@@ -472,7 +473,7 @@ def pad_matrix_op_dimensions(
         C_in = input.shape[1] if is_conv else input.shape[-1]
 
         # Skip CNN first layer with input channels equal to 3
-        if is_conv and C_in == 3:
+        if is_conv and C_in == 3 and skip_rgb:
             continue
 
         pad_C = (C_unroll - (C_in % C_unroll)) % C_unroll
