@@ -1,5 +1,8 @@
 # Hardware IR
 
+For Trainium's typed layout/ISA catalog and physical instruction plan, see
+[Trainium selected ISA plans](trainium-selected-plan.md).
+
 `AcceleratorConfig` owns an immutable hardware graph. `voyager_config()` creates
 the named `voyager` instance; `VOYAGER` is that profile with its default values.
 Voyager's constants belong to this factory, not to the generic IR types or to
@@ -344,3 +347,20 @@ unsupported transfer contracts rather than silently claiming to use them.
 
 See [the shared-flow extension interfaces](compilation.md#extensible-bufferized-targets)
 for policy, buffer plans, placement and realization ownership.
+
+## Multi-operation implementations
+
+`AcceleratorConfig.operation_implementations` optionally declares typed
+`OperationImplementation` recipes. Each contains `ImplementationValue` records,
+input/output names, and ordered `ImplementationStep` records binding supported
+operation operands to those values. The hardware validator checks exact
+capability signatures, memory placement, producer ordering and single producers.
+Compiler-specific expansion counts carry an explicit applicability string;
+counts do not imply serialized instruction latency.
+
+This is distinct from `ISAPipeline`, which still declares one supported ISA
+call. Recipes may include real intermediate memories and copies. Shape-dependent
+instantiation and implementation selection belong to the target adapter.
+The Trainium ISA adapter consumes these recipes through the existing candidate
+evaluation and realization hooks. See [dependency timing](trainium-dependency-model.md)
+for the optional shared repeated-graph evaluator and its validation scope.

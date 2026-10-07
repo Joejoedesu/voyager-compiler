@@ -53,6 +53,8 @@ IN, MID, OUT = "in", "mid", "out"
 _LAYER_NORM_PASSES = [(IN, None), (IN, None), (IN, MID), (MID, OUT)]
 _SOFTMAX_PASSES = [(IN, None), (IN, None), (IN, OUT)]
 OP_PASSES = {
+    torch.ops.aten.rms_norm.default: [(IN, None), (IN, MID), (MID, OUT)],
+    torch.ops.quantized_ops.rms_norm.default: [(IN, None), (IN, MID), (MID, OUT)],
     torch.ops.aten.layer_norm.default: _LAYER_NORM_PASSES,
     torch.ops.aten.softmax.int: _SOFTMAX_PASSES,
     torch.ops.quantized_ops.layer_norm.default: _LAYER_NORM_PASSES,

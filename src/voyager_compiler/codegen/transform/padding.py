@@ -705,9 +705,9 @@ def pad_vector_op_dimensions(
     """
     for node in list(model.graph.nodes):
         if node.target == torch.ops.aten.layer_norm.default:
-            _pad_layer_norm(model, node, K_unroll)
+            _pad_layer_norm(model, node, node.meta.get("vector_padding_alignment", K_unroll))
         elif node.target == torch.ops.aten.softmax.int:
-            _pad_softmax(model, node, K_unroll)
+            _pad_softmax(model, node, node.meta.get("vector_padding_alignment", K_unroll))
         elif node.target in (
             torch.ops.quantized_ops.quantize_mx.default,
             torch.ops.quantized_ops.quantize_affine.default,

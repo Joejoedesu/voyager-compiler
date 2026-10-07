@@ -1246,6 +1246,8 @@ def _dedup_regions(gm: GraphModule) -> None:
 
 
 _REDUCTION_POINTWISE_OPS = DYNAMIC_QUANTIZE_OPS | {
+    torch.ops.aten.rms_norm.default,
+    torch.ops.quantized_ops.rms_norm.default,
     torch.ops.quantized_ops.quantize.default,
     torch.ops.quantized_ops.layer_norm.default,
     torch.ops.aten.layer_norm.default,

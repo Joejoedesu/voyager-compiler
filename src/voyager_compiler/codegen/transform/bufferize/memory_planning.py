@@ -206,18 +206,34 @@ def _greedy_best_fit(
     banks; everything else passes 1.  Returns ``({key: offset},
     total_bytes)``.
     """
-    placed: List[Tuple[object, int, int, int, int]] = (
-        []
-    )  # (key, lo, hi, start, end)
+    # Index already-placed lifetimes by their start time. Each subtree keeps
+    # the latest end time, so sequential regions need not scan one another.
+    # This changes only the overlap query, not ordering or placement policy.
+    starts = sorted({it[2] for it in items})
+    positions = {start: i for i, start in enumerate(starts)}
+    width = 1 << max(0, (len(starts) - 1).bit_length())
+    latest = [float("-inf")] * (2 * width)
+    leaves = [[] for _ in starts]
+    bases = {}
+
+    def overlaps(lo, hi):
+        pending = [(1, 0, width)]
+        while pending:
+            node, left, right = pending.pop()
+            if left >= len(starts) or starts[left] > hi or latest[node] < lo:
+                continue
+            if right - left == 1:
+                for end_time, start, end in leaves[left]:
+                    if end_time >= lo:
+                        yield start, end
+            else:
+                middle = (left + right) // 2
+                pending.extend(((node * 2, left, middle), (node * 2 + 1, middle, right)))
     total = 0
     for key, size, lo, hi, align in sorted(
         items, key=lambda it: (-it[1], it[2])
     ):
-        occupied = sorted(
-            (start, end)
-            for _k, a, b, start, end in placed
-            if a <= hi and lo <= b
-        )
+        occupied = sorted(overlaps(lo, hi))
         off = 0
         for start, end in occupied:
             candidate = math.ceil(off / align) * align
@@ -225,9 +241,15 @@ def _greedy_best_fit(
                 break
             off = max(off, end)
         off = math.ceil(off / align) * align
-        placed.append((key, lo, hi, off, off + size))
+        bases[key] = off
+        position = positions[lo]
+        leaves[position].append((hi, off, off + size))
+        node = width + position
+        while node:
+            latest[node] = max(latest[node], hi)
+            node //= 2
         total = max(total, off + size)
-    return {key: start for key, _lo, _hi, start, _end in placed}, total
+    return bases, total
 
 
 # ---------------------------------------------------------------------------

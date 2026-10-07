@@ -1,0 +1,136 @@
+{
+  "name": "trn2-primitives-stream32-shortK64-2026-10-07",
+  "compiler": "neuronx-cc 2.22.12471 / Trainium2",
+  "primitives": [
+    {
+      "implementation": "nki.matmul.float32",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 381.33333333333337,
+      "completion_service_scale": 2.000000000000001
+    },
+    {
+      "implementation": "nki.copy.PSUM.float32.ScalarE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 166.99999999999991,
+      "completion_service_scale": 1.0031250000000003
+    },
+    {
+      "implementation": "nki.transpose_copy.float32.ScalarE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 423.6666666666667,
+      "completion_service_scale": 1
+    },
+    {
+      "implementation": "nki.copy.SBUF.float32.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 161.3333333333334,
+      "completion_service_scale": 0.5000000000000001
+    },
+    {
+      "implementation": "nki.memset.float32.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 58.66666666666658,
+      "completion_service_scale": 0.7975000000000002
+    },
+    {
+      "implementation": "nki.matmul.bfloat16",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 203.00000000000009,
+      "completion_service_scale": 1.9875000000000007
+    },
+    {
+      "implementation": "nki.copy.PSUM.bfloat16.ScalarE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 166.99999999999991,
+      "completion_service_scale": 1.0031250000000003
+    },
+    {
+      "implementation": "nki.transpose_copy.bfloat16.ScalarE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 239.66666666666666,
+      "completion_service_scale": 1
+    },
+    {
+      "implementation": "nki.copy.SBUF.bfloat16.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 141.66666666666657,
+      "completion_service_scale": 0.6850000000000003
+    },
+    {
+      "implementation": "nki.memset.bfloat16.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 58.66666666666658,
+      "completion_service_scale": 0.7975000000000002
+    },
+    {
+      "implementation": "nki.binary.float32.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 0.5,
+      "completion_base_ns": 158.66666666666663,
+      "completion_service_scale": 0.5
+    },
+    {
+      "implementation": "nki.scalar.float32.VectorE",
+      "issue_floor_ns": 0,
+      "service_scale": 0.5,
+      "completion_base_ns": 160.33333333333331,
+      "completion_service_scale": 0.5
+    },
+    {
+      "implementation": "nki.copy.SBUF.float32.ScalarE",
+      "issue_floor_ns": 0,
+      "service_scale": 1,
+      "completion_base_ns": 190.33333333333348,
+      "completion_service_scale": 0.9999999999999999
+    },
+    {
+      "implementation": "nki.stream_transpose.float32.SBUF.VectorE.steady",
+      "issue_floor_ns": 93,
+      "service_scale": 0,
+      "completion_base_ns": 233,
+      "completion_service_scale": 0
+    },
+    {
+      "implementation": "nki.stream_transpose.float32.SBUF.VectorE.switch",
+      "issue_floor_ns": 234,
+      "service_scale": 0,
+      "completion_base_ns": 233,
+      "completion_service_scale": 0
+    },
+    {
+      "implementation": "nki.matmul.float32.K64_N128_M512",
+      "issue_floor_ns": 1707,
+      "service_scale": 0,
+      "completion_base_ns": 2765,
+      "completion_service_scale": 0
+    }
+  ],
+  "load": {
+    "issue_ns": 599.0,
+    "dispatch_ns": 751.0,
+    "payload_floor_ns": 0,
+    "payload_base_ns": 293.13043478260835,
+    "payload_scale": 1.3045898437500008,
+    "notification_ns": 314.5
+  },
+  "store": {
+    "issue_ns": 609.0,
+    "dispatch_ns": 565.5,
+    "payload_floor_ns": 0,
+    "payload_base_ns": 162.2608695652172,
+    "payload_scale": 0.9627929687500003,
+    "notification_ns": 355.0
+  },
+  "fixed_kernel_ns": 9403.3965,
+  "evidence": "Prior movement calibration plus results/trainium/vector-characterization/calibration.json (isolated primitives; application kernels held out); scalar SBUF copy: results/trainium/scalar-copy-characterization/calibration.json; stream transpose and short-K: results/trainium/model-integration-2026-10-07/calibration-provenance.json (authenticated isolated hardware probes; exact scopes in docs/trainium-isa-model.md)"
+}

@@ -779,6 +779,14 @@ def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
 # element per row, and the ones as big as the tile itself.  A softmax holds a
 # max and a sum, a layer_norm a mean and a variance plus the normalized tile.
 _REDUCTION_SCRATCH = {
+    aten.rms_norm.default: (
+        torch.ops.quantized_ops.rms_norm.default,
+        ("variance",), ("normalized",),
+    ),
+    torch.ops.quantized_ops.rms_norm.default: (
+        torch.ops.quantized_ops.rms_norm.default,
+        ("variance",), ("normalized",),
+    ),
     aten.softmax.int: (
         torch.ops.quantized_ops.softmax.default,
         ("max", "sum"),

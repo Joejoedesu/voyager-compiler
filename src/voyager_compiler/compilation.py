@@ -23,6 +23,10 @@ def _encode(value):
 
 
 def hardware_fingerprint(hardware):
+    if is_dataclass(hardware):
+        hardware = asdict(hardware)
+        if not hardware.get("operation_implementations"):
+            hardware.pop("operation_implementations", None)
     return hashlib.sha256(
         json.dumps(hardware, default=_encode, sort_keys=True).encode()
     ).hexdigest()

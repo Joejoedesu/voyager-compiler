@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import math
 from voyager_compiler.hardware_config import CapacityUnit
+from .execution import ExecutionPlan
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class CandidateEvaluation:
     buffer_plan: object
     storage: tuple = ()
     diagnostics: tuple = ()
+    execution_plan: ExecutionPlan | None = None
 
     def __post_init__(self):
         if math.isnan(self.cycles) or self.cycles < 0:

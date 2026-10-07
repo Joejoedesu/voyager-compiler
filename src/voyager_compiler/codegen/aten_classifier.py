@@ -476,6 +476,7 @@ _QUANTIZED_COMPUTE_OPS = (
     "conv2d_mx",
     "dequantize",
     "layer_norm",
+    "rms_norm",
     "linear",
     "linear_mx",
     "matmul",
@@ -508,7 +509,7 @@ def _quantized(names):
 # so both unions are built on first predicate call rather than at import time.
 @functools.cache
 def _compute_ops() -> frozenset:
-    return frozenset(_GENERATED_COMPUTE_OPS) | _quantized(
+    return frozenset(_GENERATED_COMPUTE_OPS) | {torch.ops.aten.rms_norm.default} | _quantized(
         _QUANTIZED_COMPUTE_OPS
     )
 

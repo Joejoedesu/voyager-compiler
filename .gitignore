@@ -31,3 +31,7 @@ results/
 
 !test/test_extensibility.py
 !test/test_interstellar_selection.py
+!test/test_trainium.py
+!test/test_trainium_*.py
+
+!test/test_execution_contracts.py

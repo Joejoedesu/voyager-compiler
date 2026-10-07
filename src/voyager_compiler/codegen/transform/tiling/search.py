@@ -360,7 +360,8 @@ def _search_tiling(
     valid tiling is tried, ``order`` aside, since a larger tile is not always
     a faster one; each that fits is scored and the one moving the fewest
     bytes wins among those within ``(1 + tolerance)`` of the best latency.
-    Latency alone is not enough: a compute-bound op is equally fast however
+    A speed_only target instead picks strict minimum latency, ignoring
+    traffic and tolerance. For the default objective, a compute-bound op is equally fast however
     its operands are diced, so the residue the model leaves behind would buy
     any amount of traffic for a rounding error.  This is how the interstellar
     tiler picks a mapping too (``mapping_point_generator``, with energy in
@@ -433,11 +434,14 @@ def _search_tiling(
             )
 
         if scored:
-            budget = min(s[0] for s in scored) * (1.0 + tolerance)
-            best = min(
-                (s for s in scored if s[0] <= budget),
-                key=lambda s: (s[1], s[0]),
-            )
+            if policy.speed_only:
+                best = min(scored, key=lambda s: s[0])
+            else:
+                budget = min(s[0] for s in scored) * (1.0 + tolerance)
+                best = min(
+                    (s for s in scored if s[0] <= budget),
+                    key=lambda s: (s[1], s[0]),
+                )
             groups = best[4]
             return best[2], groups, best[0]
 
@@ -765,6 +769,8 @@ def _vector_op_tiling_limits(node, vector_unit_width):
         not in [
             torch.ops.aten.softmax.int,
             torch.ops.aten.layer_norm.default,
+            torch.ops.aten.rms_norm.default,
+            torch.ops.quantized_ops.rms_norm.default,
             torch.ops.aten.permute.default,
             torch.ops.aten.transpose.int,
             torch.ops.quantized_ops.layer_norm.default,
@@ -779,6 +785,8 @@ def _vector_op_tiling_limits(node, vector_unit_width):
         last_dim = get_arg_value(node, 1, "dim", -1)
     elif node.target in [
         torch.ops.aten.layer_norm.default,
+        torch.ops.aten.rms_norm.default,
+        torch.ops.quantized_ops.rms_norm.default,
         torch.ops.quantized_ops.layer_norm.default,
     ]:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)

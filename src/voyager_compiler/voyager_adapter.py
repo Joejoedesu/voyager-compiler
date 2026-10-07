@@ -17,6 +17,10 @@ def interstellar_memory(config):
     config.require_backend("voyager")
     # These declarations are available to target-specific adapters. The current
     # Voyager algorithms must not silently ignore constraints they do not use.
+    if config.operation_implementations:
+        raise NotImplementedError(
+            "Voyager lowering does not select multi-operation implementations yet"
+        )
     if any(unit.modes for unit in config.computation_units):
         raise NotImplementedError(
             "Voyager lowering does not select compute modes yet"

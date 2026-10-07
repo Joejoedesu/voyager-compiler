@@ -912,8 +912,62 @@ class AsyncPipelinedKernel(PipelinedKernel):
         def cond_fn(step, load_counts, wait_counts, store_counts):
             return step < self.num_steps
 
+        # Reusing a single changing slot requires the previous compute to
+        # retire before its input is overwritten or its output slot is reused.
+        # Retained one-slot operands do not require this serialization.
+        retire_before_submit = any(
+            ref.num_slots == 1 and not ref._single_block()
+            for ref in in_refs + out_refs
+        )
+
+        def retire_previous(ctx, store_counts):
+            step = ctx.step
+            # 4. Lagged retire of tile step-1 (nothing at step 0): wait its
+            #    compute-done every step, and store each output once its *own*
+            #    block has finished (slot ordinal one behind the tile committed
+            #    now).  Flat conds — a ``SymBool`` predicate cannot be captured
+            #    into an outer cond's operands, so ``step >= 1`` folds into the
+            #    store predicate.
+            effect_cond(
+                step >= 1,
+                lambda: voyager.async_wait(
+                    get_slot(done_sem, (step - 1) % _DONE_DEPTH)
+                ),
+            )
+
+            # 5. Retire (store) + advance the finished-tile count, per output.
+            #    An output that advances every step stores every step (guard
+            #    just ``step >= 1``) and its count ticks unconditionally — no
+            #    ``_indices_differ`` (always true), matching ``copy_out``'s fast
+            #    path.  A held output stores / ticks only on its own block
+            #    boundary.
+            next_store = []
+            for i in range(num_outputs):
+                ref = out_refs[i]
+                if ref._advances_every_step():
+                    should_store = step >= 1
+                    nxt = store_counts[i] + 1
+                else:
+                    should_store = (step >= 1) & ref._indices_differ(
+                        ctx.prev, ctx.cur
+                    )
+                    nxt = torch.sym_ite(
+                        ref._indices_differ(ctx.cur, ctx.next) | ctx.last,
+                        store_counts[i] + 1,
+                        store_counts[i],
+                    )
+                effect_cond(
+                    should_store,
+                    lambda i=i: _store_out(i, ctx.prev, store_counts[i]),
+                )
+                next_store.append(nxt)
+
+            return next_store
+
         def body_fn(step, load_counts, wait_counts, store_counts):
             ctx = self._step_ctx(step, distinct_counts)
+            if retire_before_submit:
+                next_store = retire_previous(ctx, store_counts)
 
             # 1. Prefetch each input ``D`` blocks ahead (base ``copy_in``): an
             #    advancing input copies every step (+1, no cursor); a reused one
@@ -984,45 +1038,8 @@ class AsyncPipelinedKernel(PipelinedKernel):
                 post,
             )
 
-            # 4. Lagged retire of tile step-1 (nothing at step 0): wait its
-            #    compute-done every step, and store each output once its *own*
-            #    block has finished (slot ordinal one behind the tile committed
-            #    now).  Flat conds — a ``SymBool`` predicate cannot be captured
-            #    into an outer cond's operands, so ``step >= 1`` folds into the
-            #    store predicate.
-            effect_cond(
-                step >= 1,
-                lambda: voyager.async_wait(
-                    get_slot(done_sem, (step - 1) % _DONE_DEPTH)
-                ),
-            )
-
-            # 5. Retire (store) + advance the finished-tile count, per output.
-            #    An output that advances every step stores every step (guard
-            #    just ``step >= 1``) and its count ticks unconditionally — no
-            #    ``_indices_differ`` (always true), matching ``copy_out``'s fast
-            #    path.  A held output stores / ticks only on its own block
-            #    boundary.
-            next_store = []
-            for i in range(num_outputs):
-                ref = out_refs[i]
-                if ref._advances_every_step():
-                    should_store = step >= 1
-                    nxt = store_counts[i] + 1
-                else:
-                    should_store = (step >= 1) & ref._indices_differ(
-                        ctx.prev, ctx.cur
-                    )
-                    nxt = torch.sym_ite(
-                        ref._indices_differ(ctx.cur, ctx.next) | ctx.last,
-                        store_counts[i] + 1,
-                        store_counts[i],
-                    )
-                effect_cond(
-                    should_store,
-                    lambda i=i: _store_out(i, ctx.prev, store_counts[i]),
-                )
-                next_store.append(nxt)
+            if not retire_before_submit:
+                next_store = retire_previous(ctx, store_counts)
 
             # 6. Advance each reused input's consumer cursor (block finished).
             next_wait, g = [], 0

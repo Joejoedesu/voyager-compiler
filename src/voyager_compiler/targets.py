@@ -188,3 +188,9 @@ from voyager_compiler.quantization.gemmini import ensure_gemmini_policy
 ensure_gemmini_policy()
 register_backend("gemmini", GemminiBackend())
 register_target(Target("gemmini", "gemmini", "gemmini", lean_config))
+
+from voyager_compiler.trainium.hardware import register_targets
+from voyager_compiler.quantization.trainium import register_policy
+
+register_policy()
+register_targets()

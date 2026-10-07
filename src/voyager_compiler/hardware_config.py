@@ -359,6 +359,169 @@ class ISAPipeline:
 
 
 @dataclass(frozen=True)
+class ImplementationValue:
+    """A typed value at an implementation boundary or between its steps."""
+
+    name: str
+    dtype: DataType
+    memory: str
+    layout: str = ""
+
+    def __post_init__(self):
+        if (
+            not self.name
+            or not self.memory
+            or not isinstance(self.dtype, DataType)
+        ):
+            raise ValueError(
+                "Implementation values require a name, dtype and memory"
+            )
+
+
+@dataclass(frozen=True)
+class ImplementationStep:
+    """One supported operation; bindings map capability operands to values.
+
+    Instruction counts describe a pinned lowering, not serialized timing.
+    A pipelined compound operation remains one timing node.
+    """
+
+    name: str
+    unit: str
+    mode: str
+    operation: str
+    bindings: Tuple[Tuple[str, str], ...]
+    instruction_counts: Tuple[Tuple[str, int], ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "bindings", tuple(tuple(x) for x in self.bindings)
+        )
+        object.__setattr__(
+            self,
+            "instruction_counts",
+            tuple(tuple(x) for x in self.instruction_counts),
+        )
+        if not all((self.name, self.unit, self.mode, self.operation)):
+            raise ValueError(
+                "Implementation steps require named operations and modes"
+            )
+        if len(dict(self.bindings)) != len(self.bindings):
+            raise ValueError("Duplicate implementation operand binding")
+        if len(dict(self.instruction_counts)) != len(
+            self.instruction_counts
+        ) or any(
+            not name or type(count) is not int or count <= 0
+            for name, count in self.instruction_counts
+        ):
+            raise ValueError(
+                "Instruction counts require unique names and positive integers"
+            )
+
+
+@dataclass(frozen=True)
+class OperationImplementation:
+    """Explicit multi-operation realization; never implies single-call fusion.
+
+    The graph is SSA and steps are in topological order. Shape/layout selection
+    and timing formulas remain target functions. Applicability names the pinned
+    interface/compiler contract; it is not a claim about every backend version.
+    """
+
+    name: str
+    operation: str
+    values: Tuple[ImplementationValue, ...]
+    inputs: Tuple[str, ...]
+    outputs: Tuple[str, ...]
+    steps: Tuple[ImplementationStep, ...]
+    applicability: str
+    shared_constant_bytes: int = 0
+
+    def __post_init__(self):
+        for field in ("values", "inputs", "outputs", "steps"):
+            object.__setattr__(self, field, tuple(getattr(self, field)))
+        if (
+            not all((self.name, self.operation, self.applicability))
+            or not self.steps
+        ):
+            raise ValueError(
+                "Operation implementations need names, applicability and steps"
+            )
+        names = [v.name for v in self.values]
+        if len(set(names)) != len(names) or len(
+            {s.name for s in self.steps}
+        ) != len(self.steps):
+            raise ValueError(
+                "Implementation value and step names must be unique"
+            )
+        if (
+            not self.inputs
+            or not self.outputs
+            or any(
+                len(set(boundary)) != len(boundary)
+                or not set(boundary) <= set(names)
+                for boundary in (self.inputs, self.outputs)
+            )
+        ):
+            raise ValueError("Invalid implementation boundary values")
+        if (
+            type(self.shared_constant_bytes) is not int
+            or self.shared_constant_bytes < 0
+        ):
+            raise ValueError("Invalid implementation constant size")
+
+    def instruction_counts(self):
+        counts = {}
+        for step in self.steps:
+            for name, count in step.instruction_counts:
+                counts[name] = counts.get(name, 0) + count
+        return tuple(counts.items())
+
+    def validate(self, hardware):
+        values = {v.name: v for v in self.values}
+        ready = set(self.inputs)
+        for value in self.values:
+            hardware.memory_instance(value.memory)
+        for step in self.steps:
+            bindings = dict(step.bindings)
+            if not set(bindings.values()) <= values.keys():
+                raise ValueError("Implementation references an unknown value")
+            mode = hardware.compute_unit(step.unit).mode(step.mode)
+            matches = [
+                cap
+                for cap in mode.operations
+                if cap.operation == step.operation
+                and cap.matches(
+                    {key: values[v].dtype for key, v in bindings.items()},
+                    {key: values[v].memory for key, v in bindings.items()},
+                )
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "Implementation step needs exactly one supported operand signature"
+                )
+            writes = []
+            for operand in matches[0].operands:
+                value = bindings[operand.name]
+                if (
+                    operand.access in (AccessMode.READ, AccessMode.READ_WRITE)
+                    and value not in ready
+                ):
+                    raise ValueError(
+                        "Implementation reads a value before it is produced"
+                    )
+                if operand.access in (AccessMode.WRITE, AccessMode.READ_WRITE):
+                    if value in ready:
+                        raise ValueError(
+                            "Implementation values must have a single producer"
+                        )
+                    writes.append(value)
+            ready.update(writes)
+        if not set(self.outputs) <= ready:
+            raise ValueError("Implementation output has no producer")
+
+
+@dataclass(frozen=True)
 class MemorySize:
     value: Optional[float]
     unit: CapacityUnit
@@ -713,6 +876,7 @@ class AcceleratorConfig:
     frequency: float
     backend: Optional[str]
     isa_pipelines: Tuple[ISAPipeline, ...]
+    operation_implementations: Tuple[OperationImplementation, ...]
     provenance: Tuple[ParameterProvenance, ...]
 
     def __init__(
@@ -725,6 +889,7 @@ class AcceleratorConfig:
         frequency=None,
         backend=None,
         isa_pipelines=None,
+        operation_implementations=None,
         provenance=None,
         **legacy,
     ):
@@ -743,6 +908,12 @@ class AcceleratorConfig:
                 object.__setattr__(self, "backend", backend)
             if isa_pipelines is not None:
                 object.__setattr__(self, "isa_pipelines", tuple(isa_pipelines))
+            if operation_implementations is not None:
+                object.__setattr__(
+                    self,
+                    "operation_implementations",
+                    tuple(operation_implementations),
+                )
             if provenance is not None:
                 object.__setattr__(self, "provenance", tuple(provenance))
         else:
@@ -762,6 +933,9 @@ class AcceleratorConfig:
                 frequency=frequency,
                 backend=backend,
                 isa_pipelines=tuple(isa_pipelines or ()),
+                operation_implementations=tuple(
+                    operation_implementations or ()
+                ),
                 provenance=tuple(provenance or ()),
             ).items():
                 object.__setattr__(self, key, value)
@@ -852,6 +1026,12 @@ class AcceleratorConfig:
                     raise ValueError(
                         f"ISA pipeline {pipeline.name} requires unsupported operations on {stage.unit}"
                     )
+        if len({impl.name for impl in self.operation_implementations}) != len(
+            self.operation_implementations
+        ):
+            raise ValueError("Operation implementation names must be unique")
+        for impl in self.operation_implementations:
+            impl.validate(self)
         for level in self.memory.levels:
             for ref in level.spatial_scope:
                 self.unroll(ref)
@@ -866,6 +1046,12 @@ class AcceleratorConfig:
             raise ValueError("A parameter must have a single provenance record")
         for record in self.provenance:
             self.parameter_value(record.parameter)
+
+    def operation_implementation(self, name):
+        for implementation in self.operation_implementations:
+            if implementation.name == name:
+                return implementation
+        raise ValueError(f"Unknown operation implementation: {name}")
 
     def parameter_value(self, path):
         """Resolve evidence paths without evaluating code or derived properties."""

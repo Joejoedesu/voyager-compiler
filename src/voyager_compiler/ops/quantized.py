@@ -155,6 +155,18 @@ def softmax(
     return torch.ops.aten.softmax.int(input, dim, dtype)
 
 
+quantized_ops_lib.define(
+    "rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, "
+    "float? eps=None, Tensor(a!)? variance=None, Tensor(b!)? normalized=None) -> Tensor"
+)
+
+
+@impl(quantized_ops_lib, "rms_norm", "CompositeExplicitAutograd")
+def rms_norm(input, normalized_shape, weight=None, eps=None,
+             variance=None, normalized=None):
+    return torch.nn.functional.rms_norm(input, normalized_shape, weight, eps)
+
+
 def expand(input, shape, block_size):
     while input.ndim < len(shape):
         input = input.unsqueeze(0)
