@@ -448,7 +448,7 @@ class TrainiumCostModel:
         if self.tuning.isa_lowering and not self.conv:
             from .dependencies import compute_graph, evaluate_graph
 
-            graph_compute, _ = compute_graph(
+            graph_compute, compute_counts = compute_graph(
                 hw,
                 m,
                 n,
@@ -459,6 +459,13 @@ class TrainiumCostModel:
                 getattr(rc, "input_dtype_name", None),
                 getattr(rc, "output_dtype_name", None),
             )
+            compute_transposes = compute_counts.get("MATMUL_TRANSPOSE", 0)
+            # Expansion counts must follow the chosen operand geometry.
+            # Transpose LDWEIGHTS are added with the boundary transposes below.
+            expansions = Counter(compute_counts)
+            expansions.pop("MATMUL_TRANSPOSE", None)
+            expansions["LDWEIGHTS"] -= compute_transposes
+            instructions = sum(n.name.startswith("matmul_") for n in graph_compute.nodes)
             compute_timing = evaluate_graph(graph_compute)
             compute_path, active = compute_timing.duration_ns, dict(
                 compute_timing.service_ns
@@ -535,6 +542,9 @@ class TrainiumCostModel:
             constant_bytes = isa.transpose(
                 128, 128, dtype=getattr(rc, "input_dtype_name", "float32")
             ).shared_constant_bytes
+            if not self.tuning.strict_realization:
+                # Native nc_transpose's pinned SDK identity is uint8 in HBM.
+                constant_bytes = 128 * 128
             # One shared constant load per kernel, not per transpose. Account
             # payload; first-load completion is already in the prologue.
             constant_service = constant_bytes / hw.dram_bandwidth
@@ -671,6 +681,7 @@ class TrainiumCostModel:
                 explicit_isa=self.tuning.explicit_isa,
                 isa_lowering=self.tuning.isa_lowering,
                 copy_policy=self.tuning.copy_policy,
+                matmul_operands=self.tuning.matmul_operands,
             ),
             compute_dependency_ns=compute_path,
             service_sweep_comparator_ns=previous_predicted,
@@ -697,10 +708,17 @@ class TrainiumCostModel:
                     resource_service_bound_ns=graph_timing.resource_bound_ns,
                     timing_complete=not bool(graph_timing.unknown_latency),
                     scheduling="dependency-ready ASAP with shared DMA request service; final physical reuse is audited in the selected ISA DAG; finite backend queues not assumed",
-                    read_retirement="consumer completion; early read/forward milestones unknown",
+                    read_retirement="operand retirement at consumer completion; characterized FP32 geometry uses accumulator forwarding, other forwarding remains unknown",
                 )
             ),
         )
+        if self.tuning.isa_lowering and not self.conv:
+            from .orientation import matrix_choice
+            self.estimate["matrix_choice"] = matrix_choice(
+                hw, m, n, k, rc.input_dtype_width, rc.weight_transposed,
+                self.tuning, getattr(rc, "input_dtype_name", None),
+                getattr(rc, "output_dtype_name", None),
+            )
         cycles = predicted * hw.frequency
         self._runtime_cache[cache_key] = (
             cycles,
@@ -733,7 +751,8 @@ class TrainiumCostModel:
 
     def calculate_memory_cost(self, architecture, layer, mapping):
         # Diagnostic only; speed_only prevents memory/energy tie-breaking.
-        return self.estimate["hbm_bytes"]
+        # Rejected capacity candidates have no traffic estimate.
+        return self.estimate.get("hbm_bytes", math.inf)
 
 
 def vector_candidate(config, node, tile_sizes, shapes, tiling, tuning=None):

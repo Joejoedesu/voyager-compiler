@@ -137,6 +137,11 @@ class TrainiumMappingPolicy:
     def vector_limits(self, anchor, limits):
         return limits
 
+    def row_region_candidate(self, region, rows):
+        from .row_regions import candidate
+
+        return candidate(self.config, self.tuning, region, rows)
+
     def place_local_buffers(self, model, bufs):
         from .constraints import place_local_buffers
 

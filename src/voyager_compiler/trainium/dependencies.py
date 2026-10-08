@@ -39,6 +39,7 @@ def timed_event(
     implementation="",
     step=None,
     timing_implementation="",
+    timing_override=None,
     **schedule,
 ):
     timing = None
@@ -66,6 +67,9 @@ def timed_event(
         )
     law = config.timing_profile.operation(law_name)
     occupancy, completion = law.evaluate(service) if law else (service, None)
+    if timing_override is not None:
+        occupancy, completion, forward = timing_override
+        schedule.setdefault("forward_ns", forward)
     return OperationEvent(
         name,
         engine,
@@ -90,14 +94,62 @@ def timed_event(
     )
 
 
-@lru_cache(maxsize=2048)
 def compute_graph(
+    config,
+    m,
+    n,
+    k,
+    bits,
+    transposed,
+    tuning,
+    dtype=None,
+    output_dtype=None,
+    input_row=False,
+    output_row=False,
+    weight_layout="generic",
+):
+    from .orientation import matrix_choice, orientation_graph
+
+    choice = matrix_choice(
+        config,
+        m,
+        n,
+        k,
+        bits,
+        transposed,
+        tuning,
+        dtype,
+        output_dtype,
+        input_row,
+        output_row,
+        weight_layout,
+    )
+    return orientation_graph(
+        config,
+        m,
+        n,
+        k,
+        bits,
+        transposed,
+        replace(tuning, matmul_orientation=choice["orientation"]),
+        dtype,
+        output_dtype,
+        input_row,
+        output_row,
+        weight_layout,
+    )
+
+
+@lru_cache(maxsize=2048)
+def _weights_compute_graph(
     config, m, n, k, bits, transposed, tuning, dtype=None, output_dtype=None
 ):
     """One software GEMM tile, sharing the converter's panel/ISA definitions."""
     dtype = dtype or ("float32" if bits == 32 else "bfloat16")
     output_dtype = output_dtype or dtype
     nodes, counts = [], Counter()
+    last_tensor_matmul = False
+    last_tensor_index = -1
 
     def emit(
         engine,
@@ -107,7 +159,12 @@ def compute_graph(
         step=None,
         role="copy",
         timing_implementation="",
+        timing_override=None,
     ):
+        nonlocal last_tensor_matmul, last_tensor_index
+        if engine == "TensorE":
+            last_tensor_matmul = implementation.startswith("nki.matmul.")
+            last_tensor_index = len(nodes)
         index = len(nodes)
         nodes.append(
             timed_event(
@@ -119,68 +176,120 @@ def compute_graph(
                 implementation=implementation,
                 step=step,
                 timing_implementation=timing_implementation,
+                timing_override=timing_override,
             )
         )
         return index
 
+    weight_panels = {}
     for mi, ni, mm, nn, kpanels in matmul_panels(m, n, k):
         acc = None
         for ki, kk in kpanels:
-            deps = []
-            if m > 512 or n > 128 or k > 128:
-                deps = [
-                    Dependency(
-                        emit(
-                            "VectorE",
-                            max(64, mm) / engine_clock(config, "VectorE"),
-                            implementation=f"nki.copy.SBUF.{dtype}.VectorE",
-                            step=0,
-                        )
-                    ),
-                    Dependency(
-                        emit(
-                            "VectorE",
-                            max(64, kk) / engine_clock(config, "VectorE"),
-                            implementation=f"nki.copy.SBUF.{dtype}.VectorE",
-                            step=0,
-                        )
-                    ),
-                ]
-            if not transposed:
-                engine = (
-                    "ScalarE" if tuning.copy_policy == "scalar" else "VectorE"
-                )
-                expansion = isa.transpose(nn, kk, config, engine, dtype)
-                counts.update(
-                    {
-                        name: count
-                        for name, count in expansion.instructions
-                        if name in ("LDWEIGHTS", "MATMUL_TRANSPOSE")
-                    }
-                )
-                clear = emit(
-                    "VectorE",
-                    max(64, nn) / engine_clock(config, "VectorE"),
-                    deps,
-                    implementation="nki.isa.memset.VectorE",
-                    role="psum_clear",
-                )
-                trans = emit(
-                    "TensorE",
-                    expansion.tensor_cycles / config.frequency,
-                    (Dependency(clear),),
-                    expansion.implementation,
-                    0,
-                    "transpose",
-                )
-                copied = emit(
-                    engine,
-                    expansion.scalar_cycles / engine_clock(config, engine),
-                    (Dependency(trans),),
-                    expansion.implementation,
-                    1,
-                )
-                deps = [Dependency(copied)]
+            if tuning.matmul_operands == "staged":
+                deps = []
+                if m > 512 or n > 128 or k > 128:
+                    deps = [
+                        Dependency(
+                            emit(
+                                "VectorE",
+                                max(64, mm) / engine_clock(config, "VectorE"),
+                                implementation=f"nki.copy.SBUF.{dtype}.VectorE",
+                                step=0,
+                            )
+                        ),
+                        Dependency(
+                            emit(
+                                "VectorE",
+                                max(64, kk) / engine_clock(config, "VectorE"),
+                                implementation=f"nki.copy.SBUF.{dtype}.VectorE",
+                                step=0,
+                            )
+                        ),
+                    ]
+                if not transposed:
+                    engine = (
+                        "ScalarE"
+                        if tuning.copy_policy == "scalar"
+                        else "VectorE"
+                    )
+                    expansion = isa.transpose(nn, kk, config, engine, dtype)
+                    counts.update(
+                        {
+                            name: count
+                            for name, count in expansion.instructions
+                            if name in ("LDWEIGHTS", "MATMUL_TRANSPOSE")
+                        }
+                    )
+                    clear = emit(
+                        "VectorE",
+                        max(64, nn) / engine_clock(config, "VectorE"),
+                        deps,
+                        implementation="nki.isa.memset.VectorE",
+                        role="psum_clear",
+                    )
+                    trans = emit(
+                        "TensorE",
+                        expansion.tensor_cycles / config.frequency,
+                        (Dependency(clear),),
+                        expansion.implementation,
+                        0,
+                        "transpose",
+                    )
+                    copied = emit(
+                        engine,
+                        expansion.scalar_cycles / engine_clock(config, engine),
+                        (Dependency(trans),),
+                        expansion.implementation,
+                        1,
+                    )
+                    deps = [Dependency(copied)]
+            else:
+                deps = []
+                weight_key = (ni, ki)
+                reuse = tuning.matmul_operands == "reuse"
+                if reuse and weight_key in weight_panels:
+                    weight_ready = weight_panels[weight_key]
+                elif not transposed:
+                    engine = (
+                        "ScalarE"
+                        if tuning.copy_policy == "scalar"
+                        else "VectorE"
+                    )
+                    expansion = isa.transpose(nn, kk, config, engine, dtype)
+                    counts.update(
+                        {
+                            name: count
+                            for name, count in expansion.instructions
+                            if name in ("LDWEIGHTS", "MATMUL_TRANSPOSE")
+                        }
+                    )
+                    clear = emit(
+                        "VectorE",
+                        max(64, nn) / engine_clock(config, "VectorE"),
+                        implementation="nki.isa.memset.VectorE",
+                        role="psum_clear",
+                    )
+                    trans = emit(
+                        "TensorE",
+                        expansion.tensor_cycles / config.frequency,
+                        (Dependency(clear),),
+                        expansion.implementation,
+                        0,
+                        "transpose",
+                    )
+                    weight_ready = emit(
+                        engine,
+                        expansion.scalar_cycles / engine_clock(config, engine),
+                        (Dependency(trans),),
+                        expansion.implementation,
+                        1,
+                    )
+                    if reuse:
+                        weight_panels[weight_key] = weight_ready
+                else:
+                    weight_ready = None
+                if weight_ready is not None:
+                    deps.append(Dependency(weight_ready))
             if acc is not None:
                 deps.append(Dependency(acc, milestone="forward"))
             else:
@@ -191,7 +300,23 @@ def compute_graph(
                     role="psum_clear",
                 )
                 deps.append(Dependency(clear))
-            expansion = isa.matmul(mm, nn, kk, bits, config, dtype)
+            staged = tuning.matmul_operands == "staged" and (
+                m > 512 or n > 128 or k > 128
+            )
+            expansion = isa.matmul(
+                mm,
+                nn,
+                kk,
+                bits,
+                config,
+                dtype,
+                moving_stride=1 if staged else (k + 127) // 128,
+                stationary_stride=(
+                    (k + 127) // 128 if transposed and not staged else 1
+                ),
+                streaming=last_tensor_matmul
+                and not any(d.source > last_tensor_index for d in deps),
+            )
             counts.update(dict(expansion.instructions))
             acc = emit(
                 "TensorE",
@@ -201,6 +326,7 @@ def compute_graph(
                 0,
                 "matmul",
                 timing_implementation=expansion.timing_implementation,
+                timing_override=expansion.timing_override,
             )
         engine = "ScalarE" if tuning.copy_policy == "scalar" else "VectorE"
         emit(

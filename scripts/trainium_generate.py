@@ -32,12 +32,26 @@ def main():
         default=Path(__file__).resolve().parents[1] / "results/trainium/run",
     )
     parser.add_argument("--dma-transpose", action="store_true")
+    parser.add_argument(
+        "--temporary-buffer-depth", type=int, default=1,
+        help="SBUF slot-pool multiplier; 1 preserves existing placement, >1 rotates bounded slots (strict ISA only)",
+    )
+    parser.add_argument(
+        "--strict-realization", action=argparse.BooleanOptionalAction, default=True,
+        help="Fix physical ISA buffers in Voyager (default); --no-strict-realization lets NKI allocate them",
+    )
     parser.add_argument("--legacy-isa", action="store_true")
     parser.add_argument(
         "--isa",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Explicit NKI ISA and panel result storage (default); --no-isa replays the language baseline",
+    )
+    parser.add_argument("--matmul-orientation", choices=("auto", "weights", "activations"), default="auto")
+    parser.add_argument(
+        "--matmul-operands",
+        choices=("staged", "direct", "reuse"),
+        default="staged",
     )
     parser.add_argument("--buffer-depth", type=int, default=2)
     parser.add_argument(
@@ -61,6 +75,7 @@ def main():
         metavar=("M", "N", "K"),
         help="Diagnostic fixed software tile; still uses shared search",
     )
+    parser.add_argument("--matmul-weight-layout", choices=("auto", "generic", "k_partitioned"), default="auto", help="Whole invariant row-region weight layout; auto searches both")
     args = parser.parse_args()
     if args.legacy_isa and args.isa:
         parser.error(
@@ -109,6 +124,11 @@ def main():
                         explicit_isa=not args.legacy_isa,
                         isa_lowering=args.isa,
                         copy_policy=args.copy_policy,
+                        matmul_operands=args.matmul_operands,
+                            matmul_orientation=args.matmul_orientation,
+                            matmul_weight_layout=args.matmul_weight_layout,
+                        strict_realization=args.strict_realization,
+                        temporary_buffer_depth=args.temporary_buffer_depth,
                         max_buffer_depth=args.force_buffer_depth
                         or args.buffer_depth,
                         min_buffer_depth=args.force_buffer_depth or 1,
@@ -152,7 +172,7 @@ def main():
         if estimates and all(d % 128 == 0 for x in inputs for d in x.shape):
             assert (
                 sum(e["dma_commands"] for e in estimates)
-                == plan["stats"]["isa_dma_panels"]
+                == plan["stats"]["isa_dma_panels"] + plan.get("native_implicit_dma_commands", 0)
             )
             assert (
                 sum(e["tensor_instructions"] for e in estimates)

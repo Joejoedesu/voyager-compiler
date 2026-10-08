@@ -223,8 +223,13 @@ def test_context_is_speed_only_and_restores_instruction_policy(tmp_path):
     assert restored.record() == context.record()
 
 
-@pytest.mark.parametrize("isa_lowering", [False, True])
-def test_compile_reconvert_and_instruction_counts(tmp_path, isa_lowering):
+@pytest.mark.parametrize(
+    "isa_lowering,strict_realization,temporary_buffer_depth",
+    [(False, True, 1), (True, True, 1), (True, False, 1), (True, True, 4)],
+)
+def test_compile_reconvert_and_instruction_counts(
+    tmp_path, isa_lowering, strict_realization, temporary_buffer_depth
+):
     import voyager_compiler as vc
     from voyager_compiler.trainium.converter import convert
 
@@ -239,7 +244,11 @@ def test_compile_reconvert_and_instruction_counts(tmp_path, isa_lowering):
     context = CompilerContext.resolve(
         config,
         TrainiumMappingPolicy(
-            config, TrainiumTuning(isa_lowering=isa_lowering)
+            config, TrainiumTuning(
+                isa_lowering=isa_lowering,
+                strict_realization=strict_realization,
+                temporary_buffer_depth=temporary_buffer_depth,
+            )
         ),
     )
     vc.transform(graph, inputs, context=context)
@@ -249,16 +258,23 @@ def test_compile_reconvert_and_instruction_counts(tmp_path, isa_lowering):
     estimate = json.loads((tmp_path / "hardware.json").read_text())[
         "estimates"
     ][0]
-    assert plan["stats"]["isa_dma_panels"] == estimate["dma_commands"]
+    assert plan["stats"]["isa_dma_panels"] + int(not strict_realization) == estimate["dma_commands"]
     assert (
         plan["stats"]["tensor_instructions"] == estimate["tensor_instructions"]
     )
     if isa_lowering:
         source = (tmp_path / "nki/program.py").read_text()
+        assert plan["strict_realization"] == strict_realization
+        assert plan["temporary_buffering"]["depth"] == temporary_buffer_depth
+        restored = CompilerContext.from_artifacts(tmp_path, config)
+        assert restored.policy.tuning.temporary_buffer_depth == temporary_buffer_depth
+        assert plan["program_analysis"]["physical_addresses_enforced"] == strict_realization
+        assert ("ncc.sbuf.alloc" in source) == strict_realization
         assert plan["high_level_operations"] == {}
-        assert "nisa.dma_copy" in source and "is_transpose=True" in source
+        assert "nisa.dma_copy" in source
+        assert ("is_transpose=True" if strict_realization else "nisa.nc_transpose") in source
         assert plan["stats"]["panel_result_bindings"] == 1
-        assert estimate["shared_constant_bytes"] == 65536
+        assert estimate["shared_constant_bytes"] == (65536 if strict_realization else 16384)
         for key, count in estimate["expanded_isa"].items():
             assert plan["expanded_isa"][key] == count
     convert(tmp_path, tmp_path / "second")
@@ -342,7 +358,11 @@ def test_isa_fp32_expansion_does_not_double_count_pipeline_work():
         TrainiumTuning(isa_lowering=True, explicit_isa=False)
 
 
-def test_isa_large_panel_result_matches_search_expansion(tmp_path):
+@pytest.mark.parametrize("operand_policy", ["staged", "direct", "reuse"])
+@pytest.mark.parametrize("strict_realization", [True, False])
+def test_isa_large_panel_result_matches_search_expansion(
+    tmp_path, operand_policy, strict_realization
+):
     import voyager_compiler as vc
     from voyager_compiler.codegen.transform.tiling.tiler import TileConstraint
     from voyager_compiler.trainium.converter import convert
@@ -354,7 +374,10 @@ def test_isa_large_panel_result_matches_search_expansion(tmp_path):
     torch.manual_seed(17)
     inputs = (torch.randn(1024, 256), torch.randn(256, 1024))
     config = neuron_core(3)
-    policy = TrainiumMappingPolicy(config, TrainiumTuning(isa_lowering=True))
+    policy = TrainiumMappingPolicy(
+        config,
+        TrainiumTuning(isa_lowering=True, matmul_operands=operand_policy, strict_realization=strict_realization),
+    )
     prepare = policy.prepare_matrix
     constraint = TileConstraint(
         exact=((le.OX, 1024), (le.OC, 1024), (le.IC, 256))
@@ -373,6 +396,15 @@ def test_isa_large_panel_result_matches_search_expansion(tmp_path):
     ][0]
     assert plan["stats"]["tensor_instructions"] == 32
     assert plan["expanded_isa"]["MATMUL_REGULAR"] == 64
+    assert plan["stats"].get("reused_weight_panels", 0) == (
+        16 if operand_policy == "reuse" else 0
+    )
+    restored = CompilerContext.from_artifacts(tmp_path, config)
+    assert restored.policy.tuning.matmul_operands == operand_policy
+    assert restored.policy.tuning.strict_realization == strict_realization
+    torch.testing.assert_close(
+        graph(*inputs), inputs[0] @ inputs[1], atol=5e-4, rtol=5e-4
+    )
     assert (
         plan["expanded_isa"]["MATMUL_TRANSPOSE"]
         == estimate["expanded_isa"]["MATMUL_TRANSPOSE"]
@@ -438,3 +470,121 @@ def test_candidate_cache_preserves_diagnostics_and_exact_evaluation():
     fresh.shared.has_tail = True
     assert modified == fresh.calculate_runtime(None, layer, mapping)
     assert model.estimate == fresh.estimate
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_reused_weight_completion_and_capacity_are_explicit(transposed):
+    from voyager_compiler.trainium.dependencies import compute_graph
+
+    hw = neuron_core(3)
+    direct, _ = compute_graph(
+        hw,
+        1024,
+        256,
+        256,
+        32,
+        transposed,
+        TrainiumTuning(matmul_operands="direct"),
+    )
+    reused, _ = compute_graph(
+        hw,
+        1024,
+        256,
+        256,
+        32,
+        transposed,
+        TrainiumTuning(matmul_operands="reuse"),
+    )
+    matmuls = [n for n in reused.nodes if n.name.startswith("matmul_")]
+    assert len(matmuls) == 8
+    transposes = [n for n in reused.nodes if n.name.startswith("transpose_")]
+    assert len(transposes) == (0 if transposed else 4)
+    assert sum(n.name.startswith("transpose_") for n in direct.nodes) == (
+        0 if transposed else 8
+    )
+    if not transposed:
+        # Each cached weight completion has consumers in both M panels.
+        dependencies = [d.source for n in matmuls for d in n.dependencies]
+        weight_ready = [
+            i for i, n in enumerate(reused.nodes) if n.name.startswith("copy_")
+        ]
+        assert len(weight_ready) == 4
+        assert all(dependencies.count(i) == 2 for i in weight_ready)
+    plan = make_plan(point())
+    staged_storage = matrix_storage(
+        hw,
+        1024 * 256,
+        256 * 256,
+        1024 * 256,
+        256,
+        256,
+        32,
+        32,
+        32,
+        plan,
+        TrainiumTuning(),
+    )
+    reuse_storage = matrix_storage(
+        hw,
+        1024 * 256,
+        256 * 256,
+        1024 * 256,
+        256,
+        256,
+        32,
+        32,
+        32,
+        plan,
+        TrainiumTuning(matmul_operands="reuse"),
+    )
+    assert reuse_storage[:-1] == staged_storage
+    assert reuse_storage[-1].bytes_per_slot == 256 * 256 * 4
+
+
+def test_capacity_rejection_has_no_finite_traffic_score():
+    cost = estimator(TrainiumTuning(matmul_operands="reuse"))
+    mapping = point(m=4096, n=4096, k=4096)
+    layer = SimpleNamespace(hstd=1, wstd=1)
+    assert math.isinf(cost.calculate_runtime(None, layer, mapping))
+    assert math.isinf(cost.calculate_memory_cost(None, layer, mapping))
+
+
+@pytest.mark.parametrize("fuse", [False, True])
+def test_shared_pointwise_fusion_removes_only_internal_materialization(
+    tmp_path, fuse
+):
+    import voyager_compiler as vc
+    from google.protobuf import text_format
+    from voyager_compiler.codegen import voyager_ir_pb2 as ir
+    from voyager_compiler.trainium.converter import convert
+
+    class Gate(torch.nn.Module):
+        def forward(self, x, y):
+            return torch.nn.functional.silu(x) * y
+
+    torch.manual_seed(23)
+    inputs = (torch.randn(128, 256), torch.randn(128, 256))
+    config = neuron_core(3)
+    context = CompilerContext.resolve(
+        config,
+        TrainiumMappingPolicy(config, TrainiumTuning(pointwise_fusion=fuse)),
+    )
+    graph = vc.export_model(Gate(), inputs)
+    vc.transform(graph, inputs, context=context)
+    vc.compile(graph, inputs, context=context, output_dir=tmp_path)
+    torch.testing.assert_close(graph(*inputs), Gate()(*inputs))
+    convert(tmp_path)
+    model = text_format.Parse((tmp_path / "model.txt").read_text(), ir.Model())
+    allocations = [
+        out.tensor_box
+        for op in model.ops
+        if op.WhichOneof("op_type") == "prim"
+        and op.prim.target == "voyager::alloc"
+        for out in op.outputs
+        if out.tensor_box.memory.level == ir.MEMORY_LEVEL_DRAM
+    ]
+    # Sigmoid and the first multiply need no HBM objects when fused. Both
+    # external operands and the final result remain part of the same ABI.
+    assert len(allocations) == (1 if fuse else 3)
+    restored = CompilerContext.from_artifacts(tmp_path, config)
+    assert restored.policy.tuning.pointwise_fusion == fuse

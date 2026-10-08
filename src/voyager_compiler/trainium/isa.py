@@ -19,9 +19,23 @@ class Expansion:
     scalar_cycles: float = 0
     implementation: str = ""
     timing_implementation: str = ""
+    # Effective issue/occupancy, result completion, accumulator forwarding (ns).
+    # Geometry overrides preserve the physical ISA recipe and analytical cycles.
+    timing_override: tuple | None = None
 
 
-def matmul(m, n, k, bits, hardware=None, dtype=None):
+def matmul(
+    m,
+    n,
+    k,
+    bits,
+    hardware=None,
+    dtype=None,
+    *,
+    moving_stride=None,
+    stationary_stride=None,
+    streaming=False,
+):
     if not (0 < m <= 512 and 0 < n <= 128 and 0 < k <= 128):
         raise ValueError("Invalid TensorE instruction shape")
     if bits not in (16, 32):
@@ -34,11 +48,31 @@ def matmul(m, n, k, bits, hardware=None, dtype=None):
     from .timing import matmul_timing_name
 
     contract = implementation(f"nki.matmul.{dtype}", hardware)
+    geometry = (
+        hardware.timing_profile.matmul_geometry
+        if hardware is not None
+        else None
+    )
+    override = (
+        geometry.evaluate(
+            m, n, k, dtype, moving_stride, stationary_stride, hardware.frequency
+        )
+        if geometry
+        else None
+    )
+    if override is not None and not streaming:
+        law = hardware.timing_profile.operation(
+            matmul_timing_name(m, n, k, dtype)
+        )
+        if law is not None:
+            _, cold = law.evaluate(4 * max(min(64, n), m) / hardware.frequency)
+            override = (override[0], max(override[1], cold), override[2])
     return Expansion(
         contract.instruction_counts(),
         tensor_cycles=(4 if bits == 32 else 1) * max(min(64, n), m),
         implementation=contract.name,
         timing_implementation=matmul_timing_name(m, n, k, dtype),
+        timing_override=override,
     )
 
 

@@ -66,8 +66,13 @@ class BufferizationOptions:
     bool_mask: bool = True
     flow: str = "per_kernel"
     parameter_loading: str = "on_demand"
+    row_regions: bool = False
 
     def __post_init__(self):
+        if type(self.row_regions) is not bool:
+            raise TypeError("row_regions must be boolean")
+        if self.row_regions and self.flow != "per_kernel":
+            raise ValueError("Row regions currently require per_kernel flow")
         if self.flow not in ("per_kernel", "resident"):
             raise ValueError("Unknown bufferized flow")
         if self.parameter_loading not in ("preload", "on_demand"):

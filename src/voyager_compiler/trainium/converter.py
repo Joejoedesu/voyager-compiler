@@ -57,6 +57,8 @@ def convert(root, output=None, target=None, *, context=None):
         ):
             raise ValueError(f"Selected plan does not match {filename}")
     program = Program.load(json.loads((root / "instructions.json").read_text()))
+    if (program.encoding_storage != "compiler") != context.policy.tuning.strict_realization:
+        raise ValueError("Selected physical allocation differs from strict_realization policy")
     from dataclasses import asdict
 
     contracts = {c.name: asdict(c) for c in context.hardware.isa_instructions}

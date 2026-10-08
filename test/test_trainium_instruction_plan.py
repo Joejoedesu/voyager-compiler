@@ -345,3 +345,96 @@ def test_size_class_placement_preserves_instructions_and_separates_slot_sizes():
     fresh.placements = {}
     with pytest.raises(ValueError, match="does not fit"):
         fresh.allocate(sbuf_bytes=128, strategy="size_classes")
+
+
+def test_compiler_allocation_preserves_logical_validation():
+    p = selected()
+    p.placements.clear()
+    p.encoding_storage = "compiler"
+    restored = Program.load(json.loads(json.dumps(p.record())))
+    source = emit(restored)
+    assert "buffer=nl.sbuf" in source and "ncc.sbuf.alloc" not in source
+    assert "y[...] = nisa.tensor_scalar" in source
+    restored.instructions[1] = replace(restored.instructions[1], dependencies=())
+    with pytest.raises(ValueError, match="missing operand/reuse"):
+        emit(restored)
+
+
+def test_compiler_allocation_rejects_fixed_placements():
+    p = selected()
+    p.encoding_storage = "compiler"
+    with pytest.raises(ValueError, match="cannot carry physical placements"):
+        emit(p)
+
+
+def test_native_tensor_transpose_requires_compiler_owned_psum():
+    b = Builder([SimpleNamespace(shape=(32, 64), dtype="float32")], neuron_core(3))
+    b.program.encoding_storage = "compiler"
+    b.add("x = nl.ndarray((32,64), dtype=nl.float32, buffer=nl.sbuf)")
+    b.add("nisa.dma_copy(dst=x, src=a0)")
+    b.add("t = nisa.nc_transpose(x, engine=nisa.tensor_engine)")
+    b.add("y = nisa.tensor_copy(t, engine=nisa.scalar_engine)")
+    b.add("out = nl.ndarray((64,32), dtype=nl.float32, buffer=nl.shared_hbm)")
+    b.add("nisa.dma_copy(dst=out, src=y)")
+    b.program.outputs = ("out",)
+    b.program.validate()
+    assert b.program.tensors["t"].memory == "PSUM"
+    assert b.program.tensors["t"].shape == (64, 32)
+    from voyager_compiler.trainium.program_analysis import analyze_selected
+
+    analysis = analyze_selected(b.program, neuron_core(3))
+    assert analysis["hbm_read_bytes"] == 32 * 64 * 4 + 128 * 128
+    assert not analysis["unknown_completion"]
+    b.program.encoding_storage = "arena"
+    with pytest.raises(ValueError, match="compiler-managed"):
+        b.program.validate()
+
+
+def temporary_chain(count):
+    b = Builder([SimpleNamespace(shape=(32, 64), dtype="float32")], neuron_core(3))
+    b.add("out = nl.ndarray((32,64), dtype=nl.float32, buffer=nl.shared_hbm)")
+    for i in range(count):
+        b.add(f"x{i} = nl.ndarray((32,64), dtype=nl.float32, buffer=nl.sbuf)")
+        b.add(f"nisa.dma_copy(dst=x{i}, src=a0)")
+        b.add(f"y{i} = nisa.tensor_scalar(x{i}, op0=nl.multiply, operand0=2, engine=nisa.vector_engine)")
+        b.add(f"nisa.dma_copy(dst=out, src=y{i})")
+    b.program.outputs = ("out",)
+    return b.program
+
+
+def test_bounded_temporary_storage_does_not_grow_with_repetitions():
+    extents = []
+    for count in (16, 160):
+        p = temporary_chain(count)
+        p.allocate(temporary_buffer_depth=4)
+        extents.append(max(x.byte_address + x.bytes_per_partition for x in p.placements.values()))
+        assert len({x.byte_address for x in p.placements.values()}) == 8
+        # Logical copies do not authorize address reuse until previous readers
+        # complete; every reuse must remain represented in the selected DAG.
+        for previous, current in p.reuse_edges():
+            assert previous in p.instructions[current].dependencies
+        p.validate()
+    assert extents[0] == extents[1]
+
+
+def test_bounded_temporary_storage_rejects_capacity_overflow():
+    p = temporary_chain(16)
+    with pytest.raises(ValueError, match="does not fit"):
+        p.allocate(sbuf_bytes=128 << 10, temporary_buffer_depth=4)
+
+
+@pytest.mark.parametrize("depth", [0, -1, 1.5, True])
+def test_invalid_temporary_depth_is_rejected(depth):
+    from voyager_compiler.trainium.execution import TrainiumTuning
+
+    with pytest.raises(ValueError, match="positive integer"):
+        TrainiumTuning(temporary_buffer_depth=depth)
+    with pytest.raises(ValueError, match="positive integer"):
+        temporary_chain(1).allocate(temporary_buffer_depth=depth)
+
+
+def test_native_allocation_rejects_a_voyager_temporary_pool():
+    from voyager_compiler.trainium.execution import TrainiumTuning
+
+    with pytest.raises(ValueError, match="strict ISA"):
+        TrainiumTuning(strict_realization=False, temporary_buffer_depth=2)

@@ -195,6 +195,7 @@ def predict(data, *, hardware=None, in_order=True):
         deps.append(set(edges))
         return idx
 
+    last_tensor_matmul = False
     for uid, u in enumerate(units):
         items = u["items"]
         i = items[-1]
@@ -314,8 +315,25 @@ def predict(data, *, hardware=None, in_order=True):
             else:
                 assert len(mm) == (2 if dt == "float32" else 1)
                 expansion = isa.matmul(
-                    m, n, k, 32 if dt == "float32" else 16, hw, dt
+                    m,
+                    n,
+                    k,
+                    32 if dt == "float32" else 16,
+                    hw,
+                    dt,
+                    moving_stride=(
+                        abs(shapes["src"][2][0])
+                        if shapes["src"][3][1:] == (1, 1)
+                        else None
+                    ),
+                    stationary_stride=(
+                        abs(fields(ld[0]["operands"])["src"][2][0])
+                        if fields(ld[0]["operands"])["src"][3][1:] == (1, 1)
+                        else None
+                    ),
+                    streaming=last_tensor_matmul,
                 )
+            last_tensor_matmul = not trans
             service = expansion.tensor_cycles / hw.frequency
             law_name = (
                 expansion.timing_implementation or expansion.implementation
@@ -323,6 +341,8 @@ def predict(data, *, hardware=None, in_order=True):
             law = hw.timing_profile.operation(law_name)
             selected_law_counts[law_name] += 1
             occ, lat = law.evaluate(service) if law else (service, None)
+            if expansion.timing_override is not None:
+                occ, lat, _ = expansion.timing_override
             first = end = issue_node = add(
                 f"u{uid}_{op}", eng, occ, occ, lat, law_name
             )

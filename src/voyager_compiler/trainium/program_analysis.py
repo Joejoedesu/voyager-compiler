@@ -19,6 +19,20 @@ from voyager_compiler.codegen.transform.tiling.execution import (
 from dataclasses import replace
 
 
+def matmul_free_stride(checker, expression):
+    """Read the free-axis stride from an actual regular SBUF operand view."""
+    import numpy as np
+    from .movement_search import coordinates
+
+    root, axes = coordinates(checker, expression, (slice(0, 2), slice(None)))
+    if len(axes) != 2 or checker.program.tensors[root].memory != "SBUF":
+        return None
+    if axes[1].shape[1] < 2 or not np.all(np.diff(axes[0], axis=1) == 0):
+        return None
+    delta = np.diff(axes[1], axis=1)
+    return abs(int(delta[0, 0])) if np.all(delta == delta[0, 0]) else None
+
+
 def analyze_selected(program, hardware):
     """Replay the actual selected ISA DAG, including physical reuse edges.
 
@@ -40,7 +54,33 @@ def analyze_selected(program, hardware):
     stream_context = StreamTransposeTiming()
     nodes = []
     completion = []
+    last_tensor_matmul = False
+    last_tensor_index = -1
+    geometry_counts = Counter()
     reads = writes = 0
+    native_identity = any(
+        i.opcode == "nisa.nc_transpose"
+        and program.contracts[i.implementation]["engine"] == "TensorE"
+        for i in program.instructions
+    )
+    identity_completion = None
+    if native_identity:
+        # Pinned SDK expansion: one shared uint8 128x128 HBM identity,
+        # converted to the operand type in SBUF by the native DMA.
+        reads = 128 * 128
+        panel = TransferPanel(
+            0,
+            0,
+            128,
+            128,
+            8,
+            False,
+            False,
+            False,
+            8 * 128 / (hardware.dram_bandwidth / 16),
+        )
+        nodes.extend(transfer_graph(hardware, (panel,)).nodes)
+        identity_completion = len(nodes) - 1
     for index, ins in enumerate(program.instructions):
         args = [checker.value(e) for e in ins.args]
         kw = {k: checker.value(e) for k, e in ins.kwargs}
@@ -56,6 +96,7 @@ def analyze_selected(program, hardware):
         )
         opcode = ins.opcode.removeprefix("nisa.")
         law_name = ""
+        timing_override = None
         if opcode == "dma_copy":
             src = kw.get("src", args[0] if args else None)
             store = dst.memory == "HBM"
@@ -109,6 +150,18 @@ def analyze_selected(program, hardware):
                     a.shape[0], a.shape[1], hardware, "ScalarE", a.dtype
                 )
             else:
+                operand_roots = {program.root(name) for name in ins.reads} - {
+                    program.root(name) for name in ins.writes
+                }
+                fresh_operands = any(
+                    d > last_tensor_index
+                    and operand_roots.intersection(
+                        program.root(name)
+                        for name in program.instructions[d].writes
+                    )
+                    for d in ins.dependencies
+                )
+                streaming = last_tensor_matmul and not fresh_operands
                 expansion = isa.matmul(
                     b.shape[1],
                     a.shape[1],
@@ -116,7 +169,22 @@ def analyze_selected(program, hardware):
                     BITS[a.dtype],
                     hardware,
                     a.dtype,
+                    moving_stride=matmul_free_stride(checker, ins.args[1]),
+                    stationary_stride=matmul_free_stride(checker, ins.args[0]),
+                    streaming=streaming,
                 )
+                timing_override = expansion.timing_override
+                if timing_override is not None:
+                    geometry_counts["steady" if streaming else "cold"] += 1
+            service = expansion.tensor_cycles / hardware.frequency
+            law_name = (
+                expansion.timing_implementation or expansion.implementation
+            )
+        elif opcode == "nc_transpose" and engine == "TensorE":
+            dependencies += (Dependency(identity_completion),)
+            expansion = isa.transpose(
+                data.shape[0], data.shape[1], hardware, "ScalarE", data.dtype
+            )
             service = expansion.tensor_cycles / hardware.frequency
             law_name = (
                 expansion.timing_implementation or expansion.implementation
@@ -185,10 +253,35 @@ def analyze_selected(program, hardware):
                 "memset": "memset",
             }[opcode]
             law_name = f"nki.{kind}.{dst.dtype}.{engine}"
+        if engine == "TensorE":
+            last_tensor_index = index
+            last_tensor_matmul = opcode == "nc_matmul" and not kw.get(
+                "is_transpose", False
+            )
         if engine == "VectorE" and opcode != "nc_transpose":
             stream_context.reset()
         law = hardware.timing_profile.operation(law_name)
         occupancy, latency = law.evaluate(service) if law else (service, None)
+        forward = None
+        if timing_override is not None:
+            occupancy, latency, forward = timing_override
+            if ins.accumulate:
+                dependencies = tuple(
+                    Dependency(
+                        completion[d],
+                        milestone=(
+                            "forward"
+                            if (
+                                program.instructions[d].opcode
+                                == "nisa.nc_matmul"
+                                and set(program.instructions[d].writes)
+                                & set(ins.writes)
+                            )
+                            else "result"
+                        ),
+                    )
+                    for d in ins.dependencies
+                )
         nodes.append(
             OperationEvent(
                 f"i{index}_{opcode}",
@@ -198,6 +291,7 @@ def analyze_selected(program, hardware):
                 latency,
                 dependencies=dependencies,
                 implementation=ins.implementation,
+                forward_ns=forward,
             )
         )
         completion.append(len(nodes) - 1)
@@ -206,13 +300,18 @@ def analyze_selected(program, hardware):
         prediction_ns=result.duration_ns
         + hardware.timing_profile.fixed_kernel_ns,
         instruction_count=len(program.instructions),
+        matmul_geometry_events=dict(geometry_counts),
         event_count=len(nodes),
         unknown_completion=list(result.unknown_latency),
         service_ns=dict(result.service_ns),
         hbm_read_bytes=reads,
         hbm_write_bytes=writes,
         hbm_bytes=reads + writes,
-        scope="Exact selected ISA dependencies and physical reuse; backend issue scheduling remains modeled",
+        scope=(
+            "Selected logical ISA dependencies; native physical allocation/reuse/spills are unknown"
+            if program.encoding_storage == "compiler"
+            else "Exact selected ISA dependencies and physical reuse; backend issue scheduling remains modeled"
+        ),
     )
 
 
@@ -370,11 +469,18 @@ def analyze_program(source, converter, record):
     if hasattr(converter, "builder"):
         from .instruction_plan import BITS
 
+        program = converter.builder.program
         constant = sum(
             math.prod(t.shape) * BITS[t.dtype] // 8
-            for t in converter.builder.program.tensors.values()
+            for t in program.tensors.values()
             if t.constant
         )
+        if any(
+            i.opcode == "nisa.nc_transpose"
+            and program.contracts[i.implementation]["engine"] == "TensorE"
+            for i in program.instructions
+        ):
+            constant += 128 * 128
     estimates = record.get("estimates", [])
     fixed = hw.timing_profile.fixed_kernel_ns
     matrix_ns = sum(

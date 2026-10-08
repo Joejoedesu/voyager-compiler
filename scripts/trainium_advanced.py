@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 import voyager_compiler as vc
 from voyager_compiler.compilation import CompilerContext
+from voyager_compiler.codegen.transform.bufferize import BufferizationOptions
 from voyager_compiler.trainium.hardware import neuron_core
 
 PRIOR_ROOT = Path("/home/ubuntu/ML/prior_works")
@@ -111,12 +112,29 @@ def inputs(name, small, override=None):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument(
+        "--temporary-buffer-depth", type=int, default=1,
+        help="SBUF slot-pool multiplier; 1 preserves existing placement, >1 rotates bounded slots (strict ISA only)",
+    )
+    p.add_argument(
+        "--strict-realization", action=argparse.BooleanOptionalAction, default=True,
+        help="Fix physical ISA buffers in Voyager (default); --no-strict-realization lets NKI allocate them",
+    )
     p.add_argument("--cases", nargs="*", default=list(CASES))
     p.add_argument("--small", action="store_true")
+    p.add_argument("--pointwise-fusion", action="store_true")
+    p.add_argument("--row-regions", action="store_true", help="Compose row-independent operations using the shared bufferizer")
+    p.add_argument("--matmul-orientation", choices=("auto", "weights", "activations"), default="auto")
+    p.add_argument(
+        "--matmul-operands",
+        choices=("staged", "direct", "reuse"),
+        default="staged",
+    )
     p.add_argument("--references-only", action="store_true")
     p.add_argument("--tile", type=int, nargs=3)
     p.add_argument("--shape", type=int, nargs="+")
     p.add_argument("--pool-padding", type=int, choices=(0, 1), default=0)
+    p.add_argument("--matmul-weight-layout", choices=("auto", "generic", "k_partitioned"), default="auto", help="Whole invariant row-region weight layout; auto searches both")
     a = p.parse_args()
     if a.shape and (
         len(a.cases) != 1
@@ -171,7 +189,26 @@ def main():
                     print("REFERENCES", name, flush=True)
                     continue
                 graph = vc.export_model(module, x)
-                context = CompilerContext.resolve(neuron_core(3))
+                from voyager_compiler.trainium.execution import TrainiumTuning
+                from voyager_compiler.trainium.mapping import (
+                    TrainiumMappingPolicy,
+                )
+
+                hw = neuron_core(3)
+                context = CompilerContext.resolve(
+                    hw,
+                    TrainiumMappingPolicy(
+                        hw,
+                        TrainiumTuning(
+                            matmul_operands=a.matmul_operands,
+                            matmul_orientation=a.matmul_orientation,
+                            matmul_weight_layout=a.matmul_weight_layout,
+                            strict_realization=a.strict_realization,
+                            temporary_buffer_depth=a.temporary_buffer_depth,
+                            pointwise_fusion=a.pointwise_fusion,
+                        ),
+                    ),
+                )
                 if a.tile:
                     from dataclasses import replace
                     from interstellar import loop_enum as le
@@ -202,6 +239,7 @@ def main():
                     context=context,
                     output_dir=root,
                     dump_tensors=False,
+                    bufferization_options=BufferizationOptions(row_regions=a.row_regions),
                 )
                 torch.testing.assert_close(
                     graph(*x), expected, atol=1e-3, rtol=1e-3
@@ -224,6 +262,7 @@ def main():
                         small=a.small,
                         shape=a.shape,
                         pool_padding=a.pool_padding,
+                        row_regions=a.row_regions,
                         diagnostic_tile=a.tile,
                         prior_work=inventory[name],
                         bufferized_correct=True,

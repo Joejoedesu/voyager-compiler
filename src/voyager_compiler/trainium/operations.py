@@ -31,6 +31,7 @@ def isa_instructions():
         ("dma_copy", ("DMA",), ("SBUF", "HBM")),
         ("nc_matmul", ("TensorE",), ("PSUM",)),
         ("nc_transpose", ("VectorE",), ("SBUF",)),
+        ("nc_transpose", ("TensorE",), ("PSUM",)),
         ("memset", ("VectorE",), ("SBUF", "PSUM")),
         ("tensor_copy", ("VectorE", "ScalarE"), ("SBUF",)),
         ("tensor_tensor", ("VectorE",), ("SBUF",)),

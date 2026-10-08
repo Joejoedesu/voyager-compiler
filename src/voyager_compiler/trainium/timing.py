@@ -68,6 +68,89 @@ class DmaTiming:
 
 
 @dataclass(frozen=True)
+class MatmulGeometryTiming:
+    """Empirical full-K FP32 operand-feed model, calibrated on isolated streams.
+
+    Moving and stationary feed paths overlap: use their maximum, not their sum.
+    Nonunit free strides reduce useful feed rate. This describes measured access
+    regimes, not a claimed undocumented SBUF bank mapping. Completion includes
+    a moving-path tail; accumulator forwarding can proceed at the issue rate.
+    Unsupported geometry retains the earlier explicitly analytical law.
+    """
+
+    moving_cycles_per_element: float
+    stationary_cycles_per_element: float
+    strided_feed_scale: float
+    full_rate_max_stride: int
+    issue_overhead_cycles: float
+    completion_base_cycles: float
+    moving_tail_scale: float
+    evidence: str
+
+    def __post_init__(self):
+        for name in (
+            "moving_cycles_per_element",
+            "stationary_cycles_per_element",
+            "strided_feed_scale",
+            "issue_overhead_cycles",
+            "completion_base_cycles",
+            "moving_tail_scale",
+        ):
+            if (
+                not math.isfinite(getattr(self, name))
+                or getattr(self, name) < 0
+            ):
+                raise ValueError("Invalid matmul geometry timing")
+        if (
+            type(self.full_rate_max_stride) is not int
+            or self.full_rate_max_stride < 1
+        ):
+            raise ValueError("Invalid full-rate stride boundary")
+        if self.strided_feed_scale < 1:
+            raise ValueError("Strided feed scale must be at least one")
+
+    def evaluate(self, m, n, k, dtype, moving_stride, stationary_stride, clock):
+        if not (
+            dtype == "float32"
+            and n == k == 128
+            and 128 <= m <= 512
+            and moving_stride in (1, 2, 4, 8, 16)
+            and stationary_stride in (1, 2, 4, 8, 16)
+        ):
+            return None
+        moving = (
+            self.moving_cycles_per_element
+            * m
+            * (
+                self.strided_feed_scale
+                if moving_stride > self.full_rate_max_stride
+                else 1
+            )
+        )
+        stationary = (
+            self.stationary_cycles_per_element
+            * n
+            * (
+                self.strided_feed_scale
+                if stationary_stride > self.full_rate_max_stride
+                else 1
+            )
+        )
+        feed = max(moving, stationary)
+        issue = (feed + self.issue_overhead_cycles) / clock
+        completion = max(
+            issue,
+            (
+                self.completion_base_cycles
+                + feed
+                + self.moving_tail_scale * moving
+            )
+            / clock,
+        )
+        return issue, completion, issue
+
+
+@dataclass(frozen=True)
 class TrainiumTimings:
     name: str = "uncharacterized"
     compiler: str = "neuronx-cc 2.22.12471 / Trainium2"
@@ -76,6 +159,7 @@ class TrainiumTimings:
     store: DmaTiming | None = None
     fixed_kernel_ns: float = 0
     evidence: str = ""
+    matmul_geometry: MatmulGeometryTiming | None = None
 
     def __post_init__(self):
         if len({x.implementation for x in self.primitives}) != len(
@@ -105,6 +189,10 @@ def measured_timings():
     )
     for key in ("load", "store"):
         record[key] = DmaTiming(**record[key]) if record.get(key) else None
+    if record.get("matmul_geometry"):
+        record["matmul_geometry"] = MatmulGeometryTiming(
+            **record["matmul_geometry"]
+        )
     return TrainiumTimings(**record)
 
 

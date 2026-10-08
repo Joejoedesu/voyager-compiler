@@ -34,7 +34,12 @@ def authenticate(folder, allow_failure=False):
         ("model.txt", "model_sha256"),
         ("reference.npz", "reference_sha256"),
     ):
-        assert digest(folder / file) == result[key], (folder, file)
+        path = (
+            Path(result["reference_path"])
+            if file == "reference.npz" and "reference_path" in result
+            else folder / file
+        )
+        assert digest(path) == result[key], (folder, file)
     for file, sha in result["artifact_sha256"].items():
         assert digest(folder / file) == sha, (folder, file)
     return result
@@ -68,6 +73,10 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     args = parser.parse_args()
     rows = []
+    config = json.loads((args.results / "experiment-config.json").read_text())
+    assert digest(args.manifest) == config["baseline_manifest_sha256"]
+    for name, sha in config["source_snapshot_sha256"].items():
+        assert digest(Path(name)) == sha, name
     manifest = json.loads(args.manifest.read_text())
     for baseline in manifest:
         case = baseline["case"]
@@ -134,6 +143,12 @@ def main():
         seed_dir = args.results / "seed" / case
         if (seed_dir / "result.json").exists():
             seed = authenticate(seed_dir, allow_failure=True)
+            for key in (
+                "reference_sha256",
+                "compiler_version",
+                "compiler_flags",
+            ):
+                assert seed[key] == result[key], (case, key)
             seed_selection = json.loads(
                 (seed_dir / "selection.json").read_text()
             )
@@ -141,6 +156,10 @@ def main():
             row["fresh_seed_hardware_us"] = (
                 measured(seed) if seed["status"] == "pass" else None
             )
+            row["fresh_seed_repeated_p50_us"] = [
+                x["p50_us"] for x in seed.get("latencies", [])
+            ]
+            row["fresh_seed_artifacts"] = str(seed_dir.resolve())
             row["fresh_seed_predicted_us"] = (
                 seed_selection["program_analysis"][
                     "whole_program_prediction_ns"
@@ -149,6 +168,12 @@ def main():
             )
             if actual is not None and seed["status"] == "pass":
                 row["hardware_speedup_vs_fresh_seed"] = measured(seed) / actual
+                row["selected_hardware_change_percent"] = 100 * (
+                    actual / measured(seed) - 1
+                )
+                row["selected_prediction_change_percent"] = 100 * (
+                    predicted / row["fresh_seed_predicted_us"] - 1
+                )
                 row["model_ranking_agrees_with_hardware"] = (
                     predicted < row["fresh_seed_predicted_us"]
                 ) == (actual < measured(seed))

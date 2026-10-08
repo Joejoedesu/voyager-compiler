@@ -22,6 +22,18 @@ class TrainiumTuning:
     min_buffer_depth: int = 1
     movement_search_budget: int = 0
     movement_search_beam: int = 2
+    # Target realization policy; software/HBM tiles remain shared selections.
+    matmul_operands: str = "staged"
+    # Which logical operand occupies TensorE's stationary free dimension.
+    matmul_orientation: str = "auto"
+    # Whole invariant row-region weights: retain the selected physical layout.
+    matmul_weight_layout: str = "auto"
+    pointwise_fusion: bool = False
+    # False leaves physical temporary allocation to the native compiler.
+    strict_realization: bool = True
+    # Multiplier for reusable SBUF slot pools; 1 preserves existing placement.
+    # This is independent of shared software-tile max_buffer_depth.
+    temporary_buffer_depth: int = 1
 
     def __post_init__(self):
         if (
@@ -51,13 +63,36 @@ class TrainiumTuning:
                 self.dma_transpose,
                 self.explicit_isa,
                 self.isa_lowering,
+                self.pointwise_fusion,
+                self.strict_realization,
             )
         ):
             raise TypeError("Instruction mode switches must be boolean")
+        if type(self.temporary_buffer_depth) is not int or self.temporary_buffer_depth < 1:
+            raise ValueError("Temporary buffer depth must be a positive integer")
+        if self.temporary_buffer_depth != 1 and (
+            not self.strict_realization or not self.isa_lowering
+        ):
+            raise ValueError("Temporary buffer depth requires strict ISA realization")
         if self.buffer_allocation not in ("compiler", "legacy_logical"):
             raise ValueError("Unknown buffer allocation contract")
         if not 1 <= self.min_buffer_depth <= self.max_buffer_depth:
             raise ValueError("Invalid minimum buffer depth")
+        if self.matmul_operands not in ("staged", "direct", "reuse"):
+            raise ValueError("Unknown matmul operand policy")
+        if self.matmul_weight_layout not in ("auto", "generic", "k_partitioned"):
+            raise ValueError("Unknown matmul weight layout")
+        if self.matmul_orientation not in ("auto", "weights", "activations"):
+            raise ValueError("Unknown matmul orientation")
+        if self.matmul_orientation == "activations" and not self.isa_lowering:
+            raise ValueError("Activation-stationary panels require ISA lowering")
+        if self.matmul_operands != "staged" and not self.isa_lowering:
+            raise ValueError("Direct/reused operands require ISA lowering")
+        if not self.strict_realization:
+            if not self.isa_lowering:
+                raise ValueError("Relaxed realization requires ISA lowering")
+            if self.movement_search_budget:
+                raise ValueError("Movement search currently requires strict realization")
         if self.copy_policy not in ("balanced", "scalar"):
             raise ValueError("Unknown ISA copy policy")
         if self.isa_lowering and not self.explicit_isa:
@@ -80,10 +115,13 @@ def dma_panels(rows, cols, row_boundary, *, transpose, store, tuning):
             ), direct
 
 
-def matmul_panels(m, n, k):
-    for mi in range(0, m, 512):
-        for ni in range(0, n, 128):
-            yield mi, ni, min(512, m - mi), min(128, n - ni), tuple(
+def matmul_panels(m, n, k, orientation="weights"):
+    if orientation not in ("weights", "activations"):
+        raise ValueError("Panel geometry needs a selected orientation")
+    mt, nt = (512, 128) if orientation == "weights" else (128, 512)
+    for mi in range(0, m, mt):
+        for ni in range(0, n, nt):
+            yield mi, ni, min(mt, m - mi), min(nt, n - ni), tuple(
                 (ki, min(128, k - ki)) for ki in range(0, k, 128)
             )
 
@@ -146,6 +184,12 @@ def matrix_storage(
         StorageRequirement("SBUF", tuning.sbuf_reserve_bytes, 1, 2048),
         StorageRequirement("PSUM", bank, 3, bank),
     )
+    if tuning.matmul_operands == "reuse":
+        # Retain converted weights within one software GEMM tile. The original
+        # weight buffer remains live; this is extra storage, not a smaller SRAM.
+        requirements += (
+            StorageRequirement("SBUF", slot_bytes(b, k, weight_bits), 1, 2048),
+        )
     return requirements
 
 

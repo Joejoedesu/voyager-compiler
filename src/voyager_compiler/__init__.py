@@ -421,6 +421,12 @@ def lower_to_buffers(
         mapping_policy=mapping_policy,
     )
     model.meta["bufferized_policy"] = tiler.mapping_policy
+    if options.row_regions:
+        from voyager_compiler.codegen.transform.bufferize.row_regions import (
+            plan_row_regions,
+        )
+
+        plan_row_regions(model, tiler)
     original = None
     if options.flow == "resident":
         from voyager_compiler.codegen.transform.bufferize.residency import (

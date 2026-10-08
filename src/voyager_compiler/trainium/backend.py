@@ -17,6 +17,7 @@ class TrainiumBackend:
 
         normalize_global_average_pool(model)
         from .lowering import prepare_graph
+
         prepare_graph(model, config)
 
     def restore_mapping_policy(self, config, options):
@@ -66,6 +67,15 @@ class TrainiumBackend:
         from voyager_compiler import _transform_voyager
 
         options["patterns"] = self.fusion_patterns(options["config"])
+        context = model.meta.get("compiler_context")
+        if context is not None and context.policy.tuning.pointwise_fusion:
+            from voyager_compiler import OpMatcher
+
+            # Existing shared fusion chooses legal chains and eliminates their
+            # intermediate HBM edges before tiling/bufferization.
+            options["patterns"].append(
+                [OpMatcher("sigmoid"), OpMatcher("mul"), OpMatcher("mul")]
+            )
         options["layout_policy"] = "systolic"
         return _transform_voyager(
             model, example_args, example_kwargs, **options
@@ -88,12 +98,16 @@ class TrainiumBackend:
         # mappings may be shared across *different* regions with equal shapes.
         # Deduplicate within the owning region, never across the whole model.
         record = {
+            "row_regions": model.meta.get("row_regions", []),
             "hardware": asdict(config),
             "placement": model.meta.get("trainium_placement"),
             "mapping_constraints": {
-                "instruction_M": 512,
-                "instruction_N": 128,
+                "matmul_orientations": {
+                    "weights": {"instruction_M": 512, "instruction_N": 128},
+                    "activations": {"instruction_M": 128, "instruction_N": 512},
+                },
                 "instruction_K": 128,
+                "convolution": "existing weight-stationary lowering",
                 "software_tile": "partition-aware SBUF fit and whole-bank PSUM reservation",
             },
             "cost_model": "Shared instruction panels and dependency graph, characterized primitive completion and DMA issue/payload, runtime-only selection; explicit ISA placement follows shared bufferization; backend retains engine scheduling",
@@ -137,9 +151,13 @@ class TrainiumBackend:
         )
 
         from voyager_compiler.compilation import CompilerContext
-        context = options.get("context") or CompilerContext.from_artifacts(options["output_dir"], config)
+
+        context = options.get("context") or CompilerContext.from_artifacts(
+            options["output_dir"], config
+        )
         if context.policy.tuning.isa_lowering:
             from .planning import select_plan
+
             select_plan(options["output_dir"], context=context)
         return result
 

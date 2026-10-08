@@ -1,5 +1,5 @@
 {
-  "name": "trn2-primitives-stream32-shortK64-2026-10-07",
+  "name": "trn2-primitives-operand-geometry-2026-10-08",
   "compiler": "neuronx-cc 2.22.12471 / Trainium2",
   "primitives": [
     {
@@ -132,5 +132,15 @@
     "notification_ns": 355.0
   },
   "fixed_kernel_ns": 9403.3965,
-  "evidence": "Prior movement calibration plus results/trainium/vector-characterization/calibration.json (isolated primitives; application kernels held out); scalar SBUF copy: results/trainium/scalar-copy-characterization/calibration.json; stream transpose and short-K: results/trainium/model-integration-2026-10-07/calibration-provenance.json (authenticated isolated hardware probes; exact scopes in docs/trainium-isa-model.md)"
+  "evidence": "Prior movement calibration plus results/trainium/vector-characterization/calibration.json (isolated primitives; application kernels held out); scalar SBUF copy: results/trainium/scalar-copy-characterization/calibration.json; stream transpose and short-K: results/trainium/model-integration-2026-10-07/calibration-provenance.json (authenticated isolated hardware probes; exact scopes in docs/trainium-isa-model.md)",
+  "matmul_geometry": {
+    "moving_cycles_per_element": 4,
+    "stationary_cycles_per_element": 4,
+    "strided_feed_scale": 2,
+    "full_rate_max_stride": 2,
+    "issue_overhead_cycles": 24,
+    "completion_base_cycles": 432,
+    "moving_tail_scale": 0.5,
+    "evidence": "results/trainium/matmul-geometry-2026-10-08/primitives; isolated direct-address FP32 streams; full-K N128, M128..512, regular free strides1/2/4/8/16. Feed regimes empirical; not an undocumented bank-mapping assertion. Application profiles excluded from calibration."
+  }
 }

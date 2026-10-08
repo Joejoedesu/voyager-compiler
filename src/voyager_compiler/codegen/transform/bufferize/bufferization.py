@@ -927,7 +927,10 @@ def bufferize_graph(
     plan_csr_slices(list(graph.nodes), tiler)
     if tiler is not None:
         prefetch_tilings(
-            [n for n in graph.nodes if is_gemm_op(get_anchor_node(n))],
+            [
+                n for n in graph.nodes
+                if not n.meta.get("row_region") and is_gemm_op(get_anchor_node(n))
+            ],
             tiler,
         )
 
@@ -953,7 +956,7 @@ def bufferize_graph(
 
         anchor = get_anchor_node(node)
 
-        key = _bufferize_key(node)
+        key = None if node.meta.get("row_region") else _bufferize_key(node)
         cached = build_cache.get(key) if key is not None else None
         logger.debug(
             "[bufferize] %s anchor=%s %s",
@@ -964,7 +967,11 @@ def bufferize_graph(
         if cached is not None:
             sub_gm, n_out, group, tag_sources = cached
         else:
-            if is_conv2d(anchor):
+            if node.meta.get("row_region"):
+                from .row_regions import build_row_region
+
+                sub_gm = build_row_region(node, tiler=tiler)
+            elif is_conv2d(anchor):
                 sub_gm = build_conv2d(
                     node,
                     num_slots=num_slots,

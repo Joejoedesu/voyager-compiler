@@ -127,6 +127,12 @@ def main():
                             ("reference.npz", "reference_sha256"),
                         )
                     }
+                    # The binary manifest authenticates files in this folder.
+                    # A --reference-root run may validate different input values
+                    # with the same ABI; preserve the local reference identity.
+                    artifact_hashes["reference.npz"] = hashlib.sha256(
+                        (save_neff.parent / "reference.npz").read_bytes()
+                    ).hexdigest()
                     artifact_hashes["file.neff"] = binary_hash.hexdigest()
                     (save_neff.parent / "compiled_binary.json").write_text(
                         json.dumps(
@@ -204,6 +210,7 @@ def main():
             reference = (
                 reference_root / root.name if reference_root else root
             ) / "reference.npz"
+            result["reference_path"] = str(reference.resolve())
             result["reference_sha256"] = hashlib.sha256(
                 reference.read_bytes()
             ).hexdigest()

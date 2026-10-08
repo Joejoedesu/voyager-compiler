@@ -58,7 +58,7 @@ def emit(program, *, _capture=None):
     program.validate()
     if (
         any(i.opcode == "nisa.nc_transpose" for i in program.instructions)
-        and program.encoding_storage != "disjoint_arenas"
+        and program.encoding_storage not in ("disjoint_arenas", "compiler")
     ):
         raise ValueError(
             "Pinned SDK stream transpose requires disjoint arena encoding"
@@ -154,7 +154,8 @@ def emit(program, *, _capture=None):
         return base + "[" + ", ".join(rendered) + "]"
 
     def encoded(e):
-        e = inline(e)
+        if program.encoding_storage != "compiler":
+            e = inline(e)
         if (
             e.op == "call"
             and e.args[0].op == "attr"
@@ -175,7 +176,7 @@ def emit(program, *, _capture=None):
                 return physical(base.value, index, dtype)
         if e.op == "name" and e.value in program.tensors:
             t = program.tensors[e.value]
-            if t.alias:
+            if t.alias and program.encoding_storage != "compiler":
                 return encoded(t.view)
             if e.value in program.placements:
                 return physical(e.value)
@@ -271,12 +272,20 @@ def emit(program, *, _capture=None):
                 line(
                     f"{name} = nl.ndarray({t.shape!r}, dtype=nl.{t.dtype}, buffer=nl.shared_hbm)"
                 )
+        elif program.encoding_storage == "compiler":
+            line(f"{name} = nl.ndarray({t.shape!r}, dtype=nl.{t.dtype}, buffer=nl.{t.memory.lower()})")
         else:
             p = program.placements[name]
             if len(t.shape) != 2:
                 raise ValueError(
                     f"{name}: direct allocation currently requires a 2-D physical tile"
                 )
+    if program.encoding_storage == "compiler":
+        for name, value in program.indices.items():
+            line(f"{name} = {expression(value)}")
+        for name, t in program.tensors.items():
+            if name in used and t.alias:
+                line(f"{name} = {encoded(t.view)}")
     first_instruction = len(lines)
     for ins in program.instructions:
         args = [encoded(x) for x in ins.args]
@@ -287,11 +296,18 @@ def emit(program, *, _capture=None):
             and ins.destination.value in program.placements
         ):
             dst = physical(ins.destination.value)
+        if (
+            program.encoding_storage == "compiler"
+            and ins.opcode != "nisa.dma_copy"
+            and ins.destination.op == "name"
+            and program.tensors[ins.destination.value].memory in ("SBUF", "PSUM")
+        ):
+            dst += "[...]"
         if ins.opcode in ("nisa.dma_copy",):
             line(f"{ins.opcode}(dst={dst}, {', '.join(args)})")
         else:
-            # Explicit destination assignment is the pinned SDK's output
-            # binding syntax. No automatically allocated ISA results.
+            # Bind the selected destination with the pinned SDK's assignment
+            # syntax, whether its storage is direct or compiler-managed.
             line(
                 f"{dst} {'+=' if ins.accumulate else '='} {ins.opcode}({', '.join(args)})"
             )

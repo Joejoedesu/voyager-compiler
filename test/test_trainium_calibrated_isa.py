@@ -39,7 +39,7 @@ def test_short_k_changes_timing_not_instruction_expansion():
 
 def test_candidate_and_selected_plan_both_consume_short_k_law():
     hw = neuron_core(3)
-    graph, _ = compute_graph(hw, 512, 128, 64, 32, True, TrainiumTuning())
+    graph, _ = compute_graph(hw, 512, 128, 64, 32, True, TrainiumTuning(matmul_orientation="weights"))
     mm = [n for n in graph.nodes if n.implementation == "nki.matmul.float32"]
     assert len(mm) == 1
     assert (mm[0].occupancy_ns, mm[0].latency_ns) == (1707, 2765)

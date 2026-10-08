@@ -174,8 +174,11 @@ class Program:
         return spans
 
     def allocate(
-        self, sbuf_bytes=28 << 20, psum_banks=8, *, strategy="best_fit"
+        self, sbuf_bytes=28 << 20, psum_banks=8, *, strategy="best_fit",
+        temporary_buffer_depth=1,
     ):
+        if type(temporary_buffer_depth) is not int or temporary_buffer_depth < 1:
+            raise ValueError("Temporary buffer depth must be a positive integer")
         if strategy not in ("best_fit", "size_classes"):
             raise ValueError("Unknown physical placement strategy")
         if self.placements:
@@ -201,7 +204,9 @@ class Program:
                 psums.append((name, 1, first, last, 1))
             else:
                 items.append((name, size, first, last, 16))
-        if strategy == "best_fit":
+        if temporary_buffer_depth > 1:
+            bases, total = bounded_sbuf_slots(items, temporary_buffer_depth)
+        elif strategy == "best_fit":
             bases, total = _greedy_best_fit(items)
         else:
             # Keep every reused range a whole slot, avoiding partial overlap
@@ -340,7 +345,7 @@ class Program:
             owners[p.memory] = updated
 
     def validate(self, sbuf_bytes=28 << 20, psum_banks=8):
-        if self.encoding_storage not in ("arena", "disjoint_arenas"):
+        if self.encoding_storage not in ("arena", "disjoint_arenas", "compiler"):
             raise ValueError("Unknown selected physical storage encoding")
         if self.encoding_storage == "disjoint_arenas":
             end = 0
@@ -442,7 +447,21 @@ class Program:
             if ins.opcode == "nisa.nc_transpose":
                 src = checker.value(ins.args[0])
                 dst = checker.value(ins.destination)
-                if (
+                if contract["engine"] == "TensorE":
+                    if (
+                        self.encoding_storage != "compiler"
+                        or src.memory != "SBUF"
+                        or dst.memory != "PSUM"
+                        or src.dtype != dst.dtype
+                        or len(src.shape) != 2
+                        or not all(0 < n <= 128 for n in src.shape)
+                        or dst.shape != tuple(reversed(src.shape))
+                    ):
+                        raise ValueError(
+                            "Native TensorE transpose requires compiler-managed "
+                            "SBUF to PSUM tiles up to 128x128"
+                        )
+                elif (
                     src.memory != "SBUF"
                     or dst.memory != "SBUF"
                     or src.dtype != dst.dtype
@@ -504,6 +523,19 @@ class Program:
                 users[root] = set()
             for n in ins.reads:
                 users.setdefault(self.root(n), set()).add(i)
+        if self.encoding_storage == "compiler":
+            if self.placements or self.storage_regions:
+                raise ValueError("Compiler allocation cannot carry physical placements")
+            # Shape/layout and logical hazards above remain fully checked.
+            # Aggregate placement, spills and physical reuse belong to NKI.
+            for name in self.lifetimes():
+                t = self.tensors[name]
+                size = math.prod(t.shape[1:]) * BITS[t.dtype] // 8
+                if (t.memory == "PSUM" and size > 2048) or (
+                    t.memory == "SBUF" and size * 128 > sbuf_bytes
+                ):
+                    raise ValueError(f"{name}: individual local tile exceeds capacity")
+            return
         spans = self.lifetimes()
         for name, (first, last) in spans.items():
             if name not in self.placements:
@@ -787,7 +819,7 @@ class Builder:
                 memory = "PSUM"
             elif opcode == "nisa.nc_transpose":
                 shape = (math.prod(data.shape[1:]), data.shape[0])
-                memory = "SBUF"
+                memory = "PSUM" if kw.get("engine") == "nisa.tensor_engine" else "SBUF"
             elif opcode == "nisa.tensor_reduce":
                 shape = (data.shape[0], 1)
             elif data is not None:
@@ -855,3 +887,37 @@ class Builder:
                 accumulate,
             )
         )
+
+
+def bounded_sbuf_slots(items, depth):
+    """Rotate whole SBUF slots within a bounded pool for each size class.
+
+    Each pool has at most depth * peak-source-live slots, capped by the number
+    of values. Choose the least recently occupied legal slot. Original
+    lifetimes still apply; physical reuse later adds completion dependencies.
+    Thus depth is a capacity/overlap policy, not permission to overwrite a
+    live value or a promise of exact hardware pipeline depth.
+    """
+    import heapq
+    from voyager_compiler.codegen.transform.bufferize.memory_planning import (
+        _greedy_best_fit,
+    )
+
+    if type(depth) is not int or depth < 1:
+        raise ValueError("Temporary buffer depth must be a positive integer")
+    bases, total = {}, 0
+    for size in sorted({item[1] for item in items}, reverse=True):
+        group = [item for item in items if item[1] == size]
+        _, minimum_extent = _greedy_best_fit(group)
+        count = min(len(group), depth * (minimum_extent // size))
+        # Inclusive source-order lifetimes: availability must be < first.
+        slots = [(-1, slot) for slot in range(count)]
+        heapq.heapify(slots)
+        for name, _, first, last, _ in sorted(group, key=lambda x: x[2]):
+            available, slot = heapq.heappop(slots)
+            if available >= first:
+                raise ValueError("Bounded SBUF pool cannot cover live values")
+            bases[name] = total + slot * size
+            heapq.heappush(slots, (last, slot))
+        total += count * size
+    return bases, total
