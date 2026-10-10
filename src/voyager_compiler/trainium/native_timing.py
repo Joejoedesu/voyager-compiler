@@ -49,6 +49,15 @@ def evaluate(opcode, engine, tensors, operands, hardware):
             m["issue_ns"],
             m["completion_ns"],
         )
+    if opcode in (
+        "TENSOR_SCALAR_AFFINE_SELECT",
+        "COPY_PREDICATED_SCALAR",
+        "LOAD_MASK_SELECT",
+        "STREAM_SHUFFLE",
+    ):
+        from .operand_timing import native
+
+        return native(opcode, engine, tensors, operands, hardware)
     owned = opcode in ("TENSOR_TENSOR_SCAN", "ACTIVATION_READ_ACCUMULATOR")
     accumulate = opcode == "ACTIVATE" and bool(
         re.search(
@@ -113,6 +122,7 @@ def evaluate(opcode, engine, tensors, operands, hardware):
     if engine != "ScalarE":
         raise ValueError("Activation accumulator timing requires ScalarE")
     m = parameters()["models"]["activation_accumulator"]
+    m = m.get("partition_models", {}).get(str(partitions), m)
     if opcode == "ACTIVATION_READ_ACCUMULATOR":
         if free != 1:
             raise ValueError(
@@ -132,7 +142,9 @@ def evaluate(opcode, engine, tensors, operands, hardware):
             "native.activation_read_accumulator.ScalarE",
             service,
             m["read_completion_ns"] if calibrated else None,
-            read_ns=service if calibrated else None,
+            read_ns=(
+                min(service, m["read_completion_ns"]) if calibrated else None
+            ),
         )
     # A reduction-producing activation writes hidden ScalarE accumulator state.
     # Ordinary activations retain their existing timing laws.

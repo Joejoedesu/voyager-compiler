@@ -13,10 +13,22 @@
         128
       ],
       "min_width": 64,
-      "max_width": 2048,
+      "max_width": 8192,
       "drain_ns": 157.66666666666657,
       "tensor_seed_read_ns": 60.0,
-      "evidence": "16 independent multiply/add scans per probe. Constant zero seed versus SBUF tensor seed. Documented VectorE service; completion drain measured at widths 64,256,1024,2048. Tensor seed tested at 256,1024. 32-partition probe is a coverage boundary, not extrapolated."
+      "evidence": "16 independent multiply/add scans per probe. Constant zero seed versus SBUF tensor seed. Documented VectorE service; completion drain measured at widths 64,256,1024,2048. Tensor seed tested at 256,1024. 32-partition probe is a coverage boundary, not extrapolated.",
+      "extended_width_evidence": {
+        "program": "scan-long",
+        "widths": [
+          4096,
+          7168,
+          8192
+        ],
+        "scope": "Contiguous FP32, 128 partitions, zero immediate seed; same streaming/drain law validated on separate long-scan probes.",
+        "source_sha256": "badc3957bd387a6af59df932b6f1bda0db91d5c520d397697854b869d0aa33ac",
+        "neff_sha256": "cb1b3153e9c3be8e2b188e6e22dda13950f96f3a8f8f3f0d119f3f8e9d3e8d1e",
+        "ntff_sha256": "3ac6aae9f2a8c70166893a776b24622d67b8fcfa647f75ffaac2e7770ffb2937"
+      }
     },
     "activation_accumulator": {
       "partitions": [
@@ -28,7 +40,26 @@
       "read_completion_ns": 279.0,
       "producer_completion_tail_ns": 294.49999999999994,
       "producer_forward_tail_ns": 200.66666666666663,
-      "evidence": "16 EXP+sum/readback pairs at widths 64,256,1024,2048. Producer forwarding is the observed readback issue offset; readback issue bound uses the minimum gap to the next activation, excluding stalled samples. Full-kernel validation is separate. BF16 output shares the FP32-source path; checked against retained CSA, not fitted."
+      "evidence": "16 EXP+sum/readback pairs at widths 64,256,1024,2048. Producer forwarding is the observed readback issue offset; readback issue bound uses the minimum gap to the next activation, excluding stalled samples. Full-kernel validation is separate. BF16 output shares the FP32-source path; checked against retained CSA, not fitted.",
+      "partition_models": {
+        "4": {
+          "partitions": [
+            4
+          ],
+          "min_width": 64,
+          "max_width": 1024,
+          "read_issue_ns": 315,
+          "read_completion_ns": 293.0,
+          "producer_completion_tail_ns": 290.66666666666663,
+          "producer_forward_tail_ns": 290.66666666666663,
+          "evidence": "4-partition FP32 EXP to BF16 with FP32 sum/readback. End widths 64/1024 fit; widths 128/512 held out. Read initiation conservatively uses the smallest readback-to-next-producer gap in the paired stream. Readback starts 12-14 ns after producer completion; no early forwarding is identified, so its forwarding milestone conservatively equals completion.",
+          "artifact": {
+            "source_sha256": "c49f93e4e3ad33e8140c19cf65bab18efb2e20b3439bdb9af0150c61b7e2d91d",
+            "neff_sha256": "59e8cf0504e38aab6c94140dd49c61a6fe34ddfcf053186ebd451eb4d87ea8e8",
+            "ntff_sha256": "a34ac9b07b5a837de95be8fb7c1bb0a32fb204091ee947f9b43c29916bfd49c2"
+          }
+        }
+      }
     },
     "move_uint32_immediate": {
       "issue_ns": 68,

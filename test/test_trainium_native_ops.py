@@ -43,7 +43,7 @@ def test_scan_tensor_seed_adds_read_completion_without_changing_service():
     [
         dict(partitions=32),
         dict(stride=2),
-        dict(width=4096),
+        dict(width=16384),
         dict(seed="[fp32@0x2000000]"),
     ],
 )

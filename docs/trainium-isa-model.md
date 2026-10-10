@@ -1,5 +1,10 @@
 # Trainium ISA mapping and measured timing
 
+For current operand coverage, calibration domains and analytical limitations,
+see [Trainium operand modeling, 2026-10-10](trainium-operand-model.md).
+The inventory and integration results below describe the earlier 10-06/10-07
+checkpoint.
+
 This inventory describes `voyager-trainium-10-06-isa`, Trainium2 / NeuronCore-v3,
 with neuronx-cc 2.22.12471. The selected-plan instruction registry is in
 `trainium/operations.py`; compiled prior-work instructions are mapped by

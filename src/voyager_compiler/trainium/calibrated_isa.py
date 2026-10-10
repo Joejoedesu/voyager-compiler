@@ -28,7 +28,7 @@ def sectors(width, stride, element_bytes=4, sector_bytes=16):
     return ((width - 1) * stride * element_bytes) // sector_bytes + 1
 
 
-def evaluate(d, occupancy, latency, forward):
+def legacy_evaluate(d, occupancy, latency, forward):
     if (
         d["dtype"] != "float32"
         or d["partitions"] != 128
@@ -113,9 +113,17 @@ def evaluate(d, occupancy, latency, forward):
             key = "psum_copy" if d["source_memory"] == "PSUM" else "copy_vector"
     elif op == "activation":
         key = d["function"].removeprefix("nl.")
+        # Activation COPY is a ScalarE affine operation; the old "copy"
+        # calibration describes tensor_copy and cannot identify this path.
+        if key in ("copy", "identity"):
+            return None
     elif op == "reciprocal":
         key = "reciprocal"
     elif op == "tensor_reduce":
+        # Existing reduction probes produced one output per partition.
+        # Multi-output and multi-axis forms use the operand characterization.
+        if d["free"] != 1 or d.get("reduction_rank", 1) != 1:
+            return None
         fn = d["function"].removeprefix("nl.")
         if fn not in ("add", "max"):
             return None
@@ -156,6 +164,18 @@ def evaluate(d, occupancy, latency, forward):
                 a * b for a, b in zip(features, issue_model["coefficients"])
             )
     return occupancy, completion, forward
+
+
+def evaluate(d, occupancy, latency, forward):
+    """Prefer previously validated laws; extend missing operand domains only."""
+    cost = legacy_evaluate(d, occupancy, latency, forward)
+    if cost is not None:
+        return cost
+    if latency is not None:
+        return None
+    from .operand_timing import evaluate as operand_evaluate
+
+    return operand_evaluate(d, occupancy, forward)
 
 
 def pipeline_timing(descriptors, *, startup_scenario=False):

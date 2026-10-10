@@ -1,0 +1,2944 @@
+{
+  "schema": 1,
+  "target": "Trainium2 / NeuronCore-v3",
+  "compiler": "2.22.12471.0+b4a00d10",
+  "units": "nanoseconds",
+  "calibration": "2026-10-10",
+  "scope": "Per-instruction probes; no whole-kernel fitting. Existing completion laws have priority. Derived aliases are labeled. Issue service retains documented streaming model unless separately characterized.",
+  "models": {
+    "memset|VectorE||float32||SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 59.0,
+        "input_elements_ns": 0.0
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "accumulator-p4",
+        "act-copy",
+        "act-copy-bfloat16-bfloat16-sbuf-p128",
+        "act-copy-dstpsum",
+        "act-copy-mixed-none",
+        "act-copy-mixed-scale",
+        "act-copy-scale",
+        "act-exp-bfloat16-bfloat16-sbuf-p128",
+        "act-exp-float32-bfloat16-psum-p128",
+        "act-exp-float32-bfloat16-sbuf-p128",
+        "act-exp-float32-float32-sbuf-p4",
+        "act-log",
+        "act-rsqrt",
+        "act-sqrt",
+        "act-sqrt-p64",
+        "act-square",
+        "act-square-long",
+        "forced-copy-dstpsum-p64",
+        "forced-psum-copy-mixed",
+        "forced-psum-copy-p128-bias",
+        "forced-psum-copy-p128-both",
+        "forced-psum-copy-p128-none",
+        "forced-psum-copy-p4-none",
+        "forced-psum-exp",
+        "forced-psum-silu-fp32"
+      ],
+      "fit_samples": 63,
+      "validation_samples": 0,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|float32|bfloat16|SBUF|SBUF|exp|0": {
+      "min_elements": 64,
+      "max_elements": 2048,
+      "completion": {
+        "startup_ns": 276.1290322580645,
+        "input_elements_ns": 0.841733870967742
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-exp-float32-bfloat16-psum-p128",
+        "act-exp-float32-bfloat16-sbuf-p128"
+      ],
+      "fit_samples": 12,
+      "validation_samples": 24,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 8192,
+      "completion": {
+        "startup_ns": 202.16646319131328,
+        "input_elements_ns": 0.8335368086924674,
+        "broadcast_reads_ns": 90.99999999999712
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy",
+        "act-copy-bias",
+        "act-copy-both",
+        "act-copy-both-long",
+        "act-copy-psum",
+        "act-copy-scale",
+        "forced-psum-copy-dynamic-p128-bias",
+        "forced-psum-copy-dynamic-p128-both"
+      ],
+      "fit_samples": 64,
+      "validation_samples": 148,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|bfloat16|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 4096,
+      "completion": {
+        "startup_ns": 155.47814407814397,
+        "input_elements_ns": 0.521855921855922
+      },
+      "partitions_observed": [
+        4,
+        32,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy-bf16-both",
+        "act-copy-bfloat16-bfloat16-sbuf-p128",
+        "act-exp-bfloat16-bfloat16-sbuf-p128",
+        "binary-bf16",
+        "copy-psum-vector-float32-bfloat16",
+        "copy-sbuf-scalar-bfloat16-bfloat16",
+        "copy-sbuf-scalar-bfloat16-float32",
+        "copy-sbuf-vector-bfloat16-bfloat16",
+        "copy-sbuf-vector-bfloat16-float32",
+        "copy-sbuf-vector-float32-bfloat16",
+        "manual-copy-sbuf-vector-float32-bfloat16",
+        "reduce-add-bf16",
+        "reduce-max-bf16"
+      ],
+      "fit_samples": 60,
+      "validation_samples": 236,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|bfloat16|bfloat16|SBUF|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 217.67123287671245,
+        "input_elements_ns": 0.8287671232876715,
+        "broadcast_reads_ns": 78.49999999999991
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy-bf16-both",
+        "act-copy-bfloat16-bfloat16-sbuf-p128"
+      ],
+      "fit_samples": 12,
+      "validation_samples": 28,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|float32|float32|SBUF|PSUM|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 0.0,
+        "input_elements_ns": 0.8326810176125244,
+        "broadcast_reads_ns": 176.83365949119374
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy-dstpsum"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 20,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|float32|float32|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 158.66731898238746,
+        "input_elements_ns": 0.8326810176125246
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy-dstpsum"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 20,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|float32|bfloat16|SBUF|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 185.28204500978492,
+        "input_elements_ns": 0.8429549902152645,
+        "broadcast_reads_ns": 99.74999999999984
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-copy-mixed-both",
+        "act-copy-mixed-none",
+        "act-copy-mixed-scale"
+      ],
+      "fit_samples": 24,
+      "validation_samples": 16,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|bfloat16|bfloat16|SBUF|SBUF|exp|0": {
+      "min_elements": 1,
+      "max_elements": 4096,
+      "completion": {
+        "startup_ns": 295.6670329670334,
+        "input_elements_ns": 0.8329670329670328
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-exp-bfloat16-bfloat16-sbuf-p128"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|exp|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 290.6663405088063,
+        "input_elements_ns": 0.8336594911937377
+      },
+      "partitions_observed": [
+        4
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-exp-float32-float32-sbuf-p4"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|log|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 285.6516634050881,
+        "input_elements_ns": 0.8483365949119372
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-log"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|rsqrt|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 279.13796477495106,
+        "input_elements_ns": 0.8620352250489236
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-rsqrt"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|sqrt|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 285.6516634050881,
+        "input_elements_ns": 0.8483365949119372
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-sqrt"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 20,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|float32|SBUF|SBUF|square|0": {
+      "min_elements": 1,
+      "max_elements": 8192,
+      "completion": {
+        "startup_ns": 286.16554755219096,
+        "input_elements_ns": 0.8344524478085704
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "act-square",
+        "act-square-long"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 24,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "affine_select|GpSimdE|float32|float32|SBUF|SBUF||0": {
+      "min_elements": 64,
+      "max_elements": 1024,
+      "completion": {
+        "startup_ns": 176.86666666666656,
+        "input_elements_ns": 0.8458333333333335
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "affine"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|bfloat16|bfloat16|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 193.17221135029357,
+        "input_elements_ns": 0.8277886497064578
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-bf16",
+        "manual-copy-sbuf-scalar-bfloat16-bfloat16"
+      ],
+      "fit_samples": 12,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|int32|int32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 256,
+      "completion": {
+        "startup_ns": 189.1607843137255,
+        "input_elements_ns": 0.8392156862745098
+      },
+      "partitions_observed": [
+        4,
+        32,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 41,
+      "strided_reduction": false
+    },
+    "tensor_tensor|VectorE|bfloat16|bfloat16|SBUF|SBUF|add|0|bfloat16|SBUF": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 161.4833659491194,
+        "input_elements_ns": 0.5166340508806262
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|int32|int32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 64,
+      "completion": {
+        "startup_ns": 136.33333333333331,
+        "input_elements_ns": 0.6666666666666674
+      },
+      "partitions_observed": [
+        4
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-bf16-p4"
+      ],
+      "fit_samples": 2,
+      "validation_samples": 1,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|float32|float32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1024,
+      "completion": {
+        "startup_ns": 189.16471163245347,
+        "input_elements_ns": 0.8352883675464324
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-fp32-bf16",
+        "predicated-p128"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 66,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|float32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 153.46575342465752,
+        "input_elements_ns": 0.5342465753424658
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-fp32-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 14,
+      "strided_reduction": false
+    },
+    "tensor_tensor|VectorE|float32|bfloat16|SBUF|SBUF|add|0|float32|SBUF": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 160.4618395303327,
+        "input_elements_ns": 1.0381604696673188
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "binary-fp32-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|float32|bfloat16|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 8192,
+      "completion": {
+        "startup_ns": 193.16701257477715,
+        "input_elements_ns": 0.8329874252228056
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "cast-scalar-long",
+        "copy-psum-scalar-float32-bfloat16",
+        "copy-sbuf-scalar-float32-bfloat16",
+        "manual-copy-sbuf-scalar-float32-bfloat16"
+      ],
+      "fit_samples": 16,
+      "validation_samples": 60,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|int32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 153.4637964774951,
+        "input_elements_ns": 0.5362035225048924
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "copy-psum-scalar-int32-int32",
+        "copy-psum-vector-int32-int32"
+      ],
+      "fit_samples": 16,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|bfloat16|float32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 189.6653620352251,
+        "input_elements_ns": 0.8346379647749511
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "copy-sbuf-scalar-bfloat16-float32",
+        "manual-copy-sbuf-scalar-bfloat16-float32"
+      ],
+      "fit_samples": 16,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|bfloat16|float32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 152.69667318982385,
+        "input_elements_ns": 0.8033268101761252
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "copy-sbuf-vector-bfloat16-float32",
+        "manual-copy-sbuf-vector-bfloat16-float32"
+      ],
+      "fit_samples": 16,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "memset|VectorE||float32||PSUM||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 58.16829745596869,
+        "input_elements_ns": 0.8317025440313112
+      },
+      "partitions_observed": [
+        1,
+        4,
+        64,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-binary-reverse-psum-bf16",
+        "forced-psum-copy-dynamic-p128-bias",
+        "forced-psum-copy-dynamic-p128-both",
+        "forced-psum-copy-mixed",
+        "forced-psum-copy-p128-bias",
+        "forced-psum-copy-p128-both",
+        "forced-psum-copy-p128-none",
+        "forced-psum-exp",
+        "forced-psum-reduce",
+        "forced-psum-silu-fp32",
+        "manual-copy-psum-scalar-float32-bfloat16",
+        "manual-copy-psum-vector-f32",
+        "manual-copy-psum-vector-float32-bfloat16"
+      ],
+      "fit_samples": 88,
+      "validation_samples": 288,
+      "strided_reduction": false
+    },
+    "memset|VectorE||bfloat16||SBUF||0": {
+      "min_elements": 2,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 57.33333333333331,
+        "input_elements_ns": 0.8333333333333334
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-binary-reverse-psum-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_tensor|VectorE|float32|bfloat16|PSUM|SBUF|add|0|bfloat16|SBUF": {
+      "min_elements": 2,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 143.90980392156868,
+        "input_elements_ns": 1.0450980392156861
+      },
+      "partitions_observed": [
+        4
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-binary-psum-bf16-p4"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false
+    },
+    "tensor_tensor|VectorE|bfloat16|bfloat16|SBUF|SBUF|add|0|float32|PSUM": {
+      "min_elements": 2,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 153.91764705882355,
+        "input_elements_ns": 1.0411764705882351
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-binary-reverse-psum-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|float32|float32|PSUM|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 161.75562622309198,
+        "input_elements_ns": 0.8693737769080236,
+        "broadcast_reads_ns": 95.25
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-psum-copy-dynamic-p128-bias",
+        "forced-psum-copy-dynamic-p128-both",
+        "forced-psum-copy-p128-bias",
+        "forced-psum-copy-p128-both",
+        "forced-psum-copy-p128-none"
+      ],
+      "fit_samples": 40,
+      "validation_samples": 160,
+      "strided_reduction": false
+    },
+    "activation|ScalarE|float32|bfloat16|PSUM|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 262.67221135029354,
+        "input_elements_ns": 0.8277886497064578
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-psum-copy-mixed"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "activation|ScalarE|float32|bfloat16|PSUM|SBUF|exp|0": {
+      "min_elements": 64,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 251.1428571428571,
+        "input_elements_ns": 0.9743303571428573
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-psum-exp"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "tensor_reduce|VectorE|float32|float32|PSUM|SBUF|add|1": {
+      "min_elements": 8,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 157.6666666666666,
+        "input_elements_ns": 1.041666666666667
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-psum-reduce"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": true
+    },
+    "activation|ScalarE|float32|float32|PSUM|SBUF|silu|0": {
+      "min_elements": 1,
+      "max_elements": 128,
+      "completion": {
+        "startup_ns": 260.17322834645665,
+        "input_elements_ns": 1.3267716535433074
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "forced-psum-silu-fp32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1
+    },
+    "tensor_copy|ScalarE|float32|bfloat16|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 174.14677103718196,
+        "input_elements_ns": 0.8532289628180039
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-scalar-float32-bfloat16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "memset|VectorE||int32||PSUM||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 58.168297455968684,
+        "input_elements_ns": 0.8317025440313112
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-scalar-int32-int32",
+        "manual-copy-psum-vector-int32-int32"
+      ],
+      "fit_samples": 16,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|int32|int32|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 170.61937377690802,
+        "input_elements_ns": 0.8806262230919765
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-scalar-int32-int32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|float32|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 155.95499021526413,
+        "input_elements_ns": 1.0450097847358124
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-vector-f32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 28,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|bfloat16|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 159.9628180039139,
+        "input_elements_ns": 1.0371819960861055
+      },
+      "partitions_observed": [
+        1,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-vector-float32-bfloat16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|int32|int32|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 155.95499021526413,
+        "input_elements_ns": 1.0450097847358124
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-psum-vector-int32-int32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|bfloat16|bfloat16|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 155.73091976516633,
+        "input_elements_ns": 0.26908023483365945
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-copy-sbuf-vector-bfloat16-bfloat16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 12,
+      "strided_reduction": false
+    },
+    "tensor_reduce|VectorE|float32|float32|SBUF|SBUF|max|2": {
+      "min_elements": 576,
+      "max_elements": 36846,
+      "completion": {
+        "startup_ns": 142.4166253101707,
+        "input_elements_ns": 1.04181141439206
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "manual-pool"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": true
+    },
+    "tensor_reduce|VectorE|float32|float32|SBUF|SBUF|add|1": {
+      "min_elements": 2,
+      "max_elements": 8192,
+      "completion": {
+        "startup_ns": 152.9164835164835,
+        "input_elements_ns": 1.0417582417582418
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reduce-add-long",
+        "reduce-add-scalar"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 88,
+      "strided_reduction": true
+    },
+    "memset|VectorE||uint16||SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 59.0,
+        "input_elements_ns": 0.0
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "memset-u16"
+      ],
+      "fit_samples": 4,
+      "validation_samples": 0,
+      "strided_reduction": false
+    },
+    "memset|VectorE||int32||SBUF||0": {
+      "min_elements": 4,
+      "max_elements": 256,
+      "completion": {
+        "startup_ns": 57.66666666666667,
+        "input_elements_ns": 0.8333333333333334
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "memset-u16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false
+    },
+    "predicated_scalar|VectorE||float32||SBUF||0": {
+      "min_elements": 64,
+      "max_elements": 1024,
+      "completion": {
+        "startup_ns": 155.53333333333342,
+        "input_elements_ns": 1.1088541666666663
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "predicated-p128"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 24,
+      "strided_reduction": false
+    },
+    "reciprocal|VectorE|float32|float32|SBUF|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1024,
+      "completion": {
+        "startup_ns": 151.75464320625537,
+        "input_elements_ns": 6.245356793743892
+      },
+      "partitions_observed": [
+        64
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reciprocal-p64"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 8,
+      "strided_reduction": false
+    },
+    "tensor_reduce|VectorE|bfloat16|float32|SBUF|SBUF|add|1": {
+      "min_elements": 256,
+      "max_elements": 4096,
+      "completion": {
+        "startup_ns": 142.7333333333329,
+        "input_elements_ns": 1.0440104166666668
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reduce-add-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": true
+    },
+    "tensor_reduce|VectorE|bfloat16|float32|SBUF|SBUF|max|1": {
+      "min_elements": 256,
+      "max_elements": 4096,
+      "completion": {
+        "startup_ns": 142.7333333333329,
+        "input_elements_ns": 1.0440104166666668
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reduce-max-bf16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": true
+    },
+    "tensor_reduce|VectorE|float32|float32|SBUF|SBUF|max|1": {
+      "min_elements": 2,
+      "max_elements": 8192,
+      "completion": {
+        "startup_ns": 153.4168498168498,
+        "input_elements_ns": 1.0415750915750916
+      },
+      "partitions_observed": [
+        4,
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reduce-max-long",
+        "reduce-max-scalar"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 52,
+      "strided_reduction": true
+    },
+    "tensor_reduce|VectorE|float32|float32|SBUF|SBUF|min|1": {
+      "min_elements": 2,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 152.91960784313721,
+        "input_elements_ns": 1.0401960784313726
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "reduce-min-multi",
+        "reduce-min-scalar"
+      ],
+      "fit_samples": 12,
+      "validation_samples": 24,
+      "strided_reduction": true
+    },
+    "stream_shuffle|VectorE|bfloat16|bfloat16|SBUF|SBUF||0": {
+      "min_elements": 64,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 142.57142857142856,
+        "input_elements_ns": 1.0457589285714288
+      },
+      "partitions_observed": [
+        32
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "shuffle-bfloat16"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false
+    },
+    "tensor_copy|VectorE|float32|uint8|SBUF|SBUF||0": {
+      "min_elements": 64,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 150.21428571428572,
+        "input_elements_ns": 0.5747767857142857
+      },
+      "partitions_observed": [
+        32
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "shuffle-uint8"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false
+    },
+    "stream_shuffle|VectorE|uint8|uint8|SBUF|SBUF||0": {
+      "min_elements": 64,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 143.1428571428572,
+        "input_elements_ns": 1.0446428571428572
+      },
+      "partitions_observed": [
+        32
+      ],
+      "source": "isolated native instruction probes",
+      "fitting_programs": [
+        "shuffle-uint8"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 4,
+      "strided_reduction": false
+    },
+    "tensor_copy|ScalarE|bfloat16|bfloat16|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 158.66731898238746,
+        "input_elements_ns": 0.8326810176125246
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "derived operand alias over measured datapath",
+      "fitting_programs": [
+        "act-copy-dstpsum"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 0,
+      "strided_reduction": false,
+      "derived_from": "tensor_copy|ScalarE|float32|float32|PSUM|SBUF||0",
+      "validation_scope": "Analytical alias; independent characterization of this exact operand form is unavailable"
+    },
+    "tensor_copy|VectorE|bfloat16|bfloat16|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 155.95499021526413,
+        "input_elements_ns": 1.0450097847358124
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "derived operand alias over measured datapath",
+      "fitting_programs": [
+        "manual-copy-psum-vector-f32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 0,
+      "strided_reduction": false,
+      "derived_from": "tensor_copy|VectorE|float32|float32|PSUM|SBUF||0",
+      "validation_scope": "Analytical alias; independent characterization of this exact operand form is unavailable"
+    },
+    "activation|ScalarE|bfloat16|bfloat16|PSUM|SBUF|copy|0": {
+      "min_elements": 1,
+      "max_elements": 512,
+      "completion": {
+        "startup_ns": 262.67221135029354,
+        "input_elements_ns": 0.8277886497064578
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "derived operand alias over measured datapath",
+      "fitting_programs": [
+        "forced-psum-copy-mixed"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 0,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1,
+      "derived_from": "activation|ScalarE|float32|bfloat16|PSUM|SBUF|copy|0",
+      "validation_scope": "Analytical alias; independent characterization of this exact operand form is unavailable"
+    },
+    "activation|ScalarE|bfloat16|bfloat16|PSUM|SBUF|silu|0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 260.17322834645665,
+        "input_elements_ns": 1.3267716535433074
+      },
+      "partitions_observed": [
+        128
+      ],
+      "source": "derived operand alias over measured datapath",
+      "fitting_programs": [
+        "forced-psum-silu-fp32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 0,
+      "strided_reduction": false,
+      "fixed_broadcast_reads": 1,
+      "derived_from": "activation|ScalarE|float32|float32|PSUM|SBUF|silu|0",
+      "validation_scope": "Analytical alias; independent characterization of this exact operand form is unavailable"
+    },
+    "tensor_copy|VectorE|bfloat16|float32|PSUM|SBUF||0": {
+      "min_elements": 1,
+      "max_elements": 1,
+      "completion": {
+        "startup_ns": 155.95499021526413,
+        "input_elements_ns": 1.0450097847358124
+      },
+      "partitions_observed": [
+        64,
+        128
+      ],
+      "source": "derived operand alias over measured datapath",
+      "fitting_programs": [
+        "manual-copy-psum-vector-f32"
+      ],
+      "fit_samples": 8,
+      "validation_samples": 0,
+      "strided_reduction": false,
+      "derived_from": "tensor_copy|VectorE|float32|float32|PSUM|SBUF||0",
+      "validation_scope": "Analytical alias; independent characterization of this exact operand form is unavailable"
+    }
+  },
+  "mask_load": {
+    "issue_ns": 13.0,
+    "completion_ns": 13.0
+  },
+  "activation_table_setup": {
+    "completion_ns": 1283,
+    "accounting": "Existing fixed_kernel_ns includes one common table setup; graph entry is a covered setup marker."
+  },
+  "affine_service": {
+    "startup_ns": 126.87500000000003,
+    "element_ns": 0.8458333333333335,
+    "startup_cycles": 150,
+    "interpretation": "Measured per-element GpSimd throughput, with documented 150-cycle startup; remainder is completion drain."
+  },
+  "evidence": {
+    "accumulator-p4": {
+      "source_sha256": "c49f93e4e3ad33e8140c19cf65bab18efb2e20b3439bdb9af0150c61b7e2d91d",
+      "neff_sha256": "59e8cf0504e38aab6c94140dd49c61a6fe34ddfcf053186ebd451eb4d87ea8e8",
+      "ntff_sha256": "a34ac9b07b5a837de95be8fb7c1bb0a32fb204091ee947f9b43c29916bfd49c2",
+      "spec": {
+        "name": "accumulator-p4",
+        "mode": "accumulate",
+        "function": "exp",
+        "partitions": 4,
+        "widths": [
+          64,
+          128,
+          512,
+          1024
+        ],
+        "output_dtype": "bfloat16"
+      }
+    },
+    "act-copy": {
+      "source_sha256": "b6812b91b5f21fe8df4fe6d8964576496af182bda39388b434651f9f17431bd0",
+      "neff_sha256": "94219486cbfd2fc0d43caf7c9cc53099779247b8bb3c511b6381f43007349f89",
+      "ntff_sha256": "0a4f0111064f634a889ab7f2072176c8439ce370d1a17e9c98ed44cf8bee44dc",
+      "spec": {
+        "name": "act-copy",
+        "mode": "activation",
+        "function": "copy",
+        "widths": [
+          1,
+          4,
+          64,
+          512,
+          2048
+        ]
+      }
+    },
+    "act-copy-bf16-both": {
+      "source_sha256": "cd8bbee8758334c444e15b7115ffeb3325a8db1c2fd1e574d0b2c661d25f4872",
+      "neff_sha256": "780027481bc56668ccd6bcc776e1be914b32bab82e2734c3f3600c35db012546",
+      "ntff_sha256": "d4177c33f22d3e4ec0bf0b7bf35e7a6281666fa55dc2f3293af50fde574886de",
+      "spec": {
+        "name": "act-copy-bf16-both",
+        "mode": "activation",
+        "function": "copy",
+        "dtype": "bfloat16",
+        "broadcast": "both",
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "act-copy-bf16-both-p4": {
+      "source_sha256": "447ccc38760d8a2c5b48b33f0a14b6116c44950bd780320c2f707862c23c2940",
+      "neff_sha256": "a55617603bf608b41cfeceb1c961426b8d0dc27e712c4d42bca657ab22616bb6",
+      "ntff_sha256": "bc0e0821e8cb091af689c2c35209700cd1a67734594b0ca0a00246502d90cc96",
+      "spec": {
+        "name": "act-copy-bf16-both-p4",
+        "mode": "activation",
+        "function": "copy",
+        "dtype": "bfloat16",
+        "broadcast": "both",
+        "partitions": 4,
+        "widths": [
+          1,
+          64,
+          128
+        ]
+      }
+    },
+    "act-copy-bfloat16-bfloat16-sbuf-p128": {
+      "source_sha256": "8a2e2f7613aebfaf76214fe52088bb30eafbaa6d423ae04cbe0531e901d1321e",
+      "neff_sha256": "57aab87a922a15bbee0d67500a111838758c9f84fe74959e620c90726fe1cb33",
+      "ntff_sha256": "fbda0407175f036a640519b1ea3003d0c83c90b23ea41b77ddd66c22e0d050db",
+      "spec": {
+        "name": "act-copy-bfloat16-bfloat16-sbuf-p128",
+        "mode": "activation",
+        "function": "copy",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "source_memory": "sbuf",
+        "widths": [
+          1,
+          64,
+          128
+        ],
+        "partitions": 128
+      }
+    },
+    "act-copy-bias": {
+      "source_sha256": "14ac4724c1980c45620a5b99f98e8742a5c5b739b4acf352445d6107a38e4331",
+      "neff_sha256": "94762d21017d4e3e034ff8eef0e0a20b5f8dadbd48db927467749c4535142179",
+      "ntff_sha256": "da90f1443e248eed19b895f73b09a6c26e6c28c9d782e674db4643e2e7ac2f66",
+      "spec": {
+        "name": "act-copy-bias",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "bias",
+        "widths": [
+          1,
+          64,
+          512,
+          2048
+        ]
+      }
+    },
+    "act-copy-both": {
+      "source_sha256": "8e1085d4a7bb41a38a9d5780fcdbbb0509929205c89812ebe683ef073f30cef9",
+      "neff_sha256": "54133aaa87b4f8b98a48143df934f3dab5f3574f4d7aa81a540ae4885691767d",
+      "ntff_sha256": "2d1f7f5777f1ccee062f46affe8f104514adc7286e5c16b65eeed3c29809191f",
+      "spec": {
+        "name": "act-copy-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "widths": [
+          1,
+          64,
+          512,
+          2048
+        ]
+      }
+    },
+    "act-copy-both-long": {
+      "source_sha256": "1007ca4da6574652041b3bb3ffbc8f2a55ddf3c81c616c77ae874474299ffb8a",
+      "neff_sha256": "313d8d5424151c989e3583cd00473c554cec54d06c46ac325dc6fdc74feb00ce",
+      "ntff_sha256": "1aa46d995d1c22489c32a6abc9a17a97ed61dde62f0f531a086e2106a63d905d",
+      "spec": {
+        "name": "act-copy-both-long",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "widths": [
+          2048,
+          4096,
+          8192
+        ]
+      }
+    },
+    "act-copy-dstpsum": {
+      "source_sha256": "1debef2fa282572518b5d3c9c6d71df546a308af3d88279e20d12d8a140e85c6",
+      "neff_sha256": "ef577ebbfa3360386e0b544701fd6037157c386a7ec384f256b5c37594c7805f",
+      "ntff_sha256": "e7aecbccb8098fb83252ff8830ada1dd61bf3fbed698fe2a16cc3aff8c29d862",
+      "spec": {
+        "name": "act-copy-dstpsum",
+        "mode": "activation",
+        "function": "copy",
+        "destination_memory": "psum",
+        "broadcast": "scale",
+        "widths": [
+          1,
+          64,
+          512
+        ]
+      }
+    },
+    "act-copy-mixed-both": {
+      "source_sha256": "b3eaaccb601bda90d2e33b7a7e6a127ee075a446c8ad51d8440966128c3a9531",
+      "neff_sha256": "096e9328e5cf7fa323c8d8c320d29a52039f18579fcf102a55b2ea5c83eeb7db",
+      "ntff_sha256": "96fb4f43be0e72a475c26823d524e77bf20d5d33d25979fad2b2dc82c1dda78d",
+      "spec": {
+        "name": "act-copy-mixed-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          64,
+          512
+        ]
+      }
+    },
+    "act-copy-mixed-none": {
+      "source_sha256": "607ff7057b3fa18f5f744a34ad09c76be8eefa1022e9eeedde83b93f35b448bd",
+      "neff_sha256": "2e2135b804563a943c5dff13402325983436bc0d8f8ac71d5418b69fb5e5dacb",
+      "ntff_sha256": "4cef00ffdddfe4000f7980b71217f65d7732b7096bcecc6530569667130d93b9",
+      "spec": {
+        "name": "act-copy-mixed-none",
+        "mode": "activation",
+        "function": "copy",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "act-copy-mixed-scale": {
+      "source_sha256": "c16e26c1ff5201bfa57a4b224d6369d75eb65b8394cb83aa16c5a5764eb7d485",
+      "neff_sha256": "9cf509581a50c5444e6def9a8d1ca12eec5e784fe632ddc3cc3e107a00bff3f4",
+      "ntff_sha256": "e4d7afd7f80e861009b726dad4496fb8695e44faf50c17adb2ba5d2b46ff8ffa",
+      "spec": {
+        "name": "act-copy-mixed-scale",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "scale",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          64,
+          512
+        ]
+      }
+    },
+    "act-copy-psum": {
+      "source_sha256": "ff064dff1331a9ed23e7222848f3c5c0b40feccf415a0c588a04178d1f6e4136",
+      "neff_sha256": "e5c29c76971c42afd511ba689b6444451ddd801bb2f93c38815c60e98c129cb7",
+      "ntff_sha256": "600558b62f1ec243a8f0f8053aa7566311944e5e7a3131e67d43a4661dd8d7b9",
+      "spec": {
+        "name": "act-copy-psum",
+        "mode": "activation",
+        "function": "copy",
+        "source_memory": "psum",
+        "broadcast": "bias",
+        "widths": [
+          1,
+          64,
+          512
+        ]
+      }
+    },
+    "act-copy-scale": {
+      "source_sha256": "f2a00523da0c9c15b0189b45650c04d2f221e056c0b89427dce6d124b474e1bc",
+      "neff_sha256": "c19f242f4d06569ce4d29e3a47d0bed9d223ab39cb2bcd6c170827d34de8e8f4",
+      "ntff_sha256": "414cbecd325db2e33173dc5a52451b5201a2d9ca4d606031c6912e047f034f40",
+      "spec": {
+        "name": "act-copy-scale",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "scale",
+        "widths": [
+          1,
+          64,
+          512,
+          2048
+        ]
+      }
+    },
+    "act-exp-bfloat16-bfloat16-sbuf-p128": {
+      "source_sha256": "069b359924f90c0936d80e2e5db92e1d358ac0e51f9176df3cb0a1291a149b34",
+      "neff_sha256": "6b814b4972cb1c3c50754e0e98865f320993ef95fea313bb5169cab7e1da77ed",
+      "ntff_sha256": "c847fe84e3602ca879c3f54981a8f2793916fd87a0cbf770b8882d88764a1c0e",
+      "spec": {
+        "name": "act-exp-bfloat16-bfloat16-sbuf-p128",
+        "mode": "activation",
+        "function": "exp",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "source_memory": "sbuf",
+        "widths": [
+          1,
+          64,
+          512,
+          4096
+        ],
+        "partitions": 128
+      }
+    },
+    "act-exp-float32-bfloat16-psum-p128": {
+      "source_sha256": "618346aab65a70477afffe1594fd57edca8bbe6863d1a77c7a7d900a252d1fbd",
+      "neff_sha256": "69f9db6291ec33a7a6196a902cfd4fac4c95d863548ef2c88a43bd3f6451c382",
+      "ntff_sha256": "ce3096626599b3e4142761e2a50388410f5ba8d547b0b6c6577b4dc3d33a37a6",
+      "spec": {
+        "name": "act-exp-float32-bfloat16-psum-p128",
+        "mode": "activation",
+        "function": "exp",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "source_memory": "psum",
+        "widths": [
+          64,
+          512
+        ],
+        "partitions": 128
+      }
+    },
+    "act-exp-float32-bfloat16-sbuf-p128": {
+      "source_sha256": "ee1b26adb81b99250cdcd4cbc73c20e97e83ea364df536ebb7f5c38b5f1b3793",
+      "neff_sha256": "1fb639a4d061690ccfebb950cd395395ac57afeb60d82fcea5b09fa82b2cecd3",
+      "ntff_sha256": "fca9f15551f29cb7de4e1cb1f8e15ff2c00181164083be71f9c364496a8c08d7",
+      "spec": {
+        "name": "act-exp-float32-bfloat16-sbuf-p128",
+        "mode": "activation",
+        "function": "exp",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "source_memory": "sbuf",
+        "widths": [
+          64,
+          1024,
+          2048
+        ],
+        "partitions": 128
+      }
+    },
+    "act-exp-float32-float32-sbuf-p4": {
+      "source_sha256": "604192b4f26f6f05e05711589134ba334271cd1db44416f1126b0cacabacf6ad",
+      "neff_sha256": "08c61d5dc21c69581a86d065d5c0acba190f9ec940b2107f114aad7c4380cd8d",
+      "ntff_sha256": "3ac492c88fada1b893fd4d8121c0c6686adfd69212a16b192f9bfb620fde7151",
+      "spec": {
+        "name": "act-exp-float32-float32-sbuf-p4",
+        "mode": "activation",
+        "function": "exp",
+        "dtype": "float32",
+        "output_dtype": "float32",
+        "source_memory": "sbuf",
+        "widths": [
+          1,
+          64,
+          512
+        ],
+        "partitions": 4
+      }
+    },
+    "act-log": {
+      "source_sha256": "ef46dd4c6d2ce2921fbba1138d89e8e709b11f74f23b4220df479bab2c5ff07b",
+      "neff_sha256": "1b0016c4ae08d033e0feba2a233bcb57a9c68e4eb38e32c73289df97c0110efe",
+      "ntff_sha256": "48543f4041a04fb569d579757384a472ffe72d0c627a6f933d749bf92d22dea2",
+      "spec": {
+        "name": "act-log",
+        "mode": "activation",
+        "function": "log",
+        "widths": [
+          1,
+          4,
+          64,
+          512
+        ]
+      }
+    },
+    "act-rsqrt": {
+      "source_sha256": "247205320db796a95b8cb6730c87e86017fbabf9c697bf0fff85445522706e75",
+      "neff_sha256": "d1480c163d0152b5115d50dcf72c707cc675804e126a3a5979dbfad127fb9a07",
+      "ntff_sha256": "ddc21ea00f80e1d2a748b650c1ffe617539672383d7a50970ba41c8e064ebffc",
+      "spec": {
+        "name": "act-rsqrt",
+        "mode": "activation",
+        "function": "rsqrt",
+        "widths": [
+          1,
+          4,
+          64,
+          512
+        ]
+      }
+    },
+    "act-sqrt": {
+      "source_sha256": "5782133df6b8f40c221beb74d36d0bed2f0b46f3e554debc5f12d3881cf5e2f7",
+      "neff_sha256": "9df7c43513d03c2b39940a6a43aafbda9961ba6b30cf7a0f2f039f1473d8a523",
+      "ntff_sha256": "8bb90415d797bf490108a57b9bb2f25a586cf222d1e486f49bc45e71d3012b82",
+      "spec": {
+        "name": "act-sqrt",
+        "mode": "activation",
+        "function": "sqrt",
+        "widths": [
+          1,
+          4,
+          64,
+          512
+        ]
+      }
+    },
+    "act-sqrt-p64": {
+      "source_sha256": "de282dcb6677af0e9615c56d220da880be06987ba6b105d1172a7bceb62e68ff",
+      "neff_sha256": "f6eacfb57606ad112dcfdc909676c4a4f1351dc73a5b067d7f2c1230a0bb51d9",
+      "ntff_sha256": "cb33bd45af672bbe466770a3609b8e5a2311e4db52a61648c27a59108970ff2a",
+      "spec": {
+        "name": "act-sqrt-p64",
+        "mode": "activation",
+        "function": "sqrt",
+        "partitions": 64,
+        "widths": [
+          1,
+          64,
+          512
+        ]
+      }
+    },
+    "act-square": {
+      "source_sha256": "3a43687778e5fb468ff15eb871d2e616e2eea9d181e99d69237fcc2427709b19",
+      "neff_sha256": "f09775b60d7122cec84afa4e7123937688833c0c881f98f038e48124e8ddaf08",
+      "ntff_sha256": "0a241998977be26b46f5a08831231e20cc38fc6c388db3dc783da6e3c5104dce",
+      "spec": {
+        "name": "act-square",
+        "mode": "activation",
+        "function": "square",
+        "widths": [
+          1,
+          4,
+          64,
+          512,
+          2048
+        ]
+      }
+    },
+    "act-square-long": {
+      "source_sha256": "eeb129afa080b1ad550fa85779c41c5999e24684d148a551c2d771ef9470167a",
+      "neff_sha256": "e532ef5c42a932f26b11540c9ff176766e361b0113f415eb0508dc7e94599225",
+      "ntff_sha256": "db72b4329ab1c8f63481ca2ef4f821b97054552b1f1dcfb13b89408c2a4cb168",
+      "spec": {
+        "name": "act-square-long",
+        "mode": "activation",
+        "function": "square",
+        "widths": [
+          2048,
+          4096,
+          8192
+        ]
+      }
+    },
+    "affine": {
+      "source_sha256": "7b55e5f596dc872252431c61e375b6d885501f0c9d655ae0446cfabc40dd5d9f",
+      "neff_sha256": "b62f7daa093cbea4db96240aaa5d64065e542289ae811d20b812b854b0cd0161",
+      "ntff_sha256": "ffab46ed05dd985f2f9fa7948df385ac36302bacb838fa2ce9c5afd1aaa8d0f4",
+      "spec": {
+        "name": "affine",
+        "mode": "affine",
+        "widths": [
+          64,
+          128,
+          256,
+          512,
+          1024
+        ]
+      }
+    },
+    "binary-bf16": {
+      "source_sha256": "ff13f6fefbb124927d55a6fc544d207396268c19dab8e2a391b7cb8d666dfba5",
+      "neff_sha256": "dd0023e1098a8f3e9fd57829d8ee09ddbfd0db6a86f96e45cd5c878984d43f61",
+      "ntff_sha256": "e38d2e936521fa82d01570a4925ac9d979fa1970d545360d48c729cb9dd7cb6f",
+      "spec": {
+        "name": "binary-bf16",
+        "mode": "binary",
+        "dtype": "bfloat16",
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "binary-bf16-p4": {
+      "source_sha256": "44192af60af609f5553003daa0f7392964b0df1d79a27889dcbfe8dc60db9e41",
+      "neff_sha256": "4bb463bfd2a4fa181438179c8a8d606a2fd5704d69f1527fd2d88fb351759452",
+      "ntff_sha256": "376c91d29427abe300cc2b449bf7681625e93eada760909536925b8c761e0ae1",
+      "spec": {
+        "name": "binary-bf16-p4",
+        "mode": "binary",
+        "dtype": "bfloat16",
+        "partitions": 4,
+        "widths": [
+          2,
+          64,
+          128
+        ]
+      }
+    },
+    "binary-fp32-bf16": {
+      "source_sha256": "9a6cb8ce81e524eb5f387aa7f1e95cf0ae59132fbb50121f7f2e10c1e05b589d",
+      "neff_sha256": "1559d962a145f742167b1d3ff3caea56b4bc85f334b191191c46793cbed07917",
+      "ntff_sha256": "f0af7c7ac4fe5fdfe012d613cfe7f6d1bc05a43e1f1537ad45e21c4a16716b86",
+      "spec": {
+        "name": "binary-fp32-bf16",
+        "mode": "binary",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "cast-scalar-long": {
+      "source_sha256": "adc1b70ab08dbb387e5f23a8c944f0b96d508ebe40930260a5315d5f1f5ac131",
+      "neff_sha256": "adeff4d06d17887a50a5492cb3f6689eac25615de82bcf045097958a73a3a76f",
+      "ntff_sha256": "6ebba384e30b9f32d8384f98a28f364ef382d2eca50594aff31f69e80818c214",
+      "spec": {
+        "name": "cast-scalar-long",
+        "engine": "scalar",
+        "output_dtype": "bfloat16",
+        "widths": [
+          512,
+          1024,
+          4096,
+          8192
+        ]
+      }
+    },
+    "copy-psum-scalar-float32-bfloat16": {
+      "source_sha256": "c894b716a47e816a7f63a40c9494f14cfebb3db62538e1d2fca0df4d1e1e1ae9",
+      "neff_sha256": "5608a400dd66c02dbe84d75285ce7695238a5e24849d32c3c6c6f4eb887f3edd",
+      "ntff_sha256": "ba29be1d6eeaefe4b9042e51d93b8cd1ee923ceff585dd2b15084ddc89ea9429",
+      "spec": {
+        "name": "copy-psum-scalar-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "scalar",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-psum-scalar-int32-int32": {
+      "source_sha256": "aa0d73ae2826f345afe694a4e5d9f87204eed3385f7fa798a06d67cfca254a4e",
+      "neff_sha256": "64d3ffdf902dc0c2ed8bf5fd6d01231f2b6fc49aca4bc41ad749b587c0df72e0",
+      "ntff_sha256": "37ed49408d7aa6af40295cba80d2ca11c5ccd7c3b333461d6ad85a1ebd005c52",
+      "spec": {
+        "name": "copy-psum-scalar-int32-int32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "scalar",
+        "dtype": "int32",
+        "output_dtype": "int32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-psum-vector-f32": {
+      "source_sha256": "5f806bc897223d25a71b37dd654777f9862879ba941f3f8984a25ca4abfe78a7",
+      "neff_sha256": "c3881193a28a0766f227f35b02d96bb1582210bdf5b02b0a3ead8ab18fc7d8c7",
+      "ntff_sha256": "b455030743c10d79a614b100a143d02a68022d048272b1aec65a70c79b978c2b",
+      "spec": {
+        "name": "copy-psum-vector-f32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-psum-vector-float32-bfloat16": {
+      "source_sha256": "5b976a0b33dfc491b053bbf4b24933f82908bc47b4170717c6062e8d54df9962",
+      "neff_sha256": "986c139ebf1e684635a9c8d29ee6e4fb9edb4e04afd3abc3cb8cfe3ca3759eef",
+      "ntff_sha256": "1575962d3aeb06bed9fb3f2b0531ad9725b7dc0397a1ddf7cf791ab924a555c5",
+      "spec": {
+        "name": "copy-psum-vector-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-psum-vector-int32-int32": {
+      "source_sha256": "c0995849c170389d8c16b41447851dcdfaca4d8fc48f499c41663269777b313a",
+      "neff_sha256": "be303d7f3510d945c6aa2072cda54e8151077710684031aefb9a9b6f3711bab7",
+      "ntff_sha256": "35da16bebeabcbc5a154dc2b59572296616ab8444d8bcbae7bcf585ef7bbc9e8",
+      "spec": {
+        "name": "copy-psum-vector-int32-int32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "dtype": "int32",
+        "output_dtype": "int32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-psum-vector-p64": {
+      "source_sha256": "9c4ef737f3dff5ff1b87ac782e2d29a2e38dbd9b93afc7805d006485d2a2ce57",
+      "neff_sha256": "4b14a5a4cc96a4a496c05734e81341575cbee9ac1b94f8f9fb35ff289dbde49b",
+      "ntff_sha256": "93a71e33fa477111a12f6db601db92b2349ef67ce8718cbfec6f2658a035bfb8",
+      "spec": {
+        "name": "copy-psum-vector-p64",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "partitions": 64,
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-scalar-bfloat16-bfloat16": {
+      "source_sha256": "21a16b612d71c8716fc938938f6ec20b84a47c6f4cd276dcfa93964b8e09b3e8",
+      "neff_sha256": "c7286f2c2f59a2e7c2acf28f28bfb9246f5ff3104f90939e4e21f505bc819820",
+      "ntff_sha256": "3265c2d416832cd5d2fe5e47abf5b3604f5eeb2b4ae49e35d2010593fe63573a",
+      "spec": {
+        "name": "copy-sbuf-scalar-bfloat16-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-scalar-bfloat16-float32": {
+      "source_sha256": "40f4df85072c831fed13b0fa14b466a03f8cad128271daef5156eed6aec66538",
+      "neff_sha256": "48333cd4c647ebe337f1bc95b457b2e45bc7fc32522643bf1fcda66e874b6029",
+      "ntff_sha256": "f20d697906d08d143b100e261cd080b9cbf9ab7a27910e63cb247f88d3274b73",
+      "spec": {
+        "name": "copy-sbuf-scalar-bfloat16-float32",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-scalar-float32-bfloat16": {
+      "source_sha256": "043fb1033992ae3d59df2ab73f2d0d8b8fb3ae465c6ee46572b19b0342a8625c",
+      "neff_sha256": "e7704371a164bc94e9a3b7c0c9ae8a3533cd5c30fbdcf1b4620f15f85cc68819",
+      "ntff_sha256": "227d3850aa281bbd382b722412dabb1fafff6f95d81310f11edd6059eb859962",
+      "spec": {
+        "name": "copy-sbuf-scalar-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-vector-bfloat16-bfloat16": {
+      "source_sha256": "5a463ef78f8d511b9e08719a9e25fe5ccb45e675f6e7b2af447a7c687ba1d512",
+      "neff_sha256": "92b89d23672f4b5dc6439c220200e20a5efd6d3740f1a8f2977e411cba5a7e74",
+      "ntff_sha256": "1e60ecbce993708d2de22ec926b900b258d45b9ee1ee5cf8a9f1f78ce5163cb7",
+      "spec": {
+        "name": "copy-sbuf-vector-bfloat16-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-vector-bfloat16-float32": {
+      "source_sha256": "3831d26568165d951de47508798aff3317238bf1712aebf85c2672570339c946",
+      "neff_sha256": "af9b4f567e49978aa17b0b53b361f434e6f48281a01c99a5d5a165ef2dbcd376",
+      "ntff_sha256": "1e84e15f8f25e951c3d91597f26eb241d86e59dd3337e4d9ca148b21134710e7",
+      "spec": {
+        "name": "copy-sbuf-vector-bfloat16-float32",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "copy-sbuf-vector-float32-bfloat16": {
+      "source_sha256": "3b3cc5656b624692f585966767e08419dd1149bbdc3e6bf368bd8c0be393e279",
+      "neff_sha256": "388d30fdf980f0335a738fbe83f8a35dc77ed1b2099ea49922002d106d558f74",
+      "ntff_sha256": "ed6e1aac5bb4379f1d0cf644ea8cb345d14871809f29b1e97e3bb093683b41a4",
+      "spec": {
+        "name": "copy-sbuf-vector-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-binary-psum-bf16-p4": {
+      "source_sha256": "4f7970ca9e936977e8e72d7328e96c3e1031df38101220dd2d4e886f4b8d2450",
+      "neff_sha256": "f6716d4cd4b1841ab4acb41d165b27d18214505343c6e2805f7fd5327a65aa3d",
+      "ntff_sha256": "173f90c37131749082e2f2d3d53fb0e4c2266f738b41a6be3d984fbbe0e7d44e",
+      "spec": {
+        "name": "forced-binary-psum-bf16-p4",
+        "mode": "binary",
+        "source_memory": "psum",
+        "output_dtype": "bfloat16",
+        "partitions": 4,
+        "widths": [
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-binary-reverse-psum-bf16": {
+      "source_sha256": "32f7ec164257b782a9284db7f990d9f8c15a45ac7215a83dc57a4f7a5a2becc2",
+      "neff_sha256": "f472438604fb6eb1be7e6d99696f1cf2addf5b23d36bf6dac09bd0fc71852090",
+      "ntff_sha256": "075fff3854b29921db18f4cf1b0b2b7c3db97c06b8d52d238e8c0a64cc66537a",
+      "spec": {
+        "name": "forced-binary-reverse-psum-bf16",
+        "mode": "binary",
+        "reverse": true,
+        "source_memory": "psum",
+        "output_dtype": "bfloat16",
+        "partitions": 128,
+        "widths": [
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-copy-dstpsum-p64": {
+      "source_sha256": "d316e91a3e095dbef771cc3b64f07bba5a5eb25a096ff981db47d224060386e4",
+      "neff_sha256": "6be3dae3db82318c135146b64c71169b1ab040466b4d60e29713800673298202",
+      "ntff_sha256": "d753c278464c0b59a98494804ad56968e61bb5b33cdff07a47ceb0d433547696",
+      "spec": {
+        "name": "forced-copy-dstpsum-p64",
+        "mode": "activation",
+        "function": "copy",
+        "partitions": 64,
+        "destination_memory": "psum",
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-dynamic-p128-bias": {
+      "source_sha256": "b65b15b61fa51b51b2041db6f7e13f135ffe90efc905e4824144a3bbce9877ef",
+      "neff_sha256": "4749b154b67a8a3d092a8a825e4d4ac79286d2efadd621d941d64252f50374b3",
+      "ntff_sha256": "8497f3128fd54e639d7fe1518e638a20d6960cc3df0a17959faec377278f6985",
+      "spec": {
+        "name": "forced-psum-copy-dynamic-p128-bias",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "bias",
+        "source_memory": "psum",
+        "partitions": 128,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-dynamic-p128-both": {
+      "source_sha256": "7922c28270c251c05cf64e7513982fbfb5eea71f1c59cae200f8fd277e18d90e",
+      "neff_sha256": "d3aae975bc4c4d14bfe89ab8edd67e1c7f65f388e589b8b8a176023abfad2fc7",
+      "ntff_sha256": "9c137a5b780688634499c853ecebed6eb0631a8b65f8ec75f13994b4dcb4291a",
+      "spec": {
+        "name": "forced-psum-copy-dynamic-p128-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "source_memory": "psum",
+        "partitions": 128,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-dynamic-p4-bias": {
+      "source_sha256": "69d05fec5ef9772a5602566b6a1e534bdae6692827e1db1ab71f16d1c52ced75",
+      "neff_sha256": "b44ce496552cac02c7fc5cc44280e81e57c94ceac89c0e197be0daa737f6351e",
+      "ntff_sha256": "ecbf5f1be259f01127a767774665e236164b6ca7851cfb964c44776a76196a1c",
+      "spec": {
+        "name": "forced-psum-copy-dynamic-p4-bias",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "bias",
+        "source_memory": "psum",
+        "partitions": 4,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-dynamic-p4-both": {
+      "source_sha256": "cba03e7d84b025d55ea0218a49110e622a6350b2a0a583eee4858512e93bbe79",
+      "neff_sha256": "52de020b3bbd8d4b71af5a59d1a3eb11c85ecc48ab62c44af6338be9dcb653dd",
+      "ntff_sha256": "e364de03972dc2d6447a756ed9215f31b122472d7da375555d9adab64594e903",
+      "spec": {
+        "name": "forced-psum-copy-dynamic-p4-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "source_memory": "psum",
+        "partitions": 4,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-mixed": {
+      "source_sha256": "4327b9b2d7f18d4fe1aaae63302bdbbe8bda04b4b28f980e9c63983d1e9f8b92",
+      "neff_sha256": "adb3521d79516de5cdd9806917c8beb3ffe5ff04b75ece472ebe08b3a4982e94",
+      "ntff_sha256": "2810a3269be15a4e8a13162bcd7824f412b4a4a3449330456111ba5650bd2978",
+      "spec": {
+        "name": "forced-psum-copy-mixed",
+        "mode": "activation",
+        "function": "copy",
+        "source_memory": "psum",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p128-bias": {
+      "source_sha256": "510757b7cec8dc42d274590dd90e3ce4e768ff67c69622fd70880666a55ffbeb",
+      "neff_sha256": "9017d6dc90584fdd4b9e183f68116c5df1b51afc89d357e7ed5b2719fc483205",
+      "ntff_sha256": "add14b34ebdf19e269c389b315001fe6357bda1cb6008b2f52869e6208acc724",
+      "spec": {
+        "name": "forced-psum-copy-p128-bias",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "bias",
+        "source_memory": "psum",
+        "partitions": 128,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p128-both": {
+      "source_sha256": "3f22e2f39c8a6f721e87748fc6187a5844d75844cc3fb994d56b0fab86d8e36b",
+      "neff_sha256": "1f69fac3d3a56a0b36df631c005f312631dcfe6cc65743b81d90c731323bbe86",
+      "ntff_sha256": "f61063a47bc82faaacf195357cad6b0a7eed2e839a7eab14841c0f30373850a7",
+      "spec": {
+        "name": "forced-psum-copy-p128-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "source_memory": "psum",
+        "partitions": 128,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p128-none": {
+      "source_sha256": "b0e4155b0649fa4ccd5612f7bf10fbb3a6b7eb4f3d49ed2c4f7a22112659def3",
+      "neff_sha256": "413df516b0de4cf582b98394a85aff0c072fc8a23c091533eaa6f2953edd95a3",
+      "ntff_sha256": "6efb3d34ddb17ba88a6754b43cdc7fba91a9fdfee8f79651b59d3bd259f9d95c",
+      "spec": {
+        "name": "forced-psum-copy-p128-none",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "none",
+        "source_memory": "psum",
+        "partitions": 128,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p4-bias": {
+      "source_sha256": "69d05fec5ef9772a5602566b6a1e534bdae6692827e1db1ab71f16d1c52ced75",
+      "neff_sha256": "118092c8cea86780e6415516212a18f33c856eece4a0fdf4821528c6dcf8eb9b",
+      "ntff_sha256": "6550da1d9be164a5520c813cc0690bc81d5904a777a6fa90cfdde9d37cbd3f13",
+      "spec": {
+        "name": "forced-psum-copy-p4-bias",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "bias",
+        "source_memory": "psum",
+        "partitions": 4,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p4-both": {
+      "source_sha256": "cba03e7d84b025d55ea0218a49110e622a6350b2a0a583eee4858512e93bbe79",
+      "neff_sha256": "2d6bf7e853c9c3ab44ff99037bda639928fccfee47b0e1f385184c3a3efa04d2",
+      "ntff_sha256": "8e89be03449a39e42d683f55289b09a8b0577b1f42b2cb1bc0b17359c058d744",
+      "spec": {
+        "name": "forced-psum-copy-p4-both",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "both",
+        "source_memory": "psum",
+        "partitions": 4,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-copy-p4-none": {
+      "source_sha256": "f2e3d5fbfbc7a3bfd9bef284f6367cbe3c1dee13b62273abe58d1a8f0da35540",
+      "neff_sha256": "c67185570a5d16b326bcc36b526e3a310884b5e1efedd825ad4277e347c27ce3",
+      "ntff_sha256": "d1da33c4c39ad7f6f8b9b2637cf01f11293acc093c9d1faf6cf6d5d3bce9d0fb",
+      "spec": {
+        "name": "forced-psum-copy-p4-none",
+        "mode": "activation",
+        "function": "copy",
+        "broadcast": "none",
+        "source_memory": "psum",
+        "partitions": 4,
+        "widths": [
+          1,
+          2,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-exp": {
+      "source_sha256": "0f67b8f1a4c73b6a2ea3b5b9ad39fec898bac5ae0ae40fbfd00e176f6cd16885",
+      "neff_sha256": "8ed3b487a091b54e4b23170c23b5b91aae5ce1cdbd0a2cb5e04dbbf8e133091c",
+      "ntff_sha256": "8b57653c1fec10029ea764f68a963bebd70621e5b19cddefa7309255cb3f0f19",
+      "spec": {
+        "name": "forced-psum-exp",
+        "mode": "activation",
+        "function": "exp",
+        "source_memory": "psum",
+        "output_dtype": "bfloat16",
+        "widths": [
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "forced-psum-reduce": {
+      "source_sha256": "169847571e759c35acb62b6acda2276d04597ff42f2acef699431ef100c2103e",
+      "neff_sha256": "71efe54fea0732a23103b4c84f8e7e8042ae059f75d063bf6ed31a1744037142",
+      "ntff_sha256": "d329df571ed4e1c9d7050d1d33a24eb8c57c5c966c8ac9c5ec39c1340c3090cc",
+      "spec": {
+        "name": "forced-psum-reduce",
+        "mode": "reduce",
+        "source_memory": "psum",
+        "groups": 4,
+        "widths": [
+          8,
+          16,
+          64,
+          512
+        ]
+      }
+    },
+    "forced-psum-silu-fp32": {
+      "source_sha256": "432a65a272c8caa4c66c578ac3731c2f2a9b3bcb939b9595075609ad39dbfdec",
+      "neff_sha256": "c3cbb3e223139193d56f4607a740725f36b270c3f63e4cb57619806693734889",
+      "ntff_sha256": "22be97b04d2325ae637a30ce51bbab6f3227176abf14bce619d8c8823c46dea4",
+      "spec": {
+        "name": "forced-psum-silu-fp32",
+        "mode": "activation",
+        "function": "silu",
+        "source_memory": "psum",
+        "widths": [
+          1,
+          64,
+          128
+        ]
+      }
+    },
+    "manual-copy-psum-scalar-float32-bfloat16": {
+      "source_sha256": "180db9035afeb01108aa87e060c6dcb541bb5978bfe71a08b70ae3e9c1d19ab7",
+      "neff_sha256": "e495a101fb13085ec676deeadcc12c9e0beb9218384e484db6a07df787db2ca2",
+      "ntff_sha256": "44fcdd720af7ee9a97794dbd57ef1f53fd7c409dff9a728f3fc7c53573c768a8",
+      "spec": {
+        "name": "manual-copy-psum-scalar-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "scalar",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-psum-scalar-int32-int32": {
+      "source_sha256": "54ae69b9042798158c334b304a97581dff2088ecbd0b98c7ca5d6d0681e69ee8",
+      "neff_sha256": "c50c408e33d43170e989be5b04d509c813be7f39572cb53ebe617d5f35a7a004",
+      "ntff_sha256": "a5a3179738ded1c5f2e967227815c9fc601ef458ff76fae3c5cfbbf1d7905117",
+      "spec": {
+        "name": "manual-copy-psum-scalar-int32-int32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "scalar",
+        "dtype": "int32",
+        "output_dtype": "int32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-psum-vector-f32": {
+      "source_sha256": "19ca2a7ca5534f62076f172f452e86d7d56104680b274da65c6613ec54c6d63d",
+      "neff_sha256": "9ec5dca88bcd9234f16d97f1526e17ed020ace2b64e2ae183f26367ab02f38b3",
+      "ntff_sha256": "9ffe2c5c4764eee194158855ee794de0c696733dbced21b5fbc8e1c8ff7cca58",
+      "spec": {
+        "name": "manual-copy-psum-vector-f32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "dtype": "float32",
+        "engine": "vector"
+      }
+    },
+    "manual-copy-psum-vector-float32-bfloat16": {
+      "source_sha256": "85110d6faa16bf84b9d590817c6aefc949a1cc2e746b8df41c558daee15900b5",
+      "neff_sha256": "83f5744dbc268f4f18aaa2f9a38c713b4a0aa25563cdf12c9442deb21181fc85",
+      "ntff_sha256": "56f94274aa639b051de0f35bbeff76afdc33e2a878536c51d415afe3e9061738",
+      "spec": {
+        "name": "manual-copy-psum-vector-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-psum-vector-fp32-bf16-p1": {
+      "source_sha256": "7874c21b3919cca93d30140fa8da5b28a834d942ad3903854b1eb6f6a239e088",
+      "neff_sha256": "7502886524c21d9aa4ba645adec607a448e9d0848b0f91749a4bc69cd6a5d713",
+      "ntff_sha256": "93280241d5987f15d4cb2df19f226023eebc4493ae9f5e06b015fbbcb4785b14",
+      "spec": {
+        "name": "manual-copy-psum-vector-fp32-bf16-p1",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "partitions": 1,
+        "widths": [
+          1,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-psum-vector-int32-int32": {
+      "source_sha256": "4adecf93e5e48914d2d2fc82056cee97c38664de813f276d4d504f29e53b079f",
+      "neff_sha256": "85e85e4f914a1385f56605a1d7fbf33ba97095e6a942c0927c4e4ebfc96a51fa",
+      "ntff_sha256": "304f77f59eaa1fbf61d75f7c8b4a5b7ad5b83ca0df18e86013fc23352cb5939c",
+      "spec": {
+        "name": "manual-copy-psum-vector-int32-int32",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "dtype": "int32",
+        "output_dtype": "int32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-psum-vector-p64": {
+      "source_sha256": "a62a18ab00632f100dd2d97011cd621a0448a5bbd967dbf85ae88b128bfa5a18",
+      "neff_sha256": "46ce682c46abbceb693d6990304d6406772f850ae2b1ecf8922b361029d84024",
+      "ntff_sha256": "c08308f1721c4a1eac8ea8131a7264c8bff92b6a95c5f7a8b5a24cd7a1fd506f",
+      "spec": {
+        "name": "manual-copy-psum-vector-p64",
+        "mode": "copy",
+        "source_memory": "psum",
+        "engine": "vector",
+        "partitions": 64,
+        "widths": [
+          1,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-scalar-bfloat16-bfloat16": {
+      "source_sha256": "e04f58c7095b7c92a403b273d6d27923c1d3a2865e62c1901dc0b568b96a7a33",
+      "neff_sha256": "0296553893a291fee87121e5203ee434a6236e94fd7c264643f7bc2f13c3e789",
+      "ntff_sha256": "57cd13c1b9e920c52c9e8801ad512a33a24b906a08a18e3327780e6d1b8a3b78",
+      "spec": {
+        "name": "manual-copy-sbuf-scalar-bfloat16-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-scalar-bfloat16-float32": {
+      "source_sha256": "37582270a515373ebc634644487d3087bc5ffa2e9a7ea6b23d1254187b0c65a3",
+      "neff_sha256": "5957386627928d68e1f375c632955b198fafeb85a495bf5f6f3527f3de797b66",
+      "ntff_sha256": "b416a6d6d39e00cfe2ecbfe18a9e9a2f701661678a17ce1ae49bff8f8789e934",
+      "spec": {
+        "name": "manual-copy-sbuf-scalar-bfloat16-float32",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-scalar-float32-bfloat16": {
+      "source_sha256": "67eb188771cb55ef47656acfdf7f883dd7ef91a9000fdb92a42ced7667dcd58c",
+      "neff_sha256": "5a257fecdb66fae55fdfeab1799b040726d2f1a877ac361a0bfe4b127a78be38",
+      "ntff_sha256": "ce772d492eb42b7855479ab7e0cadb5fe6e62b803761bbdce8cc8907c6df4fdb",
+      "spec": {
+        "name": "manual-copy-sbuf-scalar-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "scalar",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-vector-bfloat16-bfloat16": {
+      "source_sha256": "f6b7fb8a1f0fca511734a5200a5047977bd8b96872b6b050bbfee0929a3c82dd",
+      "neff_sha256": "05f56a6e9d9a27c0ae1dcefb813ff2bd8ee444738e6dd6ca2b8a58617e85337e",
+      "ntff_sha256": "989a3e301153381cc18b944fcbdf7f9c2e5c219add86312683051ca4be00fc84",
+      "spec": {
+        "name": "manual-copy-sbuf-vector-bfloat16-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "bfloat16",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-vector-bfloat16-float32": {
+      "source_sha256": "b3afe676b36bf05092dfe0532a49a99a04c0c3efd0c28ca8f6de3cfc2701d45d",
+      "neff_sha256": "a99ff51ffc7677b61cc38e51f1f0e0db2173e1687cb11c7b66ad1dcac83d063c",
+      "ntff_sha256": "d65c21c48249fa615abacd6ef1de08e8a85a4d5ce74983fcbea2aff1aa700d14",
+      "spec": {
+        "name": "manual-copy-sbuf-vector-bfloat16-float32",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-copy-sbuf-vector-float32-bfloat16": {
+      "source_sha256": "26a701f712d6fba1b7cd8a9a1f3c385b2e735dcd7a52533a3d765396bbc52ae5",
+      "neff_sha256": "9f072a1ecb417b8033d799040964a49a3d4fc400447de7ae07c61193355f4715",
+      "ntff_sha256": "682c870f8541c7c555568f3de9e3c9a5d76312a6c43ac4edb42fe5ac1c38e96b",
+      "spec": {
+        "name": "manual-copy-sbuf-vector-float32-bfloat16",
+        "mode": "copy",
+        "source_memory": "sbuf",
+        "engine": "vector",
+        "dtype": "float32",
+        "output_dtype": "bfloat16",
+        "widths": [
+          1,
+          4,
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "manual-pool": {
+      "source_sha256": "67ae605f0c973cec45b2973313961ebeed59e5ef76340d66e02690cc37b4befb",
+      "neff_sha256": "29068ad48983558af6dbb1b0ffc34e4dc573fa31ca6b7318d4a80a2561b1b7f8",
+      "ntff_sha256": "0680d4509580fcc3eebdb324190698be79e91589073efd6541583ca925c01f38",
+      "spec": {
+        "name": "manual-pool",
+        "mode": "pool",
+        "configs": [
+          [
+            9,
+            64,
+            1
+          ],
+          [
+            9,
+            512,
+            1
+          ],
+          [
+            9,
+            4094,
+            1
+          ]
+        ]
+      }
+    },
+    "manual-reduce-strided": {
+      "source_sha256": "b3183cfbf19b0d0b7e43632efc7a691bedaa76c3f3cf7775c035761198b28d66",
+      "neff_sha256": "2746862506a2135da0ca17f73b2332691d0dc6d9a236184166667044c5ff0688",
+      "ntff_sha256": "b08f4b606939e19c3fb314e4b7353df44765ca2d35567d6f3b2763c949a3d624",
+      "spec": {
+        "name": "manual-reduce-strided",
+        "function": "add",
+        "configs": [
+          [
+            2,
+            4,
+            1
+          ],
+          [
+            3,
+            4,
+            1
+          ],
+          [
+            3,
+            4,
+            2048
+          ],
+          [
+            8,
+            4,
+            1
+          ],
+          [
+            3,
+            64,
+            1
+          ],
+          [
+            3,
+            512,
+            1
+          ]
+        ]
+      }
+    },
+    "memset-u16": {
+      "source_sha256": "326d7aea9f8afe98a5f2551ce459dc951001999f81c0255cd837270d60147a02",
+      "neff_sha256": "428cc80cf976f56744da93c9c2a8fda7fc8d175630a8e261d6e4bc0dc811a264",
+      "ntff_sha256": "da99a496cb43427bfec28f475fcb1b7d617c6f8034c542c9d9c359d86fbe0ef0",
+      "spec": {
+        "name": "memset-u16",
+        "mode": "memset",
+        "dtype": "uint16",
+        "widths": [
+          1,
+          8,
+          64,
+          512
+        ]
+      }
+    },
+    "predicated-p128": {
+      "source_sha256": "d414235c5a4d1fc0bb2ac651d6bda6a49afceeb9b18a9a52b164a11e385ae81f",
+      "neff_sha256": "e4805162cbe5747e8e03f987bc4428ee7296eccdf38ffbd9d94e65daaf559729",
+      "ntff_sha256": "b495d0d40fc7972323acb4f94556e57910a447af0a79b7b9263704039752d129",
+      "spec": {
+        "name": "predicated-p128",
+        "mode": "predicated",
+        "partitions": 128,
+        "widths": [
+          64,
+          128,
+          512,
+          1024
+        ]
+      }
+    },
+    "predicated-p4": {
+      "source_sha256": "173e74e968fee9bb85729def139bc2f4fc74a07ad977d69fc044da751c25288a",
+      "neff_sha256": "0c79818055e8a3436372804992cda26c2580b3e2aa3f39a670937d0ebbd3ff98",
+      "ntff_sha256": "b8a6f19f9b97b6d80c7feb191ae13b054210fd953b71319241ac23cf9b612566",
+      "spec": {
+        "name": "predicated-p4",
+        "mode": "predicated",
+        "partitions": 4,
+        "widths": [
+          64,
+          128,
+          512,
+          1024
+        ]
+      }
+    },
+    "reciprocal-p64": {
+      "source_sha256": "02145f4967318cb3f455630bd804952229e691bc720423514c5571bcb240048c",
+      "neff_sha256": "9649abf69134d1bf94057200bc9d7e5dcd811a6460ff5e2e78e36070a69dd041",
+      "ntff_sha256": "022446bd62746375ec89e0462f4361f2c569f4500d1ebbabca2e441db2063013",
+      "spec": {
+        "name": "reciprocal-p64",
+        "mode": "reciprocal",
+        "partitions": 64,
+        "widths": [
+          1,
+          64,
+          512,
+          1024
+        ]
+      }
+    },
+    "reduce-add-bf16": {
+      "source_sha256": "e972c638ab1abb0d0d0d69064b49a6721eb447e35e976a5b86896fc5c0f3a867",
+      "neff_sha256": "ed2cc1e07e008e39fe8f494da47597e6cb5a972b83830ecc7cd4bb4cf6a979a8",
+      "ntff_sha256": "8d9695c3769bc022868de5fe2238a32f34f22423ca0d473b7773574cadf838c7",
+      "spec": {
+        "name": "reduce-add-bf16",
+        "mode": "reduce",
+        "function": "add",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          64,
+          128,
+          1024
+        ],
+        "groups": 4
+      }
+    },
+    "reduce-add-long": {
+      "source_sha256": "0c6df8577b0e799d9549ea2b5d460ffc6aa9f8d7966cc168b372bfeaf760dac1",
+      "neff_sha256": "7750bcdef862b8669cf2c695dfdbdd57d84369d91de543905636921de0d379d7",
+      "ntff_sha256": "6cfc65e6590d7e69736d9514fa57e69e7c472be4aab637ba7862f003f7341784",
+      "spec": {
+        "name": "reduce-add-long",
+        "mode": "reduce",
+        "function": "add",
+        "widths": [
+          1024,
+          4096,
+          8192
+        ]
+      }
+    },
+    "reduce-add-multi": {
+      "source_sha256": "1cc47bf8169a9e4fdc79cf794779ac237adf2ad615861c5cb719f543685f5ca0",
+      "neff_sha256": "3c426c890107e44ad57c4cf9813733f0f8318aaaec81a2f8156f6ed6e4201d9c",
+      "ntff_sha256": "88c4f857d26b1f9172a3dfd036df26909e96c016d6caed65bb85d1555308c9a4",
+      "spec": {
+        "name": "reduce-add-multi",
+        "mode": "reduce",
+        "function": "add",
+        "widths": [
+          2,
+          3,
+          4,
+          128
+        ],
+        "groups": 4
+      }
+    },
+    "reduce-add-p4": {
+      "source_sha256": "2b6d2530acab4d4b5bd02efcb37848a06980882213f42e8de73716d9fc8f05c8",
+      "neff_sha256": "414eff011a235a336ff21eeba18f815d10813a90f393d1318b26b6f7dd3f2162",
+      "ntff_sha256": "71b0034860c4ab95c080d0f6b5d24ac0bfc49687bfa2ae6b5c52c8a9e260d52e",
+      "spec": {
+        "name": "reduce-add-p4",
+        "mode": "reduce",
+        "function": "add",
+        "partitions": 4,
+        "widths": [
+          64,
+          128,
+          512
+        ],
+        "groups": 1
+      }
+    },
+    "reduce-add-scalar": {
+      "source_sha256": "79069183e305c01b5a952be7cbb56b8411f52a57b25b284aa5af67855f0d141b",
+      "neff_sha256": "92c999e6a2ee6dc1c5f9838c476cbadc0713ffb19a33f73653aff6a095eb7c8c",
+      "ntff_sha256": "0091c2fb6ec70f221b67d374acc0a0108838ca82e90d9516dc7c121244ad0808",
+      "spec": {
+        "name": "reduce-add-scalar",
+        "mode": "reduce",
+        "function": "add",
+        "widths": [
+          2,
+          3,
+          8,
+          32,
+          512
+        ],
+        "groups": 1
+      }
+    },
+    "reduce-max-bf16": {
+      "source_sha256": "3c67a9caeaa8ddaa93ea6ae89d8280aebc1e5a8736ccb7f032a4d2bf150f8a99",
+      "neff_sha256": "3f5c61cb10512bbfd0d96fa3ce8f99ded111df95a384c448946ce7326b86019a",
+      "ntff_sha256": "024944b2538a002f74ae6539b7529e684534fb43bf55e1361b4b49ee4c13c3fb",
+      "spec": {
+        "name": "reduce-max-bf16",
+        "mode": "reduce",
+        "function": "max",
+        "dtype": "bfloat16",
+        "output_dtype": "float32",
+        "widths": [
+          64,
+          128,
+          1024
+        ],
+        "groups": 4
+      }
+    },
+    "reduce-max-long": {
+      "source_sha256": "93388e867b9238c9938778352669733baa1c36582510c681ef104c84a4054dbc",
+      "neff_sha256": "bc490592e76a31ea38720a77e1988cf6a5de3baba9f1296d91c7493ba1668408",
+      "ntff_sha256": "bf04dff963fa872dfd086970da8ee7eda4937c3172b7ab813154af426bc8f4e7",
+      "spec": {
+        "name": "reduce-max-long",
+        "mode": "reduce",
+        "function": "max",
+        "widths": [
+          1024,
+          4096,
+          8192
+        ]
+      }
+    },
+    "reduce-max-multi": {
+      "source_sha256": "7009aee1427cb3afbf9defbfcc924f4a5d04031dd8d5567aebcaa8855f5c21b3",
+      "neff_sha256": "e4a48d7d19b3337f9acd0917532dc8921549a8f28e0a873ad21b928477dd0af9",
+      "ntff_sha256": "82152e5d13d8025a4af7861bcb07510574ab999223d26b5a86d76a9e576ee0eb",
+      "spec": {
+        "name": "reduce-max-multi",
+        "mode": "reduce",
+        "function": "max",
+        "widths": [
+          2,
+          3,
+          4,
+          128
+        ],
+        "groups": 4
+      }
+    },
+    "reduce-max-p4": {
+      "source_sha256": "4df0f085f06d94e79c61296caadaf8f3b59ebc8ebacb24a0b361bd44f6faa3ff",
+      "neff_sha256": "aef278a36bc8757e0d1362f4b5a1b26b14094b517b4e1ca53a2c5059f17e288e",
+      "ntff_sha256": "792b4fd128ad0f15863fd12dcbaad36f8c3a3df1816bfe2649e9b90ab6140970",
+      "spec": {
+        "name": "reduce-max-p4",
+        "mode": "reduce",
+        "function": "max",
+        "partitions": 4,
+        "widths": [
+          64,
+          128,
+          512
+        ],
+        "groups": 1
+      }
+    },
+    "reduce-max-scalar": {
+      "source_sha256": "4bdd67cbff91d006871db89f60df98f50a5ad1e797044b2478a304e8c2cd7c8b",
+      "neff_sha256": "e59013312879f22d5d19279d2750650d3955c06b01b4276d2f983559586407b0",
+      "ntff_sha256": "d6eb433e71e77d000db9a9e1bb2907f454c09f0814bb07b571eb8be9bf11ebe9",
+      "spec": {
+        "name": "reduce-max-scalar",
+        "mode": "reduce",
+        "function": "max",
+        "widths": [
+          2,
+          3,
+          8,
+          32,
+          512
+        ],
+        "groups": 1
+      }
+    },
+    "reduce-min-multi": {
+      "source_sha256": "8c3c1b17966c056fe78f8bfb5f48bafc087469c9bdf5b417603360b2dcb93814",
+      "neff_sha256": "50d8db888d07f7e77b5bbcce777e994310a34f87a7aed16f83a3aecc875f6bee",
+      "ntff_sha256": "4e82d7bbc89e2e14de312eb487e10f1bfaa01040ed50b3aaeda46bb8e02dab5c",
+      "spec": {
+        "name": "reduce-min-multi",
+        "mode": "reduce",
+        "function": "min",
+        "widths": [
+          2,
+          3,
+          4,
+          128
+        ],
+        "groups": 4
+      }
+    },
+    "reduce-min-scalar": {
+      "source_sha256": "9e354ad195f941caf25ec822e6896139b99da97c2ac3540bdf673fdf8210d7a3",
+      "neff_sha256": "5deca6c1f3a15f6c4368d4eb5001f678b0b31f07fcdb257ce8a6107a813be50b",
+      "ntff_sha256": "0535b713360e215953163b65726937c8568d57add33e472653ca789a62531461",
+      "spec": {
+        "name": "reduce-min-scalar",
+        "mode": "reduce",
+        "function": "min",
+        "widths": [
+          2,
+          3,
+          8,
+          32,
+          512
+        ],
+        "groups": 1
+      }
+    },
+    "reduce-psum-multi": {
+      "source_sha256": "b0af6180b90f8a053018e0cb505163b61486b62fbc8311f933cc4bc446885f9b",
+      "neff_sha256": "c31044d0577f11d1aa6c5edef381e72ffca4ed444c88a2817bc37455170fb1e3",
+      "ntff_sha256": "d928bc615ef17ee96ee4a53c204abc3305e1537148a6e3ce83e4211691c3fe05",
+      "spec": {
+        "name": "reduce-psum-multi",
+        "mode": "reduce",
+        "source_memory": "psum",
+        "function": "add",
+        "widths": [
+          2,
+          4,
+          16
+        ],
+        "groups": 4
+      }
+    },
+    "scan-long": {
+      "source_sha256": "badc3957bd387a6af59df932b6f1bda0db91d5c520d397697854b869d0aa33ac",
+      "neff_sha256": "cb1b3153e9c3be8e2b188e6e22dda13950f96f3a8f8f3f0d119f3f8e9d3e8d1e",
+      "ntff_sha256": "3ac6aae9f2a8c70166893a776b24622d67b8fcfa647f75ffaac2e7770ffb2937",
+      "spec": {
+        "name": "scan-long",
+        "mode": "scan",
+        "widths": [
+          4096,
+          7168,
+          8192
+        ]
+      }
+    },
+    "shuffle-bfloat16": {
+      "source_sha256": "9ab26f4c4ee0a8f32cb9bc1fedaa66a14a00389151ed2b264baf403919856964",
+      "neff_sha256": "5912b15fdbaf3a5590a8b4ea06a7f5988297ab0f94efc495e7a6556c4b5b68dc",
+      "ntff_sha256": "feedbe07770391f0ee37e7c0301465beec0d578701df40f8cea66dba0ab2afa0",
+      "spec": {
+        "name": "shuffle-bfloat16",
+        "mode": "shuffle",
+        "partitions": 32,
+        "dtype": "bfloat16",
+        "widths": [
+          64,
+          128,
+          512
+        ]
+      }
+    },
+    "shuffle-uint8": {
+      "source_sha256": "0d531702640844efeede41c6a01a988e874267b0e41b281af301821aeedb4fe8",
+      "neff_sha256": "b1d18a977adf53ee201efedfa8841f9c0a2bd4a68f0bf3352f920f2c392147a6",
+      "ntff_sha256": "d51112e6a799613fab9dc0f6a9908567b6c641f6a389e7e080f35f0aef4cf0c6",
+      "spec": {
+        "name": "shuffle-uint8",
+        "mode": "shuffle",
+        "dtype": "uint8",
+        "partitions": 32,
+        "widths": [
+          64,
+          128,
+          512
+        ]
+      }
+    }
+  },
+  "docs": [
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.affine_select.html",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.nc_stream_shuffle.html",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.tensor_reduce.html",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.tensor_tensor.html"
+  ]
+}

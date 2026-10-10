@@ -29,7 +29,7 @@ from voyager_compiler.trainium.timing import StreamTransposeTiming
 WAIT = re.compile(r"S\[(\d+)\]\s*\([^)]*\)\s*(>=|==)(\d+)")
 SET = re.compile(r"S\[(\d+)\]\s*\([^)]*\)\+\+@complete")
 TENSOR = re.compile(
-    r"\b(src\d*|dst)=(?:(\w+)@)?(0x[0-9a-f]+)\[([^]]+)\]\[([^]]+)\]"
+    r"\b(src\d*|dst|pred)=(?:(\w+)@)?(0x[0-9a-f]+)\[([^]]+)\]\[([^]]+)\]"
 )
 ENGINE = {
     "Tensor": "TensorE",
@@ -63,6 +63,18 @@ def number(text, key):
     if not match:
         raise ValueError(("missing field", key, text))
     return int(match[1], 0)
+
+
+def effective_reduction_rank(operands, source):
+    """Singleton native reduction axes do not create another reduction stage."""
+    match = re.search(r"\bdim=([XYZW]+)", operands)
+    if not match:
+        return 1
+    return (
+        max(1, sum(source[3]["XYZW".index(axis)] > 1 for axis in match[1]))
+        if source
+        else len(match[1])
+    )
 
 
 def predict(
@@ -233,9 +245,17 @@ def predict(
     last_tensor_matmul = False
     last_tensor_loads = []
     retained_stationary = 0
+    native_half_transposes = 0
+    derived_operand_models = Counter()
+    covered_setup = Counter()
     accumulator_writer = None
     accumulator_reader = None
     accumulator_edges = 0
+    mask_writer = None
+    mask_readers = []
+    register_writers = {}
+    register_readers = defaultdict(list)
+    hidden_state_edges = 0
     for uid, u in enumerate(units):
         items = u["items"]
         i = items[-1]
@@ -375,9 +395,30 @@ def predict(
             k, n = map(int, pair.groups())
             dt = DTYPE[shapes["src"][0]]
             trans = mm[0]["instruction_type"] == "TRANSPOSE"
+            native_half_transpose = False
             if trans:
                 assert len(mm) == 1
-                expansion = isa.transpose(m, n, hw, "ScalarE", dt)
+                if m > 128:
+                    # A TRANSPOSE compiler tag can denote the wide identity
+                    # matmul used by the native backend, not a legal NKI PF
+                    # transpose tile. One stationary FP32 half and two moving
+                    # halves execute two BF16-rate passes. Do not invent extra
+                    # loads or authorize this form in the NKI lowering.
+                    if not (
+                        dt == "float32"
+                        and k == n == 128
+                        and m <= 512
+                        and "fp32_mode=LOW " in ld[0]["operands"]
+                        and "fp32_mode=LOW_HIGH " in mm[0]["operands"]
+                    ):
+                        raise ValueError(
+                            "Uncharacterized wide native identity transpose"
+                        )
+                    expansion = isa.matmul(m, n, k, 16, hw, "bfloat16")
+                    native_half_transpose = True
+                    native_half_transposes += 1
+                else:
+                    expansion = isa.transpose(m, n, hw, "ScalarE", dt)
             else:
                 assert len(mm) == (2 if dt == "float32" else 1)
                 expansion = isa.matmul(
@@ -401,7 +442,11 @@ def predict(
                 )
             was_tensor_matmul = last_tensor_matmul
             last_tensor_matmul = not trans
-            service = expansion.tensor_cycles / hw.frequency
+            service = (
+                expansion.tensor_cycles
+                / hw.frequency
+                * (2 if native_half_transpose else 1)
+            )
             law_name = (
                 expansion.timing_implementation or expansion.implementation
             )
@@ -410,7 +455,7 @@ def predict(
             occ, lat = law.evaluate(service) if law else (service, None)
             if expansion.timing_override is not None:
                 occ, lat, _ = expansion.timing_override
-            if context_model:
+            if context_model and not native_half_transpose:
                 from .calibrated_isa import evaluate
 
                 if op in ("MATMUL", "LDWEIGHTS"):
@@ -443,15 +488,31 @@ def predict(
                             streaming=was_tensor_matmul,
                         )
                 else:
-                    src = fs.get("src")
-                    fun = re.search(r"\b(EXP|SIGMOID|RSQRT)\b", i["operands"])
-                    reduction = re.search(r"\bop=(ADD|MAX)\b", i["operands"])
+                    src = fs.get("src") or fs.get("src0")
+                    fun = re.search(
+                        r"\b(EXP|SIGMOID|RSQRT|RECIPROCAL_SQRT|SQRT|SQUARE|LN|SILU|COPY|IDENTITY)\b",
+                        i["operands"],
+                    )
+                    reduction = re.search(
+                        r"\bop=(ADD|MAX|MIN)\b", i["operands"]
+                    )
+                    binary = re.search(
+                        r"\bop=(ADD|SUBTRACT|MULTIPLY)\b", i["operands"]
+                    )
+                    pool = (
+                        re.search(r"\b(AVERAGE|MAX|MIN)\b", i["operands"])
+                        if op == "POOL"
+                        else None
+                    )
                     descriptor = dict(
                         opcode={
                             "COPY": "tensor_copy",
                             "ACTIVATE": "activation",
                             "RECIPROCAL": "reciprocal",
                             "TENSOR_REDUCE": "tensor_reduce",
+                            "TENSOR_TENSOR": "tensor_tensor",
+                            "POOL": "tensor_reduce",
+                            "MEMSET": "memset",
                         }.get(op, op),
                         engine=eng,
                         dtype=dt,
@@ -478,12 +539,51 @@ def predict(
                             if all(x == 1 for x in dst[3][1:])
                             else None
                         ),
+                        destination_memory=(
+                            "PSUM" if dst[1] >= 0x2000000 else "SBUF"
+                        ),
+                        source_shape=src[3] if src else (),
+                        source_strides=src[2] if src else (),
+                        reduction_rank=effective_reduction_rank(
+                            i["operands"], src
+                        ),
+                        destination_shape=dst[3],
+                        destination_strides=dst[2],
+                        broadcast_reads=sum(
+                            bool(re.search(pattern, i["operands"]))
+                            for pattern in (
+                                r"\bscale=\[",
+                                r"\b(?:bias_ptr=|imm=\[)",
+                            )
+                        ),
                         transpose=False,
                         function=(
                             fun[1].lower()
                             if fun
-                            else (reduction[1].lower() if reduction else "")
+                            else (
+                                reduction[1].lower()
+                                if reduction
+                                else (
+                                    binary[1].lower()
+                                    if binary
+                                    else (
+                                        "add"
+                                        if pool and pool[1] == "AVERAGE"
+                                        else pool[1].lower() if pool else ""
+                                    )
+                                )
+                            )
                         ),
+                    )
+                if op == "TENSOR_TENSOR":
+                    other = fs["src1"]
+                    descriptor.update(
+                        source1_dtype=DTYPE.get(other[0], other[0]),
+                        source1_memory=(
+                            "PSUM" if other[1] >= 0x2000000 else "SBUF"
+                        ),
+                        source1_shape=other[3],
+                        source1_strides=other[2],
                     )
                 timing_descriptors[f"u{uid}_{op}"] = descriptor
                 override = evaluate(descriptor, occ, lat, None)
@@ -492,6 +592,13 @@ def predict(
                     if missing.get(law_name, 0):
                         missing[law_name] -= 1
                     selected_law_counts["context:" + descriptor["opcode"]] += 1
+                    from .operand_timing import key, parameters
+
+                    operand_model = parameters()["models"].get(
+                        key(descriptor), {}
+                    )
+                    if operand_model.get("derived_from"):
+                        derived_operand_models[key(descriptor)] += 1
             first = end = issue_node = add(
                 f"u{uid}_{op}", eng, occ, occ, lat, law_name
             )
@@ -510,6 +617,17 @@ def predict(
                 native_cost.implementation,
             )
             mapped[native_cost.implementation] += 1
+        elif op == "LOAD_MASK_SELECT":
+            native_cost = native_timing(op, eng, {}, i["operands"], hw)
+            first = end = issue_node = add(
+                f"u{uid}_{op}",
+                eng,
+                native_cost.issue_ns,
+                native_cost.issue_ns,
+                native_cost.completion_ns,
+                native_cost.implementation,
+            )
+            mapped[native_cost.implementation] += 1
         elif op in ("EVENT_SEMAPHORE", "NOP", "ACT_TABLE_LOAD", "WRITE"):
             # No new per-kernel coefficient: existing fixed_kernel_ns covers
             # common setup. Semaphore waits remain graph edges.
@@ -517,7 +635,10 @@ def predict(
                 raise ValueError(("unhandled write", i))
             first = end = issue_node = add(f"u{uid}_{op}", f"Control.{eng}")
             if op == "ACT_TABLE_LOAD":
-                missing["ACT_TABLE_LOAD (existing fixed setup only)"] += 1
+                # One common table load is already included in the fixed
+                # startup budget. Keep that accounting explicit, rather than
+                # tagging it as a missing result-completion law.
+                covered_setup["ACT_TABLE_LOAD"] += 1
         else:
             if op not in (
                 "COPY",
@@ -531,6 +652,9 @@ def predict(
                 "STREAM_TRANSPOSE",
                 "TENSOR_TENSOR_SCAN",
                 "ACTIVATION_READ_ACCUMULATOR",
+                "TENSOR_SCALAR_AFFINE_SELECT",
+                "COPY_PREDICATED_SCALAR",
+                "STREAM_SHUFFLE",
             ):
                 raise ValueError(("unsupported compiled opcode", op, eng))
             fs = fields(i["operands"])
@@ -626,15 +750,31 @@ def predict(
                             streaming=was_tensor_matmul,
                         )
                 else:
-                    src = fs.get("src")
-                    fun = re.search(r"\b(EXP|SIGMOID|RSQRT)\b", i["operands"])
-                    reduction = re.search(r"\bop=(ADD|MAX)\b", i["operands"])
+                    src = fs.get("src") or fs.get("src0")
+                    fun = re.search(
+                        r"\b(EXP|SIGMOID|RSQRT|RECIPROCAL_SQRT|SQRT|SQUARE|LN|SILU|COPY|IDENTITY)\b",
+                        i["operands"],
+                    )
+                    reduction = re.search(
+                        r"\bop=(ADD|MAX|MIN)\b", i["operands"]
+                    )
+                    binary = re.search(
+                        r"\bop=(ADD|SUBTRACT|MULTIPLY)\b", i["operands"]
+                    )
+                    pool = (
+                        re.search(r"\b(AVERAGE|MAX|MIN)\b", i["operands"])
+                        if op == "POOL"
+                        else None
+                    )
                     descriptor = dict(
                         opcode={
                             "COPY": "tensor_copy",
                             "ACTIVATE": "activation",
                             "RECIPROCAL": "reciprocal",
                             "TENSOR_REDUCE": "tensor_reduce",
+                            "TENSOR_TENSOR": "tensor_tensor",
+                            "POOL": "tensor_reduce",
+                            "MEMSET": "memset",
                         }.get(op, op),
                         engine=eng,
                         dtype=dt,
@@ -661,12 +801,51 @@ def predict(
                             if all(x == 1 for x in dst[3][1:])
                             else None
                         ),
+                        destination_memory=(
+                            "PSUM" if dst[1] >= 0x2000000 else "SBUF"
+                        ),
+                        source_shape=src[3] if src else (),
+                        source_strides=src[2] if src else (),
+                        reduction_rank=effective_reduction_rank(
+                            i["operands"], src
+                        ),
+                        destination_shape=dst[3],
+                        destination_strides=dst[2],
+                        broadcast_reads=sum(
+                            bool(re.search(pattern, i["operands"]))
+                            for pattern in (
+                                r"\bscale=\[",
+                                r"\b(?:bias_ptr=|imm=\[)",
+                            )
+                        ),
                         transpose=False,
                         function=(
                             fun[1].lower()
                             if fun
-                            else (reduction[1].lower() if reduction else "")
+                            else (
+                                reduction[1].lower()
+                                if reduction
+                                else (
+                                    binary[1].lower()
+                                    if binary
+                                    else (
+                                        "add"
+                                        if pool and pool[1] == "AVERAGE"
+                                        else pool[1].lower() if pool else ""
+                                    )
+                                )
+                            )
                         ),
+                    )
+                if op == "TENSOR_TENSOR":
+                    other = fs["src1"]
+                    descriptor.update(
+                        source1_dtype=DTYPE.get(other[0], other[0]),
+                        source1_memory=(
+                            "PSUM" if other[1] >= 0x2000000 else "SBUF"
+                        ),
+                        source1_shape=other[3],
+                        source1_strides=other[2],
                     )
                 timing_descriptors[f"u{uid}_{op}"] = descriptor
                 override = evaluate(descriptor, occ, lat, None)
@@ -675,6 +854,13 @@ def predict(
                     if missing.get(law_name, 0):
                         missing[law_name] -= 1
                     selected_law_counts["context:" + descriptor["opcode"]] += 1
+                    from .operand_timing import key, parameters
+
+                    operand_model = parameters()["models"].get(
+                        key(descriptor), {}
+                    )
+                    if operand_model.get("derived_from"):
+                        derived_operand_models[key(descriptor)] += 1
             first = end = issue_node = add(
                 f"u{uid}_{op}",
                 eng,
@@ -687,6 +873,40 @@ def predict(
             )
             mapped[law_name] += 1
         assert first is not None
+        if op == "LOAD_MASK_SELECT":
+            if mask_writer is not None:
+                deps[first].add((mask_writer, "result"))
+                hidden_state_edges += 1
+            for reader in mask_readers:
+                deps[first].add((reader, "read"))
+                hidden_state_edges += 1
+            mask_readers = []
+            mask_writer = end
+        elif op == "STREAM_SHUFFLE":
+            if mask_writer is None:
+                raise ValueError("Stream shuffle has no mask producer")
+            deps[first].add((mask_writer, "result"))
+            hidden_state_edges += 1
+            mask_readers.append(end)
+        write_reg = (
+            re.search(r"\$R\[(\d+)\]=", i["operands"]) if op == "MOVE" else None
+        )
+        for reg in set(map(int, re.findall(r"\$R\[(\d+)\]", i["operands"]))):
+            if write_reg and reg == int(write_reg[1]):
+                if reg in register_writers:
+                    deps[first].add((register_writers[reg], "result"))
+                    hidden_state_edges += 1
+                for reader in register_readers[reg]:
+                    deps[first].add((reader, "read"))
+                    hidden_state_edges += 1
+                register_readers[reg] = []
+                register_writers[reg] = end
+            else:
+                if reg not in register_writers:
+                    raise ValueError("Register read has no modeled producer")
+                deps[first].add((register_writers[reg], "result"))
+                hidden_state_edges += 1
+                register_readers[reg].append(end)
         # These registers are not SBUF/PSUM tensors. Their dependencies remain
         # necessary even when engine issue-order preservation is disabled.
         if eng == "ScalarE" and op == "ACTIVATION_READ_ACCUMULATOR":
@@ -837,7 +1057,15 @@ def predict(
         "status": (
             "partial_unsupported_opcodes"
             if unsupported
-            else "mapped_with_incomplete_completion_laws"
+            else (
+                (
+                    "modeled_with_analytical_domains"
+                    if native_half_transposes or derived_operand_models
+                    else "modeled"
+                )
+                if not result.unknown_latency
+                else "mapped_with_incomplete_completion_laws"
+            )
         ),
         "timing_profile": hw.timing_profile.name,
         "missing_laws": dict(missing),
@@ -849,7 +1077,18 @@ def predict(
         "native_cast_alias_count": cast_count,
         "fragmented_dma_descriptors": fragmented_dma,
         "retained_stationary_matmuls": retained_stationary,
+        "native_half_transpose_groups": native_half_transposes,
+        "analytical_assumptions": (
+            [
+                "Wide FP32 LOW/LOW_HIGH identity matmul uses two BF16-rate passes; not independently characterized."
+            ]
+            if native_half_transposes
+            else []
+        ),
+        "derived_operand_models": dict(derived_operand_models),
+        "covered_setup_instructions": dict(covered_setup),
         "accumulator_state_dependencies": accumulator_edges,
+        "hidden_mask_register_dependencies": hidden_state_edges,
         "deduplicated_runtime_writes": deduplicated,
         "tensor_groups": dict(group_audit),
         "mapped_operations": dict(mapped),
@@ -868,8 +1107,41 @@ def main():
         "input", type=Path, help="Timing-free compiled_static.json"
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--context-model",
+        action="store_true",
+        help="Enable operand-aware characterization",
+    )
+    parser.add_argument(
+        "--execution-model",
+        choices=("baseline", "context-ready"),
+        default="baseline",
+        help="Apply static ordering/readiness policy after native ISA mapping",
+    )
     args = parser.parse_args()
-    result, _ = predict(json.loads(args.input.read_text()))
+    import gzip
+
+    opener = gzip.open if args.input.suffix == ".gz" else open
+    with opener(args.input, "rt") as stream:
+        result, graph = predict(
+            json.load(stream), context_model=args.context_model
+        )
+    if args.execution_model != "baseline":
+        from .physical_context import transform
+
+        graph, audit = transform(graph, args.execution_model)
+        estimate = evaluate_graph(graph)
+        result[
+            (
+                "partial_modeled_us"
+                if result["unsupported_instructions"]
+                else "prediction_us"
+            )
+        ] = (
+            estimate.duration_ns + neuron_core(3).timing_profile.fixed_kernel_ns
+        ) / 1000
+        result["execution_model"] = args.execution_model
+        result["ordering_audit"] = audit
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

@@ -39,7 +39,9 @@ def test_short_k_changes_timing_not_instruction_expansion():
 
 def test_candidate_and_selected_plan_both_consume_short_k_law():
     hw = neuron_core(3)
-    graph, _ = compute_graph(hw, 512, 128, 64, 32, True, TrainiumTuning(matmul_orientation="weights"))
+    graph, _ = compute_graph(
+        hw, 512, 128, 64, 32, True, TrainiumTuning(matmul_orientation="weights")
+    )
     mm = [n for n in graph.nodes if n.implementation == "nki.matmul.float32"]
     assert len(mm) == 1
     assert (mm[0].occupancy_ns, mm[0].latency_ns) == (1707, 2765)
@@ -162,7 +164,7 @@ def test_profile_timing_cannot_enter_prediction(data):
 
 def test_unknown_opcode_and_unresolved_dependencies_fail():
     with pytest.raises(ValueError, match="unsupported compiled opcode"):
-        predict({"instructions": [stream(0) | {"opcode": "LOAD_MASK_SELECT"}]})
+        predict({"instructions": [stream(0) | {"opcode": "UNKNOWN_OPCODE"}]})
     ins = stream(0)
     ins["operands"] += " S[99](unknown)>=1"
     with pytest.raises(ValueError, match="unresolved semaphore"):

@@ -321,6 +321,21 @@ def analyze_selected(
                 free=free,
                 source_free=math.prod(data.shape[1:]) if data else 0,
                 source_memory=data.memory if data else None,
+                destination_memory=dst.memory,
+                reduction_rank=(
+                    max(1, sum(data.shape[a] > 1 for a in kw["axis"]))
+                    if data and isinstance(kw.get("axis"), (tuple, list))
+                    else 1
+                ),
+                # The pinned native compiler emits a bias/constant pointer
+                # even for an activation with no explicit NKI bias operand.
+                broadcast_reads=(
+                    (1 + isinstance(kw.get("scale"), Tensor))
+                    if opcode == "activation"
+                    else sum(
+                        isinstance(kw.get(k), Tensor) for k in ("scale", "bias")
+                    )
+                ),
                 source_dtype=data.dtype if data else None,
                 source_stride=None,
                 destination_stride=None,
@@ -338,7 +353,26 @@ def analyze_selected(
                 transpose=opcode == "nc_transpose"
                 or bool(kw.get("is_transpose")),
             )
-            if opcode in ("tensor_copy", "nc_transpose", "nc_matmul"):
+            if opcode == "tensor_tensor":
+                other = args[1]
+                desc.update(
+                    source1_dtype=other.dtype,
+                    source1_memory=other.memory,
+                    source1_stride=(
+                        stride(ins.args[1]) if other.memory == "SBUF" else None
+                    ),
+                )
+                if not desc["function"] and len(args) > 2:
+                    desc["function"] = str(args[2])
+            if opcode in (
+                "tensor_copy",
+                "nc_transpose",
+                "nc_matmul",
+                "activation",
+                "tensor_tensor",
+                "reciprocal",
+                "memset",
+            ):
                 expressions = (*ins.args, *(v for _, v in ins.kwargs))
                 values = (*args, *kw.values())
                 source_expr = next(
