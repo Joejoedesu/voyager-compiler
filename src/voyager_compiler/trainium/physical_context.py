@@ -1,7 +1,8 @@
 """Experimental, static-only physical ISA ordering and readiness models.
 
 No native compilation or runtime observations enter candidate scoring. Engine
-order is source order, not a promise of the native scheduler's chosen order.
+order is source order except in scheduled-ready, which predicts a static order.
+Neither policy promises the native scheduler's chosen order.
 Prefix completion represents cumulative semaphore readiness. Launch gates are
 an explicitly separate hypothesis, inherited from earlier calibration cases.
 """
@@ -15,6 +16,7 @@ from voyager_compiler.codegen.transform.tiling.execution import (
 )
 
 MODES = (
+    "scheduled-ready",
     "baseline",
     "ordered",
     "prefix",
@@ -38,8 +40,14 @@ READY_NS = {
 }
 
 
-def transform(graph, mode):
-    if mode not in MODES:
+def transform(graph, mode, *, reorder_window=16):
+    if mode == "scheduled-ready":
+        from .issue_schedule import schedule
+
+        scheduled, audit = schedule(graph, window=reorder_window)
+        result, counts = transform(scheduled, "context-ready")
+        return result, {**counts, **audit}
+    if mode not in MODES and mode != "_readiness-only":
         raise ValueError("Unknown physical model: " + mode)
     if mode in ("baseline", "primitives", "pipeline", "pipeline-startup"):
         return graph, {}
@@ -56,6 +64,7 @@ def transform(graph, mode):
         "pipeline-startup-ready",
     )
     use_gates = mode in (
+        "_readiness-only",
         "prefix-ready",
         "context-ready",
         "pipeline-ready",
@@ -90,7 +99,7 @@ def transform(graph, mode):
             if cross_engine and d.milestone == "result":
                 cross.append(dep)
         prior = history.setdefault(n.resource, [])
-        if len(prior) >= horizon:
+        if mode != "_readiness-only" and len(prior) >= horizon:
             dependencies.append(Dependency(prior[-horizon], milestone="issue"))
             counts["issue_order_edges"] += 1
         if use_gates and cross:
@@ -148,7 +157,7 @@ def transform(graph, mode):
     return RepeatedGraph(tuple(nodes)), dict(counts)
 
 
-def identity(mode):
+def identity(mode, *, reorder_window=16):
     """Persist hypotheses and model contents with every score/cache identity."""
     import hashlib
     from pathlib import Path
@@ -160,6 +169,7 @@ def identity(mode):
         module_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     )
     if mode in (
+        "scheduled-ready",
         "primitives",
         "context",
         "context-ready",
@@ -175,6 +185,8 @@ def identity(mode):
             (base / "calibrated_isa.py").read_bytes()
         ).hexdigest()
     if mode in (
+        "scheduled-ready",
+        "_readiness-only",
         "prefix-ready",
         "context-ready",
         "pipeline-ready",
@@ -184,4 +196,13 @@ def identity(mode):
         record["readiness_evidence"] = (
             "Frozen earlier four fused-kernel admission/handoff study; transferability hypothesis, not universal hardware constants."
         )
+    if mode == "scheduled-ready":
+        record["order_scope"] = (
+            "static dependency-ready schedule; native order not used"
+        )
+        record["reorder_window"] = reorder_window
+        for name in ("region_dependencies.py", "issue_schedule.py"):
+            record[name + "_sha256"] = hashlib.sha256(
+                (base / name).read_bytes()
+            ).hexdigest()
     return record

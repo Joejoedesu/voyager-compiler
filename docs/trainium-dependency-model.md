@@ -3,6 +3,61 @@
 The current [ISA mapping and measured timing inventory](trainium-isa-model.md)
 includes the integrated stream-transpose and short-K FP32 laws.
 
+## Dependency-aware physical scoring (2026-10-10)
+
+The opt-in `scheduled-ready` model scores the fully expanded selected ISA with
+slice hazards and a predicted compiler issue order. Enable it through the target
+policy:
+
+```python
+from voyager_compiler.trainium.execution import TrainiumTuning
+
+# Pass this tuning object to TrainiumMappingPolicy for compilation/search.
+tuning = TrainiumTuning(physical_model="scheduled-ready", reorder_window=16)
+```
+
+`program_analysis.analyze_selected(..., execution_model="scheduled-ready",
+reorder_window=16)` also supports analysis of an existing selected program.
+Expanded region search uses this same analysis to score candidates and retains
+its model identity in the selected plan. The default physical model is unchanged.
+
+The analysis has two additional steps:
+
+1. `trainium/region_dependencies.py` reconstructs read-after-write,
+   write-after-read and write-after-write hazards using root-relative tensor
+   coordinates. Strided disjoint slices no longer depend on the unrelated last
+   writer of their entire buffer. Only fully covered accesses can be retired;
+   partial writes retain hazards on untouched elements. Unknown views and views
+   above the coordinate limit conservatively overlap the whole root. Affine
+   Cartesian views use a fast path; general small views use explicit coordinates.
+   Physical allocation reuse edges and dependencies beyond the Builder's logical
+   whole-root edges remain required.
+2. `trainium/issue_schedule.py` chooses a dependency-ready static order with a
+   bounded source lookahead per engine. Existing operand handoff laws participate
+   in this choice. The final order is scored with the existing per-engine issue,
+   cumulative completion and readiness laws. The lookahead is compiler modeling
+   policy, not a measured hardware queue capacity. It is recorded in the model
+   identity together with hashes of both mechanisms.
+
+These steps operate on an analysis copy. They do not alter emitted source,
+physical addresses, or the selected buffer layout, and do not invoke the native
+compiler or read NEFF/profile data during search. They predict the reorder that
+native compilation may perform; they do not enforce an identical native order.
+Primitive timing coefficients remain unchanged. Geometry/context classification
+currently precedes predicted reordering, so history-sensitive primitive laws are
+still an approximation. The version-1 dependency record does not distinguish an
+explicit scheduling edge identical to a Builder root edge; such custom ordering
+constraints need separate provenance before this refinement can support them.
+
+A whole-kernel `ncc.no_reorder()` guard is a separate hardware diagnostic. It
+changes native scheduling constraints and must be evaluated as a distinct binary;
+its performance is not the expected result of enabling `scheduled-ready`.
+The model remains experimental: guarded native replay still has unexplained
+latency, and validation on retained selected streams is not a full search-ranking
+or ISA timing-coverage validation.
+
+## Historical baseline
+
 The text below records the 10-05 baseline. See
 [the 10-06 selected-plan implementation](trainium-selected-plan.md) for the
 formal converter, physical allocation, row reductions, pool and new evidence.
@@ -245,3 +300,53 @@ remain explicit. Their measured slopes must agree within 1%, and the final
 window check within 0.2%. Otherwise the ordinary periodic-window path applies.
 Full-problem resource counts are unchanged; this remains an approximation whose
 selected matrix result is checked by finite replay.
+
+
+## Native scan, register move, and accumulator readback
+
+The compiled-ISA analyzer also consumes `native_timing.py` and the packaged
+`native_characterization.json`. This extends analysis of existing NEFF instruction
+streams; it does not add NKI lowering or a new search candidate family.
+
+- `TENSOR_TENSOR_SCAN` uses the documented `max(64, 2N)` VectorE cycles,
+  a measured pipeline drain, and an additional operand-read cost when its initial
+  value comes from SBUF instead of an immediate zero. Completion characterization
+  is bounded to contiguous FP32 multiply/add, 128 partitions, and free widths
+  64–2048. Other shapes retain analytical service and unknown completion.
+- `ACTIVATION_READ_ACCUMULATOR` has separate issue and output-completion costs.
+  A reduction-producing activation supplies an internal forwarding milestone;
+  readback waits for it, and a subsequent activation waits until readback releases
+  the hidden state. These RAW/WAR dependencies survive disabling engine ordering.
+  Continuation requires a recognized producer; an ordinary activation invalidates
+  the tracked reduction state. The calibrated producer is FP32-source EXP+sum,
+  with explicit shape bounds; unsupported producers keep their existing partial
+  timing. No extra full reduction is charged on top of readback.
+- GpSimd `MOVE` currently covers a scalar `uint32` immediate-to-register move.
+  Its measured cost is deliberately separate from tensor-copy throughput.
+  Other move forms are rejected rather than assigned the same cost.
+
+Calibration contains per-probe source/binary/trace hashes and documented versus
+measured quantities. Twelve isolated hardware probes check scan width, seed
+kind, and reduction/readback; full-kernel runtime is not a fitting target. The
+32-partition probes are coverage checks, not permission to extrapolate the
+128-partition completion laws. Runtime durations remain forbidden prediction
+inputs. Unknown completion laws remain visible in analysis results.
+
+Native `CAST` and long dtype spellings are normalized inside the production
+adapter. A load-elided matmul consumes the preceding TensorE stationary operand
+without duplicating its load or semaphore notifications. Existing paired-matmul
+service laws remain unchanged; this does not claim a new independently timed
+LDWEIGHTS pipeline model.
+
+A packed static DMA descriptor can repeat a partition: four 1 KiB fragments on
+three partitions are not four thirds of a KiB per partition. For descriptors
+that fail the old equal-partition byte accounting, `native_dma.py` validates the
+supported contiguous-byte block form, preserves the exact bytes, and uses the
+busiest eight-partition DMA-engine group. The descriptor still contributes one
+request. Other descriptor forms fail explicitly. Existing uniform-panel rules
+are unchanged.
+
+Unit coverage: `test/test_trainium_native_ops.py`. Characterization data is
+packaged with the compiler; external experiment scripts and result reports are
+not required to use these laws. Remaining affine-select, predicated-copy,
+mask/shuffle, and wide native transpose forms are not covered by this extension.

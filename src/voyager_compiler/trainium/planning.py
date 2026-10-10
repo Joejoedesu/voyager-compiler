@@ -2655,6 +2655,7 @@ def select_plan(
                     program,
                     context.hardware,
                     execution_model=context.policy.tuning.physical_model,
+                    reorder_window=context.policy.tuning.reorder_window,
                 )["prediction_ns"],
             ),
             requests=converter.movement_selector.requests,
@@ -2709,6 +2710,7 @@ def select_plan(
         program,
         context.hardware,
         execution_model=context.policy.tuning.physical_model,
+        reorder_window=context.policy.tuning.reorder_window,
     )
     program_analysis["selected_instruction_analysis"] = selected_analysis
     program_analysis["template_prediction_ns"] = program_analysis[

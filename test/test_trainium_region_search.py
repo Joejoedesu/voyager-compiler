@@ -1,5 +1,6 @@
 """Expanded selection: actual realization, prediction-only ranking and coverage."""
 import json
+from dataclasses import replace
 import math
 import pytest
 import torch
@@ -39,13 +40,15 @@ def test_physical_score_controls_winner_and_failed_candidates_cannot_win():
 
 
 @pytest.mark.parametrize("name", ["bmm", "swiglu"])
-def test_end_to_end_winner_is_the_scored_physical_program(tmp_path, name):
+@pytest.mark.parametrize("physical_model", ["baseline", "scheduled-ready"])
+def test_end_to_end_winner_is_the_scored_physical_program(tmp_path, name, physical_model):
     torch.manual_seed(48)
     module = BMM() if name == "bmm" else Chain()
     shapes = ((2, 128, 64), (2, 64, 256)) if name == "bmm" else (
         (128, 64), (64, 128), (64, 128), (128, 64))
     args = tuple(torch.randn(*s)*0.1 for s in shapes)
     graph, context = prepare(module, args)
+    context.policy.tuning = replace(context.policy.tuning, physical_model=physical_model, reorder_window=4)
     before = context.record()
     vc.compile(graph, args, context=context, output_dir=tmp_path,
                dump_tensors=False, bufferization_options=BufferizationOptions(

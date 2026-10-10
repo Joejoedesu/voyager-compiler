@@ -1,0 +1,194 @@
+{
+  "schema": 1,
+  "target": "Trainium2 / NeuronCore-v3",
+  "compiler": "neuronx-cc 2.22.12471.0+b4a00d10",
+  "calibration_date": "2026-10-10",
+  "units": "ns unless explicitly cycles",
+  "scope": "Isolated opcode measurements; no whole-kernel latency fitting. No additional throttling factor. Only the listed input/geometry domains receive completion laws.",
+  "models": {
+    "scan": {
+      "minimum_cycles": 64,
+      "cycles_per_element": 2,
+      "partitions": [
+        128
+      ],
+      "min_width": 64,
+      "max_width": 2048,
+      "drain_ns": 157.66666666666657,
+      "tensor_seed_read_ns": 60.0,
+      "evidence": "16 independent multiply/add scans per probe. Constant zero seed versus SBUF tensor seed. Documented VectorE service; completion drain measured at widths 64,256,1024,2048. Tensor seed tested at 256,1024. 32-partition probe is a coverage boundary, not extrapolated."
+    },
+    "activation_accumulator": {
+      "partitions": [
+        128
+      ],
+      "min_width": 64,
+      "max_width": 2048,
+      "read_issue_ns": 185.0,
+      "read_completion_ns": 279.0,
+      "producer_completion_tail_ns": 294.49999999999994,
+      "producer_forward_tail_ns": 200.66666666666663,
+      "evidence": "16 EXP+sum/readback pairs at widths 64,256,1024,2048. Producer forwarding is the observed readback issue offset; readback issue bound uses the minimum gap to the next activation, excluding stalled samples. Full-kernel validation is separate. BF16 output shares the FP32-source path; checked against retained CSA, not fitted."
+    },
+    "move_uint32_immediate": {
+      "issue_ns": 68,
+      "completion_ns": 68,
+      "evidence": "Single scalar uint32 immediate register MOVE: 68 ns in CSA-2048. Held-out MHA MOVE also 68 ns. No GpSimd tensor-throughput claim; issue conservatively equals completion."
+    }
+  },
+  "sources": [
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.tensor_tensor_scan.html",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/api/generated/nki.isa.activation_reduce.html"
+  ],
+  "microprobes": [
+    {
+      "probe": "reduce-p128-w1024",
+      "correct": true,
+      "source_sha256": "2cfb76d4b9a02494758ce3e6c87f377de02bb2f920198eb37bd7fb295d2df5e9",
+      "neff_sha256": "8e17bd19353ec14da2dca30308de1bcba1cf8eaee7ce8dc0a39d02a821925a45",
+      "ntff_sha256": "cf0b7ce09cb63bed3a7d82989a6b6aeaa4ed5b8e097fb6c22986089a1e97859b",
+      "median_duration_ns": {
+        "ACTIVATE": 1148.0,
+        "ACTIVATION_READ_ACCUMULATOR": 279.0
+      }
+    },
+    {
+      "probe": "reduce-p128-w2048",
+      "correct": true,
+      "source_sha256": "b68a940a932e1e3c85d287da1e6e24ef0f7212d8274fdc0c46f28e145ad2b583",
+      "neff_sha256": "2ca28ad6de9ee02213adc13cffdf115fb772cdb25cda969cd37d8675781d7888",
+      "ntff_sha256": "4b270eab17bce124cbb2673e4dd49ac8659635faed89a0ce4f62c45d05a308f9",
+      "median_duration_ns": {
+        "ACTIVATE": 2001.0,
+        "ACTIVATION_READ_ACCUMULATOR": 279.0
+      }
+    },
+    {
+      "probe": "reduce-p128-w256",
+      "correct": true,
+      "source_sha256": "fdee4cfd6c094d9372342dfd33dffdd77e8f584907f1b7df161e8b76f544e543",
+      "neff_sha256": "c5ec9e17812d17c5ae77a34f6907be1dbed95117824473ec8b08fb6a95a5786f",
+      "ntff_sha256": "227592376ccef38a36c07f65a2a074ad66a1574b5704b92740febb5881868f2e",
+      "median_duration_ns": {
+        "ACTIVATE": 491.0,
+        "ACTIVATION_READ_ACCUMULATOR": 278.0
+      }
+    },
+    {
+      "probe": "reduce-p128-w64",
+      "correct": true,
+      "source_sha256": "fdb1e6510a711bc2eb3ff5e8e4c366c969bda485315991ec60cff0170c816d6e",
+      "neff_sha256": "55ab473a9ce5c4948995650a6872d1be6ef3e9cc49bee16e890f6f0dacc86c8c",
+      "ntff_sha256": "7d5fd9e3675a064aa5e0c9e937c640be955d8810d5b1c33d47f2b8e80cf86adc",
+      "median_duration_ns": {
+        "ACTIVATE": 348.0,
+        "ACTIVATION_READ_ACCUMULATOR": 279.0
+      }
+    },
+    {
+      "probe": "reduce-p32-w256",
+      "correct": true,
+      "source_sha256": "ced6bfd5a17e5bfb5bfef7b0767da1b00baec86c31c12ffb37003356fd3b59d8",
+      "neff_sha256": "a4185d77b4e6e43b6b52e2768a22c78780c21d223fbc0a8b2fbb3dfdaaea2ad3",
+      "ntff_sha256": "8bf1e6dffec5ae79ba29005fef06929874968719dc6db3f7b8bbc57bc231f939",
+      "median_duration_ns": {
+        "ACTIVATE": 504.0,
+        "ACTIVATION_READ_ACCUMULATOR": 290.0
+      }
+    },
+    {
+      "probe": "scan-p128-w1024",
+      "correct": true,
+      "source_sha256": "9141aa72ec0445834463cbd38dc51710cab243d18a0c2fd69761969058b2b8c3",
+      "neff_sha256": "cc596d9fe588b998c50edce6af6f20c1ca4c666505e4a9ca001e0192cc616cf4",
+      "ntff_sha256": "52c35c6c654dc025b28b736766ad00f19bd881f47c3e30871d021dc15640450e",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 2291.0
+      }
+    },
+    {
+      "probe": "scan-p128-w2048",
+      "correct": true,
+      "source_sha256": "e16c8d5d0e4134094592ac677470d0d183435f45e447f1edaa3ac3f38984ac64",
+      "neff_sha256": "b352c2ab7ccfe51757e7b8874f273141f6609b4accd9c09687c28feaacb1ecec",
+      "ntff_sha256": "4e4352a9919f18f09c801b9234792b227997effc54c3741ffa2df0ed5dea3545",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 4424.0
+      }
+    },
+    {
+      "probe": "scan-p128-w256",
+      "correct": true,
+      "source_sha256": "bcbc0e80f3ee909b52165fa8596349c86a0889cb0e81b269e74c88e93f1e2f18",
+      "neff_sha256": "d6ebb3bc283ba935607457f8e26336690dcda5973a2822e2263dd91d374acbb7",
+      "ntff_sha256": "1ad6589eb44c0cfa108366ef7649dea5112d7e9c325c305ee6936486960af7b3",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 691.0
+      }
+    },
+    {
+      "probe": "scan-p128-w64",
+      "correct": true,
+      "source_sha256": "58d8f5029cd64c0849f278922d0238ab3c726949157019fd8233ea529133d67a",
+      "neff_sha256": "0d83dc85a8730a85c373e524c6057ac06150f9fc4b0e2d0e7793c57ed10c12a8",
+      "ntff_sha256": "b063c167571c7eefe298958807df2b2906311359dd646432355163d236d83096",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 291.0
+      }
+    },
+    {
+      "probe": "scan-p32-w256",
+      "correct": true,
+      "source_sha256": "7391fd5c426e2318faebf5819028a2f75c22c37c00144766d5ef3625f740845c",
+      "neff_sha256": "e8ad0e8587ad9e3dc161c711e17993ebd0ffd7bdafc512c9f1b49b529f41a242",
+      "ntff_sha256": "c98e4210864d4e176392bf36825aa5bcabee820d4d505af3c204475f1b028143",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 680.0
+      }
+    },
+    {
+      "probe": "scan_tensor-p128-w1024",
+      "correct": true,
+      "source_sha256": "b219389f68dbd308cb5b3b3fe2564a053a08f1093d3d4cbe68bdd49d7a53c80a",
+      "neff_sha256": "ea1bcdfdf584fbda1d3ceb52b8d3f30de027ea54747a2a8ea2bb82491b452f5b",
+      "ntff_sha256": "cc51c611da15904f476a8b2cf1b59acf9b23ec691fc9354bb5df3448f0ab6d68",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 2351.0
+      }
+    },
+    {
+      "probe": "scan_tensor-p128-w256",
+      "correct": true,
+      "source_sha256": "e2e4257ebce62c21f043e8ec8371a0791a65dfeeab35e08fb9b5140c565182a4",
+      "neff_sha256": "ed1cbb655b042b52813cde81b37e34f4c82d506700d8f89cf6f752645fa709b3",
+      "ntff_sha256": "031d7f558b8af687cf9fce3a7d5e2cc7a015d352e6d9c4252573dac85f96dfdf",
+      "median_duration_ns": {
+        "TENSOR_TENSOR_SCAN": 751.0
+      }
+    }
+  ],
+  "move_evidence": [
+    {
+      "case": "trn-advanced-nki1__6_csa_2048_ref",
+      "role": "calibration",
+      "neff_sha256": "3e3a29fb8f8122132bab8eafc2c01fa4801fa5c1ac9d5f3fd3b4cb61f018860a",
+      "ntff_sha256": "ee26d6a02fe3bd9d2b179dbaaa460f6d6b162b4c7e476ba741ddfe17b543a21d",
+      "opcode": "MOVE",
+      "dtype": "uint32",
+      "form": "register immediate",
+      "samples": 1,
+      "completion_ns": 68
+    },
+    {
+      "case": "trn-advanced-nki1__8_mha_ref",
+      "role": "validation",
+      "neff_sha256": "f7d829c3d75d68eef4b58f1ba216645cfb1d4c9fceb54ed60efbbdde6698cf7f",
+      "ntff_sha256": "52bfb13373fedca2287c3fa894cf1e0f255c489116731a12a3918fece982c2a0",
+      "opcode": "MOVE",
+      "dtype": "uint32",
+      "form": "register immediate",
+      "samples": 1,
+      "completion_ns": 68
+    }
+  ]
+}

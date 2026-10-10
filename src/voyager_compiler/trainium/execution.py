@@ -35,6 +35,8 @@ class TrainiumTuning:
     # This is independent of shared software-tile max_buffer_depth.
     temporary_buffer_depth: int = 1
     physical_model: str = "baseline"
+    # Static compiler scheduling lookahead; not a hardware queue size.
+    reorder_window: int = 16
     layernorm_algorithm: str = "centered"
     layernorm_fused: bool = False
     layernorm_square_engine: str = "vector"
@@ -51,6 +53,8 @@ class TrainiumTuning:
             raise TypeError("LayerNorm fusion must be boolean")
         from .physical_context import MODES
 
+        if type(self.reorder_window) is not int or self.reorder_window < 1:
+            raise ValueError("Reorder window must be a positive integer")
         if self.physical_model not in MODES:
             raise ValueError("Unknown physical execution model")
         if (

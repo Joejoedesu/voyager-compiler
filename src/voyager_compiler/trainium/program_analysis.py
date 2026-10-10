@@ -34,7 +34,12 @@ def matmul_free_stride(checker, expression):
 
 
 def analyze_selected(
-    program, hardware, *, execution_model="baseline", graph_observer=None
+    program,
+    hardware,
+    *,
+    execution_model="baseline",
+    graph_observer=None,
+    reorder_window=16,
 ):
     """Replay the actual selected ISA DAG, including physical reuse edges.
 
@@ -42,6 +47,11 @@ def analyze_selected(
     It exposes disagreement with the compact search model instead of silently
     dropping explicit temporaries, clears or retained-operand initialization.
     """
+    dependency_audit = {}
+    if execution_model == "scheduled-ready":
+        from .region_dependencies import refine
+
+        program, dependency_audit = refine(program)
     from .instruction_plan import Builder, Tensor, BITS
     from .dependencies import engine_clock
     from . import isa
@@ -57,6 +67,7 @@ def analyze_selected(
     nodes = []
     descriptors = {}
     contextual = execution_model in (
+        "scheduled-ready",
         "primitives",
         "context",
         "context-ready",
@@ -397,7 +408,11 @@ def analyze_selected(
         graph_observer(RepeatedGraph(tuple(nodes)), descriptors)
     from .physical_context import transform, identity
 
-    graph, ordering = transform(RepeatedGraph(tuple(nodes)), execution_model)
+    graph, ordering = transform(
+        RepeatedGraph(tuple(nodes)),
+        execution_model,
+        reorder_window=reorder_window,
+    )
     if execution_model in (
         "pipeline",
         "pipeline-ready",
@@ -420,7 +435,10 @@ def analyze_selected(
         matmul_geometry_events=dict(geometry_counts),
         event_count=len(graph.nodes),
         physical_model=execution_model,
-        physical_model_record=identity(execution_model),
+        physical_model_record=identity(
+            execution_model, reorder_window=reorder_window
+        ),
+        dependency_refinement=dependency_audit,
         ordering=ordering,
         unknown_completion=list(result.unknown_latency),
         service_ns=dict(result.service_ns),

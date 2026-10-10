@@ -20,6 +20,7 @@ from voyager_compiler.codegen.transform.tiling.execution import (
     evaluate_graph,
 )
 from voyager_compiler.trainium import isa
+from voyager_compiler.trainium.native_timing import evaluate as native_timing
 from voyager_compiler.trainium.dependencies import engine_clock
 from voyager_compiler.trainium.hardware import neuron_core
 from voyager_compiler.trainium.movement import TransferPanel, transfer_graph
@@ -129,6 +130,26 @@ def predict(
         raise ValueError(
             "Compiled ISA adapter is pinned to Trainium2 / NeuronCore-v3"
         )
+    # Native CAST and long dtype spellings are the same physical copy forms
+    # already consumed by selected-ISA analysis. Keep this in the compiler,
+    # rather than requiring an experiment-specific normalization wrapper.
+    cast_count = 0
+    normalized = []
+    for ins in data["instructions"]:
+        ins = dict(ins)
+        if ins["opcode"] == "CAST":
+            ins["opcode"] = "COPY"
+            cast_count += 1
+        for field in ("operands", "compiler_operands"):
+            if field in ins:
+                for long, short in (
+                    ("bfloat16@", "bf16@"),
+                    ("float16@", "fp16@"),
+                    ("float32@", "fp32@"),
+                ):
+                    ins[field] = ins[field].replace(long, short)
+        normalized.append(ins)
+    data = dict(data, instructions=normalized)
     timing_descriptors = {}
     stream_context = StreamTransposeTiming()
     selected_law_counts = Counter()
@@ -179,6 +200,7 @@ def predict(
     mapped = Counter()
     group_audit = Counter()
     bytes_read = bytes_written = 0
+    fragmented_dma = 0
 
     def add(
         name,
@@ -188,6 +210,9 @@ def predict(
         latency=0,
         implementation="",
         edges=(),
+        *,
+        forward=None,
+        read=None,
     ):
         idx = len(nodes)
         nodes.append(
@@ -198,12 +223,19 @@ def predict(
                 occupancy,
                 latency,
                 implementation=implementation,
+                forward_ns=forward,
+                read_ns=read,
             )
         )
         deps.append(set(edges))
         return idx
 
     last_tensor_matmul = False
+    last_tensor_loads = []
+    retained_stationary = 0
+    accumulator_writer = None
+    accumulator_reader = None
+    accumulator_edges = 0
     for uid, u in enumerate(units):
         items = u["items"]
         i = items[-1]
@@ -214,6 +246,7 @@ def predict(
         semsets = [(int(s), 1) for s in SET.findall(text)]
         first = end = None
         issue_node = None
+        native_cost = None
         if (
             op == "DMA_DIRECT2D"
             or i.get("compiler_opcode") == "PSEUDO_DMA_TRIGGER"
@@ -266,7 +299,7 @@ def predict(
                     if store
                     else d["dest_num_sb_partitions"]
                 )
-                assert 1 <= partitions <= 128 and nbytes % partitions == 0
+                assert 1 <= partitions <= 128
             bytes_read += read
             bytes_written += write
             # Unit bytes avoid inventing a dtype for byte-oriented DMA geometry.
@@ -275,11 +308,22 @@ def predict(
                 * (nbytes / partitions)
                 / (hw.dram_bandwidth / 16)
             )
+            panel_partitions, panel_free = partitions, nbytes // partitions
+            if nbytes % partitions:
+                from .native_dma import partition_bytes, payload_ns
+
+                loads = partition_bytes(d, store, nbytes)
+                ideal = payload_ns(loads, hw.dram_bandwidth)
+                fragmented_dma += 1
+                # This timing-only panel represents the packed byte stream;
+                # physical per-partition loads were decoded above. It remains
+                # one native request, not one request per descriptor fragment.
+                panel_partitions, panel_free = 1, nbytes
             panel = TransferPanel(
                 0,
                 0,
-                partitions,
-                nbytes // partitions,
+                panel_partitions,
+                panel_free,
                 8,
                 store,
                 False,
@@ -306,7 +350,21 @@ def predict(
         elif op in ("MATMUL", "LDWEIGHTS"):
             mm = [v for v in items if v["opcode"] == "MATMUL"]
             ld = [v for v in items if v["opcode"] == "LDWEIGHTS"]
+            if not ld and len(mm) == 1:
+                # The native compiler elides a redundant stationary load. The
+                # most recent TensorE load still owns the stationary payload;
+                # its waits/setters must not be duplicated for this matmul.
+                if len(last_tensor_loads) != 1:
+                    raise ValueError(
+                        (
+                            "matmul has no unambiguous retained stationary operand",
+                            uid,
+                        )
+                    )
+                ld = last_tensor_loads
+                retained_stationary += 1
             assert len(mm) == len(ld) and len(mm) in (1, 2), (uid, items)
+            last_tensor_loads = ld
             assert u["last_pc"] - u["pc"] + 1 == len(items), (
                 uid,
                 "noncontiguous tensor group",
@@ -441,6 +499,17 @@ def predict(
             group_audit[
                 f'{dt}:{"transpose" if trans else "matmul"}:{len(mm)}'
             ] += 1
+        elif op == "MOVE":
+            native_cost = native_timing(op, eng, {}, i["operands"], hw)
+            first = end = issue_node = add(
+                f"u{uid}_{op}",
+                eng,
+                native_cost.issue_ns,
+                native_cost.issue_ns,
+                native_cost.completion_ns,
+                native_cost.implementation,
+            )
+            mapped[native_cost.implementation] += 1
         elif op in ("EVENT_SEMAPHORE", "NOP", "ACT_TABLE_LOAD", "WRITE"):
             # No new per-kernel coefficient: existing fixed_kernel_ns covers
             # common setup. Semaphore waits remain graph edges.
@@ -460,6 +529,8 @@ def predict(
                 "ACTIVATE",
                 "MEMSET",
                 "STREAM_TRANSPOSE",
+                "TENSOR_TENSOR_SCAN",
+                "ACTIVATION_READ_ACCUMULATOR",
             ):
                 raise ValueError(("unsupported compiled opcode", op, eng))
             fs = fields(i["operands"])
@@ -468,7 +539,11 @@ def predict(
             free = math.prod(dst[3])
             clock = engine_clock(hw, eng)
             service = max(64, free) / clock
-            if op == "COPY":
+            native_cost = native_timing(op, eng, fs, i["operands"], hw)
+            if native_cost is not None:
+                law_name = native_cost.implementation
+                service = native_cost.issue_ns
+            elif op == "COPY":
                 mem = "PSUM" if fs["src"][1] >= 0x2000000 else "SBUF"
                 law_name = f"nki.copy.{mem}.{dt}.{eng}"
             elif op == "TENSOR_TENSOR":
@@ -510,9 +585,15 @@ def predict(
                 stream_context.reset()
             law = hw.timing_profile.operation(law_name)
             occ, lat = law.evaluate(service) if law else (service, None)
-            if law is None and not law_name.startswith("UNSUPPORTED"):
+            if native_cost is not None:
+                occ, lat = native_cost.issue_ns, native_cost.completion_ns
+                selected_law_counts[law_name] += 1
+            if (
+                (native_cost is None and law is None)
+                or (native_cost is not None and lat is None)
+            ) and not law_name.startswith("UNSUPPORTED"):
                 missing[law_name] += 1
-            if context_model:
+            if context_model and native_cost is None:
                 from .calibrated_isa import evaluate
 
                 if op in ("MATMUL", "LDWEIGHTS"):
@@ -595,10 +676,42 @@ def predict(
                         missing[law_name] -= 1
                     selected_law_counts["context:" + descriptor["opcode"]] += 1
             first = end = issue_node = add(
-                f"u{uid}_{op}", eng, occ, occ, lat, law_name
+                f"u{uid}_{op}",
+                eng,
+                occ,
+                occ,
+                lat,
+                law_name,
+                forward=native_cost.forward_ns if native_cost else None,
+                read=native_cost.read_ns if native_cost else None,
             )
             mapped[law_name] += 1
         assert first is not None
+        # These registers are not SBUF/PSUM tensors. Their dependencies remain
+        # necessary even when engine issue-order preservation is disabled.
+        if eng == "ScalarE" and op == "ACTIVATION_READ_ACCUMULATOR":
+            if accumulator_writer is None:
+                raise ValueError("Accumulator read has no recognized producer")
+            deps[first].add((accumulator_writer, "forward"))
+            accumulator_reader = end
+            accumulator_edges += 1
+        elif eng == "ScalarE" and op == "ACTIVATE":
+            command = re.search(r"\baccumulator_cmd=(\w+)", i["operands"])
+            if accumulator_reader is not None:
+                deps[first].add((accumulator_reader, "read"))
+                accumulator_edges += 1
+                accumulator_reader = None
+            if command and command[1] in ("ZERO_ACCUMULATE", "ACCUMULATE"):
+                if command[1] == "ACCUMULATE":
+                    if accumulator_writer is None:
+                        raise ValueError(
+                            "Accumulator continuation has no producer"
+                        )
+                    deps[first].add((accumulator_writer, "forward"))
+                    accumulator_edges += 1
+                accumulator_writer = end
+            else:
+                accumulator_writer = None
         pending.append((first, waits))
         # Preserve each compiled engine's issue order without requiring previous
         # completion. Readiness is carried by the encoded hardware semaphores.
@@ -733,6 +846,10 @@ def predict(
         "hbm_read_bytes": bytes_read,
         "hbm_write_bytes": bytes_written,
         "static_instructions": len(raw),
+        "native_cast_alias_count": cast_count,
+        "fragmented_dma_descriptors": fragmented_dma,
+        "retained_stationary_matmuls": retained_stationary,
+        "accumulator_state_dependencies": accumulator_edges,
         "deduplicated_runtime_writes": deduplicated,
         "tensor_groups": dict(group_audit),
         "mapped_operations": dict(mapped),

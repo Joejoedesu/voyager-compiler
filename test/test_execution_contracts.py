@@ -199,7 +199,12 @@ def test_realization_rejects_modified_selected_graph(tmp_path):
     from test_trainium import test_compile_reconvert_and_instruction_counts
     from voyager_compiler.trainium.converter import convert
 
-    test_compile_reconvert_and_instruction_counts(tmp_path, True)
+    test_compile_reconvert_and_instruction_counts(
+        tmp_path,
+        isa_lowering=True,
+        strict_realization=True,
+        temporary_buffer_depth=1,
+    )
     record = json.loads((tmp_path / "hardware.json").read_text())
     plan = record["execution_plans"][0]
     event = next(

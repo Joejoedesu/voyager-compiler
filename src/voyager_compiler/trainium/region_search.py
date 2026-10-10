@@ -169,7 +169,11 @@ def reuse_scored_plan(root, source, context):
     if context.policy.tuning.physical_model != "baseline":
         from .physical_context import identity
         saved=manifest["program_analysis"]["selected_instruction_analysis"].get("physical_model_record")
-        if saved != identity(context.policy.tuning.physical_model):
+        expected = identity(
+            context.policy.tuning.physical_model,
+            reorder_window=context.policy.tuning.reorder_window,
+        )
+        if saved != expected:
             raise ValueError("Scored physical model contents differ from final compilation")
     def digest(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
