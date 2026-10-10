@@ -35,3 +35,19 @@ results/
 !test/test_trainium_*.py
 
 !test/test_execution_contracts.py
+
+# Trainium experiments and evidence are kept in the external archive.
+/archive/
+/reports/
+/results/
+/consolidation.json
+/README.txt
+/README-sweep.txt
+.pytest_cache/
+.venv*/
+!test/test_*.py
+!test/utils/
+
+/benchmarks/
+/experiments/
+/compiler/

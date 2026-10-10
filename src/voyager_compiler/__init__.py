@@ -421,6 +421,13 @@ def lower_to_buffers(
         mapping_policy=mapping_policy,
     )
     model.meta["bufferized_policy"] = tiler.mapping_policy
+    if options.block_regions:
+        from voyager_compiler.codegen.transform.bufferize.block_regions import plan_block_regions
+        plan_block_regions(model, tiler)
+    if options.stream_regions:
+        from voyager_compiler.codegen.transform.bufferize.stream_regions import plan_stream_regions
+
+        plan_stream_regions(model, tiler)
     if options.row_regions:
         from voyager_compiler.codegen.transform.bufferize.row_regions import (
             plan_row_regions,

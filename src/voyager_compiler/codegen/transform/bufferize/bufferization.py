@@ -929,7 +929,7 @@ def bufferize_graph(
         prefetch_tilings(
             [
                 n for n in graph.nodes
-                if not n.meta.get("row_region") and is_gemm_op(get_anchor_node(n))
+                if not (n.meta.get("row_region") or n.meta.get("stream_region") or n.meta.get("block_region")) and is_gemm_op(get_anchor_node(n))
             ],
             tiler,
         )
@@ -956,7 +956,7 @@ def bufferize_graph(
 
         anchor = get_anchor_node(node)
 
-        key = None if node.meta.get("row_region") else _bufferize_key(node)
+        key = None if (node.meta.get("row_region") or node.meta.get("stream_region") or node.meta.get("block_region")) else _bufferize_key(node)
         cached = build_cache.get(key) if key is not None else None
         logger.debug(
             "[bufferize] %s anchor=%s %s",
@@ -967,7 +967,14 @@ def bufferize_graph(
         if cached is not None:
             sub_gm, n_out, group, tag_sources = cached
         else:
-            if node.meta.get("row_region"):
+            if node.meta.get("block_region"):
+                from .block_regions import build_block_region
+                sub_gm = build_block_region(node, tiler=tiler)
+            elif node.meta.get("stream_region"):
+                from .stream_regions import build_stream_region
+
+                sub_gm = build_stream_region(node, tiler=tiler)
+            elif node.meta.get("row_region"):
                 from .row_regions import build_row_region
 
                 sub_gm = build_row_region(node, tiler=tiler)

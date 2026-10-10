@@ -39,3 +39,15 @@ If you use Voyager Compiler in your research, please cite:
   primaryClass={cs.AR}
 }
 ```
+
+## Current Trainium development branch
+
+The `trainium-isa-10-09` branch contains the consolidated compiler and physical ISA
+performance model in `src/`, bufferized lowering in
+`src/voyager_compiler/codegen/transform/bufferize/`, and Trainium tests in `test/`.
+
+The benchmark workflows, exploratory scripts, profiling/report tools, hardware
+results, and historical experiment outputs are kept outside this repository in the sibling
+`../trainium-isa-10-09-archive/` directory. They are distributed separately from
+the compiler source. The experiment-derived implementations are integrated into
+`src/`; no experiment directory is required to compile or run the unit tests.

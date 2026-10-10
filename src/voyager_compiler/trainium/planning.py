@@ -52,7 +52,13 @@ def strides(shape):
 
 class InstructionPlanner:
     def __init__(
-        self, model, target, tuning=None, hardware=None, movement_bindings=None, matrix_bindings=()
+        self,
+        model,
+        target,
+        tuning=None,
+        hardware=None,
+        movement_bindings=None,
+        matrix_bindings=(),
     ):
         from .execution import TrainiumTuning
 
@@ -168,7 +174,8 @@ class InstructionPlanner:
 
         This closure runs before any instruction/storage definition. Matrix
         boundaries keep their explicit panel-to-row conversion in ``write``.
-        HBM edges and shape-changing/broadcast operations do not propagate it.
+        HBM edges do not propagate it. Last-axis scalar broadcasts preserve
+        the row partition when their leading row extent agrees.
         """
         groups = []
 
@@ -194,6 +201,7 @@ class InstructionPlanner:
                     "tanh",
                     "exp",
                     "clone",
+                    "reciprocal",
                 }:
                     boxes = [
                         v.tensor_box.box
@@ -212,13 +220,18 @@ class InstructionPlanner:
                         if b.HasField("memory")
                         and b.memory.level == ir.MEMORY_LEVEL_SCRATCHPAD
                     ]
-                    if (
-                        boxes
-                        and len(
-                            {tuple(self.boxes[b.node].shape) for b in boxes}
+                    shapes = [tuple(self.boxes[b.node].shape) for b in boxes]
+                    row_broadcast = (
+                        bool(shapes)
+                        and all(
+                            len(s) == 2 and s[0] == shapes[0][0] for s in shapes
                         )
-                        == 1
-                    ):
+                        and all(
+                            s[1] in (1, max(t[1] for t in shapes))
+                            for s in shapes
+                        )
+                    )
+                    if boxes and (len(set(shapes)) == 1 or row_broadcast):
                         groups.append({b.node for b in boxes})
             for field, value in msg.ListFields():
                 if field.type == field.TYPE_MESSAGE:
@@ -314,7 +327,13 @@ class InstructionPlanner:
                     ]
                     layouts = {
                         c.get("weight_layout", "generic") for c in matches
-                    } or {"generic"}
+                    } or {
+                        (
+                            self.tuning.matmul_weight_layout
+                            if self.tuning.matmul_weight_layout != "auto"
+                            else "generic"
+                        )
+                    }
                     if len(layouts) != 1:
                         raise ValueError(
                             "Ambiguous selected weight layouts for matrix consumers"
@@ -323,7 +342,7 @@ class InstructionPlanner:
                     root = self.boxes[b.box.node]
                     if layout == "k_partitioned" and (
                         tuple(root.shape) != bshape
-                        or root.bank_count not in (0, 1)
+                        or root.bank_count not in (0, 1, 2)
                         or b.box.node in self.row_buffers
                         or root.memory.level != ir.MEMORY_LEVEL_SCRATCHPAD
                     ):
@@ -369,7 +388,10 @@ class InstructionPlanner:
                     else ()
                 )
             )
-            if any(p.target.split("::")[-1] in RECIPES for p in prims):
+            if any(
+                p.target.split("::")[-1] in {*RECIPES, "amax", "sum"}
+                for p in prims
+            ):
                 boxes = [
                     v.tensor_box.box
                     for p in prims
@@ -1155,15 +1177,23 @@ class InstructionPlanner:
         if r.name in self.row_buffers and isinstance(value, PanelValue):
             # A matrix produces partition=N panels; row reductions consume
             # partition=M. Materialize that required local layout edge.
-            local = self.tmp(f"nl.ndarray(({value.m}, {value.n}), dtype=nl.{r.dtype}, buffer=nl.sbuf)")
+            local = self.tmp(
+                f"nl.ndarray(({value.m}, {value.n}), dtype=nl.{r.dtype}, buffer=nl.sbuf)"
+            )
             for mi, ni, mm, nn, panel in value.panels:
                 if value.row_major:
-                    self.emit(f"{local}[{mi}:{mi + mm}, {ni}:{ni + nn}] = nisa.tensor_copy({panel}, engine=nisa.vector_engine)")
+                    self.emit(
+                        f"{local}[{mi}:{mi + mm}, {ni}:{ni + nn}] = nisa.tensor_copy({panel}, engine=nisa.vector_engine)"
+                    )
                     continue
                 for row in range(0, mm, 128):
                     count = min(128, mm - row)
-                    tile = self.transpose(self.local_copy(f"{panel}[:, {row}:{row + count}]"))
-                    self.emit(f"{local}[{mi + row}:{mi + row + count}, {ni}:{ni + nn}] = nisa.tensor_copy({tile}, engine=nisa.vector_engine)")
+                    tile = self.transpose(
+                        self.local_copy(f"{panel}[:, {row}:{row + count}]")
+                    )
+                    self.emit(
+                        f"{local}[{mi + row}:{mi + row + count}, {ni}:{ni + nn}] = nisa.tensor_copy({tile}, engine=nisa.vector_engine)"
+                    )
             self.vars[r.name, r.slot] = local
             self.panel_slots.pop((r.name, r.slot), None)
             return
@@ -1294,22 +1324,38 @@ class InstructionPlanner:
             return
         if local_ref.name in self.k_weight_buffers:
             root = self.boxes[local_ref.name]
-            if (not load or transposed or any(pad or ()) or local_ref.offset
-                or shape != tuple(root.shape) or local_ref.shape != shape
+            if (
+                not load
+                or transposed
+                or any(pad or ())
+                or local_ref.offset
+                or shape != tuple(root.shape)
+                or local_ref.shape != shape
                 or local_ref.strides != globals()["strides"](shape)
-                or len(src.shape) != 2 or src.strides != globals()["strides"](src.shape)
-                or any(off < 0 or off + size > dim for off, size, dim in zip(offsets, shape, src.shape))):
-                raise ValueError("K-partitioned weight DMA requires a full unpadded contiguous load")
+                or len(src.shape) != 2
+                or src.strides != globals()["strides"](src.shape)
+                or any(
+                    off < 0 or off + size > dim
+                    for off, size, dim in zip(offsets, shape, src.shape)
+                )
+            ):
+                raise ValueError(
+                    "K-partitioned weight DMA requires a full unpadded contiguous load"
+                )
             rows, width = shape
             for row in range(0, rows, 128):
-                nr = min(128, rows-row)
+                nr = min(128, rows - row)
                 for col in range(0, width, self.tuning.dma_columns):
-                    nc = min(self.tuning.dma_columns, width-col)
+                    nc = min(self.tuning.dma_columns, width - col)
                     ip = self.tmp(f"nl.arange({nr})[:, None]")
                     jf = self.tmp(f"nl.arange({nc})[None, :]")
                     local = [f"{ip}+{row}", f"{jf}+{col}"]
-                    external = [f"({c})+{off}" for c, off in zip(local, offsets)]
-                    self.emit(f"nisa.dma_copy(dst={self.index(dst, local)}, src={self.index(src, external)})")
+                    external = [
+                        f"({c})+{off}" for c, off in zip(local, offsets)
+                    ]
+                    self.emit(
+                        f"nisa.dma_copy(dst={self.index(dst, local)}, src={self.index(src, external)})"
+                    )
                     self.stats["isa_dma_panels"] += 1
                     self.stats["k_weight_dma_panels"] += 1
             self.signal(semaphore, post_count)
@@ -1628,8 +1674,13 @@ class InstructionPlanner:
                     f"nisa.nc_transpose({value}, engine=nisa.tensor_engine)"
                 )
                 return self.local_copy(
-                    psum, dtype=dtype,
-                    engine="scalar" if self.tuning.copy_policy == "scalar" else copy_engine,
+                    psum,
+                    dtype=dtype,
+                    engine=(
+                        "scalar"
+                        if self.tuning.copy_policy == "scalar"
+                        else copy_engine
+                    ),
                 )
             from .instruction_plan import Tensor
 
@@ -1749,6 +1800,7 @@ class InstructionPlanner:
             for value in values:
                 if isinstance(value, PanelValue):
                     assert (value.m, value.n) == (panel.m, panel.n)
+                    assert value.row_major == panel.row_major
                     assert value.panels[idx][:4] == (mi, ni, mm, nn)
                     args.append(value.panels[idx][4])
                 else:
@@ -1765,11 +1817,41 @@ class InstructionPlanner:
                         f"{value}[{ip}, ({jf}+{mi})*{math.ceil(panel.n / 128)}+{ni // 128}]"
                     )
             results.append((mi, ni, mm, nn, self.tmp(expression(*args))))
-        return PanelValue(panel.m, panel.n, results)
+        return PanelValue(panel.m, panel.n, results, row_major=panel.row_major)
 
     def matrix_activation(self, ref):
         """Convert a row-partition producer tile to TensorE's K partitions."""
         if ref.name not in self.row_buffers:
+            # A preceding local matrix/pointwise region can bind a logical
+            # destination directly to N-partitioned panels. Read the requested
+            # K-by-M activation view from that payload; do not treat the panel
+            # container as an address expression or return the entire tensor.
+            panels = self.panel_slots.get((ref.name, ref.slot))
+            if panels is not None:
+                width = self.boxes[ref.name].shape[-1]
+                row, col = divmod(ref.offset, width)
+                rows, columns = ref.shape
+                if ref.strides != (width, 1):
+                    raise ValueError(
+                        "Panel consumer requires a contiguous logical row tile"
+                    )
+                for mi, ni, mm, nn, value in panels.panels:
+                    if (
+                        mi <= row
+                        and row + rows <= mi + mm
+                        and ni <= col
+                        and col + columns <= ni + nn
+                    ):
+                        if panels.row_major:
+                            view = f"{value}[{row-mi}:{row-mi+rows}, {col-ni}:{col-ni+columns}]"
+                            return self.transpose(
+                                self.local_copy(view), dtype=ref.dtype
+                            )
+                        view = f"{value}[{col-ni}:{col-ni+columns}, {row-mi}:{row-mi+rows}]"
+                        return self.tmp(view)
+                raise ValueError(
+                    "Matrix input view crosses producer panel boundaries"
+                )
             return self.read(ref)
         width = self.boxes[ref.name].shape[-1]
         row, col = divmod(ref.offset, width)
@@ -1802,7 +1884,9 @@ class InstructionPlanner:
         """Lower one scheduled tile into ISA panels without retiling HBM."""
         from .orientation import matrix_choice
 
-        weight_layout = "k_partitioned" if b.name in self.k_weight_buffers else "generic"
+        weight_layout = (
+            "k_partitioned" if b.name in self.k_weight_buffers else "generic"
+        )
         choice = matrix_choice(
             self.hardware,
             m,
@@ -1824,7 +1908,10 @@ class InstructionPlanner:
             if all(b[s] == choice[s] for s in signature)
         ]
         if matches:
-            if any(b.get("weight_layout", "generic") != weight_layout for b in matches):
+            if any(
+                b.get("weight_layout", "generic") != weight_layout
+                for b in matches
+            ):
                 raise ValueError("Search/realization weight layout mismatch")
             if any(b["orientation"] != choice["orientation"] for b in matches):
                 raise ValueError(
@@ -1923,7 +2010,9 @@ class InstructionPlanner:
                     weight_key = (ni, ki)
                     if weight_layout == "k_partitioned":
                         bv = self.resident_weight_panel(br)
-                        if self.tuning.matmul_operands == "staged" and (m > 512 or n > 128 or k > 128):
+                        if self.tuning.matmul_operands == "staged" and (
+                            m > 512 or n > 128 or k > 128
+                        ):
                             bv = self.local_copy(bv)
                     elif reuse and weight_key in weight_panels:
                         bv = weight_panels[weight_key]
@@ -1962,7 +2051,11 @@ class InstructionPlanner:
                 else:
                     if self.tuning.matmul_operands == "staged":
                         av = self.matrix_activation(ar)
-                        bv = self.resident_weight_panel(br) if weight_layout == "k_partitioned" else self.read(br)
+                        bv = (
+                            self.resident_weight_panel(br)
+                            if weight_layout == "k_partitioned"
+                            else self.read(br)
+                        )
                         if m > 512 or n > 128 or k > 128:
                             av = self.local_copy(av)
                             bv = self.local_copy(bv)
@@ -1987,7 +2080,11 @@ class InstructionPlanner:
                             bv = weight_panels[weight_key]
                             self.stats["reused_weight_panels"] += 1
                         else:
-                            bv = self.resident_weight_panel(br) if weight_layout == "k_partitioned" else self.read(br)
+                            bv = (
+                                self.resident_weight_panel(br)
+                                if weight_layout == "k_partitioned"
+                                else self.read(br)
+                            )
                             if not transposed and weight_layout == "generic":
                                 bv = self.transpose(bv, dtype=b.dtype)
                             if reuse:
@@ -2117,7 +2214,16 @@ class InstructionPlanner:
                     name == "matmul" and p.target.startswith("quantized_ops::")
                 ) or (name == "linear" and p.target.startswith("aten::"))
                 n = b.shape[0] if transposed else b.shape[1]
-                value = self.gemm(a, b, m, n, k, transposed, d.dtype, d.name in self.row_buffers)
+                value = self.gemm(
+                    a,
+                    b,
+                    m,
+                    n,
+                    k,
+                    transposed,
+                    d.dtype,
+                    d.name in self.row_buffers,
+                )
                 if kw.get("bias") is not None:
                     value = self.map_panels(
                         lambda x, y: (
@@ -2128,6 +2234,32 @@ class InstructionPlanner:
                         value,
                         self.read(kw["bias"], d.shape),
                     )
+            elif name in ("amax", "sum"):
+                dim = kw.get("dim")
+                if isinstance(dim, int):
+                    dim = [dim]
+                if (
+                    dim is None
+                    or tuple(i % len(a.shape) for i in dim)
+                    != (len(a.shape) - 1,)
+                    or not kw.get("keepdim", False)
+                ):
+                    raise NotImplementedError(
+                        "Block reduction requires last axis with keepdim"
+                    )
+                if a.name not in self.row_buffers:
+                    raise ValueError("Block reduction lost its row layout")
+                op = "max" if name == "amax" else "add"
+                value = self.tmp(
+                    f"nisa.tensor_reduce(nl.{op}, {self.read(a)}, axis=[1], keepdims=True, dtype=nl.float32)"
+                )
+            elif name in ("full_like", "zeros_like", "ones_like"):
+                fill = kw.get("fill_value", 1 if name == "ones_like" else 0)
+                value = self.tmp(
+                    f"nisa.memset({self.storage_shape(self.boxes[d.name])!r}, value={fill}, dtype=nl.{d.dtype}, engine=nisa.vector_engine)"
+                )
+            elif name == "reciprocal":
+                value = self.tmp(f"nisa.reciprocal({self.read(a)})")
             elif name in ("layer_norm", "rms_norm", "softmax"):
                 from .lowering import realize_reduction
 
@@ -2318,6 +2450,12 @@ class InstructionPlanner:
                     if name == "avg_pool2d":
                         value = self.tmp(f"{value}/{math.prod(kernel)}")
             elif name in ("add", "add_", "sub", "mul", "div", "maximum"):
+                row_scalar = (
+                    isinstance(kw.get("other"), Ref)
+                    and kw["other"].name in self.row_buffers
+                    and kw["other"].shape[-1] == 1
+                    and d.name in self.row_buffers
+                )
                 a = self.read(a, d.shape)
                 b = self.read(kw["other"], d.shape)
                 op = {
@@ -2335,7 +2473,13 @@ class InstructionPlanner:
                             lambda x: f"nisa.tensor_scalar({x}, op0=nl.multiply, operand0={alpha}, engine=nisa.vector_engine)",
                             b,
                         )
-                    if isinstance(kw["other"], (int, float)):
+                    if row_scalar:
+                        value = self.map_panels(
+                            lambda x, y: f"nisa.tensor_scalar({x}, op0=nl.{op}, operand0={y}, engine=nisa.vector_engine)",
+                            a,
+                            b,
+                        )
+                    elif isinstance(kw["other"], (int, float)):
                         value = self.map_panels(
                             lambda x: f"nisa.tensor_scalar({x}, op0=nl.{op}, operand0={kw['other'] * alpha}, engine=nisa.vector_engine)",
                             a,
@@ -2424,7 +2568,9 @@ class InstructionPlanner:
         program.outputs += workspace
         if not self.tuning.strict_realization:
             if self.movement_selector is not None:
-                raise ValueError("Movement bindings currently require strict realization")
+                raise ValueError(
+                    "Movement bindings currently require strict realization"
+                )
             program.encoding_storage = "compiler"
             self.selected_allocation_policy = "compiler"
             program.validate(self.hardware.scratchpad_size)
@@ -2435,11 +2581,13 @@ class InstructionPlanner:
         if getattr(self, "required_movement_storage", "") == "disjoint_arenas":
             allocation_policy = "size_classes"
         self.selected_allocation_policy = (
-            "bounded_size_classes" if self.tuning.temporary_buffer_depth > 1
+            "bounded_size_classes"
+            if self.tuning.temporary_buffer_depth > 1
             else allocation_policy
         )
         program.allocate(
-            self.hardware.scratchpad_size, strategy=allocation_policy,
+            self.hardware.scratchpad_size,
+            strategy=allocation_policy,
             temporary_buffer_depth=self.tuning.temporary_buffer_depth,
         )
         if allocation_policy == "size_classes":
@@ -2460,15 +2608,35 @@ def select_plan(
     output = root
     model = text_format.Parse((root / "model.txt").read_text(), ir.Model())
     record = json.loads((root / "hardware.json").read_text())
-    matrix_bindings = [e["matrix_choice"] for e in record.get("estimates", []) if "matrix_choice" in e]
-    matrix_bindings += [c for r in record.get("row_regions", [])
-                        for c in r.get("selected", {}).get("matrix_choices", [])]
+    tuning = context.policy.tuning
+    trial = record.get("stream_search_trial")
+    if trial is not None:
+        orientation = trial["orientation"]
+        if orientation not in ("weights", "activations"):
+            raise ValueError(
+                "Invalid expanded-search matrix orientation binding"
+            )
+        if tuning.matmul_orientation not in ("auto", orientation):
+            raise ValueError(
+                "Expanded search conflicts with requested orientation"
+            )
+        tuning = replace(tuning, matmul_orientation=orientation)
+    matrix_bindings = [
+        e["matrix_choice"]
+        for e in record.get("estimates", [])
+        if "matrix_choice" in e
+    ]
+    matrix_bindings += [
+        c
+        for r in record.get("row_regions", [])
+        for c in r.get("selected", {}).get("matrix_choices", [])
+    ]
     movement_search = None
     if movement_bindings is not None:
         converter = InstructionPlanner(
             model,
             target,
-            context.policy.tuning,
+            tuning,
             context.hardware,
             movement_bindings=movement_bindings,
             matrix_bindings=matrix_bindings,
@@ -2483,9 +2651,11 @@ def select_plan(
                     k: v["selected"]
                     for k, v in converter.movement_selector.requests.items()
                 },
-                predicted_ns=analyze_selected(program, context.hardware)[
-                    "prediction_ns"
-                ],
+                predicted_ns=analyze_selected(
+                    program,
+                    context.hardware,
+                    execution_model=context.policy.tuning.physical_model,
+                )["prediction_ns"],
             ),
             requests=converter.movement_selector.requests,
         )
@@ -2496,7 +2666,7 @@ def select_plan(
             planner = InstructionPlanner(
                 model,
                 target,
-                context.policy.tuning,
+                tuning,
                 context.hardware,
                 movement_bindings=bindings,
                 matrix_bindings=matrix_bindings,
@@ -2511,7 +2681,11 @@ def select_plan(
         )
     else:
         converter = InstructionPlanner(
-            model, target, context.policy.tuning, context.hardware, matrix_bindings=matrix_bindings
+            model,
+            target,
+            tuning,
+            context.hardware,
+            matrix_bindings=matrix_bindings,
         )
         program = converter.select(allocation_policy)
     from .plan_emitter import emit
@@ -2531,7 +2705,11 @@ def select_plan(
     program_analysis = analyze_program(source, converter, record)
     from .program_analysis import analyze_selected
 
-    selected_analysis = analyze_selected(program, context.hardware)
+    selected_analysis = analyze_selected(
+        program,
+        context.hardware,
+        execution_model=context.policy.tuning.physical_model,
+    )
     program_analysis["selected_instruction_analysis"] = selected_analysis
     program_analysis["template_prediction_ns"] = program_analysis[
         "whole_program_prediction_ns"
@@ -2556,6 +2734,7 @@ def select_plan(
         ).hexdigest(),
         stats=converter.stats,
         matrix_choices=converter.matrix_choices,
+        stream_search_trial=trial,
         k_partitioned_weight_buffers=sorted(converter.k_weight_buffers),
         expanded_isa=dict(converter.expanded_isa),
         execution_contract=(
@@ -2608,8 +2787,8 @@ def select_plan(
     )
     manifest["allocation"] = (
         "All selected local values bind to direct SBUF/PSUM arena views; NKI retains final engine scheduling"
-        if strict else
-        "Selected logical SBUF/PSUM buffers; NKI owns physical allocation, reuse and engine scheduling"
+        if strict
+        else "Selected logical SBUF/PSUM buffers; NKI owns physical allocation, reuse and engine scheduling"
     )
     manifest["selected_instruction_plan"] = "instructions.json"
     manifest["requested_physical_placement_strategy"] = allocation_policy
@@ -2618,13 +2797,24 @@ def select_plan(
     )
     manifest["temporary_buffering"] = dict(
         depth=context.policy.tuning.temporary_buffer_depth,
-        policy="existing placement" if context.policy.tuning.temporary_buffer_depth == 1
-        else "per-size-class bounded slots; oldest legal owner recycled",
-        sbuf_reserved_bytes=max(
-            (p.byte_address + p.bytes_per_partition
-             for p in program.placements.values() if p.memory == "SBUF"),
-            default=0,
-        ) * 128 if strict else None,
+        policy=(
+            "existing placement"
+            if context.policy.tuning.temporary_buffer_depth == 1
+            else "per-size-class bounded slots; oldest legal owner recycled"
+        ),
+        sbuf_reserved_bytes=(
+            max(
+                (
+                    p.byte_address + p.bytes_per_partition
+                    for p in program.placements.values()
+                    if p.memory == "SBUF"
+                ),
+                default=0,
+            )
+            * 128
+            if strict
+            else None
+        ),
         scope="Physical temporary allocation; shared software tile depth is unchanged",
         search_scope="Selected logical program only; compact mapping search does not score this pool depth",
     )
@@ -2632,13 +2822,15 @@ def select_plan(
         semantic_output_count=len(model.outputs),
         workspace_outputs=list(program.outputs[len(model.outputs) :]),
     )
-    manifest["program_analysis"]["buffer_allocation"] = "direct" if strict else "compiler"
+    manifest["program_analysis"]["buffer_allocation"] = (
+        "direct" if strict else "compiler"
+    )
     manifest["program_analysis"]["physical_addresses_enforced"] = strict
     if not strict:
         manifest["program_analysis"]["whole_program_timing_complete"] = False
-        manifest["program_analysis"]["allocation_limitation"] = (
-            "Logical dependency estimate only; NKI allocation, physical reuse and spills are not predicted"
-        )
+        manifest["program_analysis"][
+            "allocation_limitation"
+        ] = "Logical dependency estimate only; NKI allocation, physical reuse and spills are not predicted"
     manifest["program_analysis"]["physical_slot_depth_enforced"] = False
     manifest["program_analysis"]["logical_depth_speed_credit"] = False
     (root / "instructions.json").write_text(

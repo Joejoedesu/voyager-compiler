@@ -33,7 +33,9 @@ def matmul_free_stride(checker, expression):
     return abs(int(delta[0, 0])) if np.all(delta == delta[0, 0]) else None
 
 
-def analyze_selected(program, hardware):
+def analyze_selected(
+    program, hardware, *, execution_model="baseline", graph_observer=None
+):
     """Replay the actual selected ISA DAG, including physical reuse edges.
 
     This final audit uses the same primitive timing laws as candidate templates.
@@ -53,6 +55,23 @@ def analyze_selected(program, hardware):
 
     stream_context = StreamTransposeTiming()
     nodes = []
+    descriptors = {}
+    contextual = execution_model in (
+        "primitives",
+        "context",
+        "context-ready",
+        "pipeline",
+        "pipeline-ready",
+        "pipeline-startup",
+        "pipeline-startup-ready",
+    )
+    collect = contextual or graph_observer is not None
+    from functools import lru_cache
+
+    @lru_cache(maxsize=32768)
+    def stride(expression):
+        return matmul_free_stride(checker, expression)
+
     completion = []
     last_tensor_matmul = False
     last_tensor_index = -1
@@ -282,6 +301,85 @@ def analyze_selected(program, hardware):
                     )
                     for d in ins.dependencies
                 )
+        if collect:
+            desc = dict(
+                opcode=opcode,
+                engine=engine,
+                dtype=dst.dtype,
+                partitions=partitions,
+                free=free,
+                source_free=math.prod(data.shape[1:]) if data else 0,
+                source_memory=data.memory if data else None,
+                source_dtype=data.dtype if data else None,
+                source_stride=None,
+                destination_stride=None,
+                function=str(
+                    kw.get(
+                        "op",
+                        (
+                            args[0]
+                            if opcode in ("activation", "tensor_reduce")
+                            and args
+                            else ""
+                        ),
+                    )
+                ),
+                transpose=opcode == "nc_transpose"
+                or bool(kw.get("is_transpose")),
+            )
+            if opcode in ("tensor_copy", "nc_transpose", "nc_matmul"):
+                expressions = (*ins.args, *(v for _, v in ins.kwargs))
+                values = (*args, *kw.values())
+                source_expr = next(
+                    (
+                        e
+                        for e, v in zip(expressions, values)
+                        if isinstance(v, Tensor)
+                    ),
+                    None,
+                )
+                if source_expr is not None and data.memory == "SBUF":
+                    desc["source_stride"] = stride(source_expr)
+                if dst.memory == "SBUF":
+                    desc["destination_stride"] = stride(ins.destination)
+            if opcode == "nc_matmul" and not desc["transpose"]:
+                desc.update(
+                    moving=args[1].shape[1],
+                    stationary=args[0].shape[1],
+                    contraction=args[0].shape[0],
+                    moving_stride=stride(ins.args[1]),
+                    stationary_stride=stride(ins.args[0]),
+                    streaming=streaming,
+                )
+            desc["forward_sources"] = [
+                completion[d]
+                for d in ins.dependencies
+                if ins.accumulate
+                and program.instructions[d].opcode == "nisa.nc_matmul"
+                and set(program.instructions[d].writes) & set(ins.writes)
+            ]
+            descriptors[len(nodes)] = desc
+            if contextual:
+                from .calibrated_isa import evaluate
+
+                override = evaluate(desc, occupancy, latency, forward)
+                if override is not None:
+                    occupancy, latency, forward = override
+                    if forward is not None and ins.accumulate:
+                        dependencies = tuple(
+                            Dependency(
+                                completion[d],
+                                milestone=(
+                                    "forward"
+                                    if program.instructions[d].opcode
+                                    == "nisa.nc_matmul"
+                                    and set(program.instructions[d].writes)
+                                    & set(ins.writes)
+                                    else "result"
+                                ),
+                            )
+                            for d in ins.dependencies
+                        )
         nodes.append(
             OperationEvent(
                 f"i{index}_{opcode}",
@@ -295,13 +393,35 @@ def analyze_selected(program, hardware):
             )
         )
         completion.append(len(nodes) - 1)
-    result = evaluate_graph(RepeatedGraph(tuple(nodes)))
+    if graph_observer is not None:
+        graph_observer(RepeatedGraph(tuple(nodes)), descriptors)
+    from .physical_context import transform, identity
+
+    graph, ordering = transform(RepeatedGraph(tuple(nodes)), execution_model)
+    if execution_model in (
+        "pipeline",
+        "pipeline-ready",
+        "pipeline-startup",
+        "pipeline-startup-ready",
+    ):
+        from .calibrated_isa import pipeline_timing
+
+        callback = pipeline_timing(
+            {nodes[i].name: d for i, d in descriptors.items()},
+            startup_scenario="startup" in execution_model,
+        )
+        result = evaluate_graph(graph, event_timing=callback)
+    else:
+        result = evaluate_graph(graph)
     return dict(
         prediction_ns=result.duration_ns
         + hardware.timing_profile.fixed_kernel_ns,
         instruction_count=len(program.instructions),
         matmul_geometry_events=dict(geometry_counts),
-        event_count=len(nodes),
+        event_count=len(graph.nodes),
+        physical_model=execution_model,
+        physical_model_record=identity(execution_model),
+        ordering=ordering,
         unknown_completion=list(result.unknown_latency),
         service_ns=dict(result.service_ns),
         hbm_read_bytes=reads,

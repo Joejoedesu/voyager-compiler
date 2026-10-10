@@ -137,6 +137,11 @@ class TrainiumMappingPolicy:
     def vector_limits(self, anchor, limits):
         return limits
 
+    def stream_region_candidate(self, region, rows, residency):
+        from .stream_regions import candidate
+
+        return candidate(self.config, self.tuning, region, rows, residency)
+
     def row_region_candidate(self, region, rows):
         from .row_regions import candidate
 

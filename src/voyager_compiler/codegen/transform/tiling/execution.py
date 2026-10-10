@@ -130,7 +130,7 @@ class GraphTiming:
         return self.iteration_finishes_ns[-1] - self.iteration_finishes_ns[-2]
 
 
-def evaluate_graph(graph):
+def evaluate_graph(graph, *, event_timing=None):
     """Schedule finite repetitions exactly under the declared ASAP abstraction.
 
     Periodic nodes express retained loads and final reduction stores. A
@@ -195,6 +195,17 @@ def evaluate_graph(graph):
             heapq.heappop(future[resource])
         iteration, j = instances[index]
         node = nodes[j]
+        if event_timing is not None:
+            timed = event_timing(node, start)
+            if (timed.name, timed.resource, timed.dependencies) != (
+                node.name,
+                node.resource,
+                node.dependencies,
+            ):
+                raise ValueError(
+                    "Dynamic timing may not change graph identity or dependencies"
+                )
+            node = timed
         available[node.resource] = start + max(node.issue_ns, node.occupancy_ns)
         service[node.resource] = (
             service.get(node.resource, 0) + node.occupancy_ns
@@ -206,7 +217,10 @@ def evaluate_graph(graph):
             ready_at[dest] = max(ready_at[dest], start + node.offset(milestone))
             pending[dest] -= 1
             if not pending[dest]:
-                heapq.heappush(future[nodes[instances[dest][1]].resource], (ready_at[dest], dest))
+                heapq.heappush(
+                    future[nodes[instances[dest][1]].resource],
+                    (ready_at[dest], dest),
+                )
         completed += 1
     if completed != count:
         raise ValueError("Cyclic execution dependencies")

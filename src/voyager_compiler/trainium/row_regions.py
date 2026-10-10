@@ -149,7 +149,7 @@ def _candidate(config, tuning, region, rows, weight_layout):
             extra = max(
                 extra,
                 reduction_workspace(
-                    name, shapes[op][-1], len(op.all_input_nodes) - 1
+                    name, shapes[op][-1], len(op.all_input_nodes) - 1, tuning=tuning
                 ),
             )
     allocated += max(tuning.sbuf_reserve_bytes, extra)

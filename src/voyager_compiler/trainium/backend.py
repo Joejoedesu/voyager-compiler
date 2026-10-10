@@ -89,6 +89,14 @@ class TrainiumBackend:
             raise NotImplementedError(
                 "Trainium currently supports the shared per_kernel flow"
             )
+        if (buffers is not None and buffers.stream_regions
+                and buffers.stream_region_search == "expanded"
+                and not model.meta.get("stream_search_trial")):
+            from .region_search import compile_expanded_regions
+
+            return compile_expanded_regions(
+                self, model, example_args, example_kwargs, **options
+            )
         result = _compile_voyager(
             model, example_args, example_kwargs, **options
         )
@@ -98,7 +106,11 @@ class TrainiumBackend:
         # mappings may be shared across *different* regions with equal shapes.
         # Deduplicate within the owning region, never across the whole model.
         record = {
+            "block_regions": model.meta.get("block_regions", []),
             "row_regions": model.meta.get("row_regions", []),
+            "stream_regions": model.meta.get("stream_regions", []),
+            "stream_contraction_padding": model.meta.get("stream_contraction_padding", []),
+            "stream_search_trial": model.meta.get("stream_search_trial"),
             "hardware": asdict(config),
             "placement": model.meta.get("trainium_placement"),
             "mapping_constraints": {
@@ -158,7 +170,12 @@ class TrainiumBackend:
         if context.policy.tuning.isa_lowering:
             from .planning import select_plan
 
-            select_plan(options["output_dir"], context=context)
+            selected_root = model.meta.get("stream_selected_plan_root")
+            if selected_root is not None:
+                from .region_search import reuse_scored_plan
+                reuse_scored_plan(options["output_dir"], selected_root, context)
+            else:
+                select_plan(options["output_dir"], context=context)
         return result
 
     @staticmethod

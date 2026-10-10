@@ -64,7 +64,14 @@ def number(text, key):
     return int(match[1], 0)
 
 
-def predict(data, *, hardware=None, in_order=True):
+def predict(
+    data,
+    *,
+    hardware=None,
+    in_order=True,
+    context_model=False,
+    descriptor_observer=None,
+):
     # This is an allowlist, not a blacklist: new profile fields cannot leak in.
     if not set(data) <= {"instructions", "static_dma", "dma_audit"}:
         raise ValueError("Only static compiled metadata is accepted")
@@ -122,6 +129,7 @@ def predict(data, *, hardware=None, in_order=True):
         raise ValueError(
             "Compiled ISA adapter is pinned to Trainium2 / NeuronCore-v3"
         )
+    timing_descriptors = {}
     stream_context = StreamTransposeTiming()
     selected_law_counts = Counter()
     raw = []
@@ -333,6 +341,7 @@ def predict(data, *, hardware=None, in_order=True):
                     ),
                     streaming=last_tensor_matmul,
                 )
+            was_tensor_matmul = last_tensor_matmul
             last_tensor_matmul = not trans
             service = expansion.tensor_cycles / hw.frequency
             law_name = (
@@ -343,6 +352,88 @@ def predict(data, *, hardware=None, in_order=True):
             occ, lat = law.evaluate(service) if law else (service, None)
             if expansion.timing_override is not None:
                 occ, lat, _ = expansion.timing_override
+            if context_model:
+                from .calibrated_isa import evaluate
+
+                if op in ("MATMUL", "LDWEIGHTS"):
+                    descriptor = dict(
+                        opcode="nc_transpose" if trans else "nc_matmul",
+                        engine=eng,
+                        dtype=dt,
+                        partitions=n,
+                        free=m,
+                        source_free=m,
+                        source_memory="SBUF",
+                        transpose=trans,
+                        source_stride=(
+                            abs(fields(ld[0]["operands"])["src"][2][0])
+                            if trans
+                            else abs(shapes["src"][2][0])
+                        ),
+                        destination_stride=1,
+                        function="",
+                    )
+                    if not trans:
+                        descriptor.update(
+                            moving=m,
+                            stationary=n,
+                            contraction=k,
+                            moving_stride=abs(shapes["src"][2][0]),
+                            stationary_stride=abs(
+                                fields(ld[0]["operands"])["src"][2][0]
+                            ),
+                            streaming=was_tensor_matmul,
+                        )
+                else:
+                    src = fs.get("src")
+                    fun = re.search(r"\b(EXP|SIGMOID|RSQRT)\b", i["operands"])
+                    reduction = re.search(r"\bop=(ADD|MAX)\b", i["operands"])
+                    descriptor = dict(
+                        opcode={
+                            "COPY": "tensor_copy",
+                            "ACTIVATE": "activation",
+                            "RECIPROCAL": "reciprocal",
+                            "TENSOR_REDUCE": "tensor_reduce",
+                        }.get(op, op),
+                        engine=eng,
+                        dtype=dt,
+                        partitions=(
+                            number(i["operands"], "channels")
+                            if "channels=" in i["operands"]
+                            else 0
+                        ),
+                        free=free,
+                        source_free=math.prod(src[3]) if src else 0,
+                        source_memory=(
+                            ("PSUM" if src[1] >= 0x2000000 else "SBUF")
+                            if src
+                            else None
+                        ),
+                        source_dtype=DTYPE.get(src[0], src[0]) if src else None,
+                        source_stride=(
+                            abs(src[2][0])
+                            if src and all(x == 1 for x in src[3][1:])
+                            else None
+                        ),
+                        destination_stride=(
+                            abs(dst[2][0])
+                            if all(x == 1 for x in dst[3][1:])
+                            else None
+                        ),
+                        transpose=False,
+                        function=(
+                            fun[1].lower()
+                            if fun
+                            else (reduction[1].lower() if reduction else "")
+                        ),
+                    )
+                timing_descriptors[f"u{uid}_{op}"] = descriptor
+                override = evaluate(descriptor, occ, lat, None)
+                if override is not None:
+                    occ, lat, _ = override
+                    if missing.get(law_name, 0):
+                        missing[law_name] -= 1
+                    selected_law_counts["context:" + descriptor["opcode"]] += 1
             first = end = issue_node = add(
                 f"u{uid}_{op}", eng, occ, occ, lat, law_name
             )
@@ -421,6 +512,88 @@ def predict(data, *, hardware=None, in_order=True):
             occ, lat = law.evaluate(service) if law else (service, None)
             if law is None and not law_name.startswith("UNSUPPORTED"):
                 missing[law_name] += 1
+            if context_model:
+                from .calibrated_isa import evaluate
+
+                if op in ("MATMUL", "LDWEIGHTS"):
+                    descriptor = dict(
+                        opcode="nc_transpose" if trans else "nc_matmul",
+                        engine=eng,
+                        dtype=dt,
+                        partitions=n,
+                        free=m,
+                        source_free=m,
+                        source_memory="SBUF",
+                        transpose=trans,
+                        source_stride=(
+                            abs(fields(ld[0]["operands"])["src"][2][0])
+                            if trans
+                            else abs(shapes["src"][2][0])
+                        ),
+                        destination_stride=1,
+                        function="",
+                    )
+                    if not trans:
+                        descriptor.update(
+                            moving=m,
+                            stationary=n,
+                            contraction=k,
+                            moving_stride=abs(shapes["src"][2][0]),
+                            stationary_stride=abs(
+                                fields(ld[0]["operands"])["src"][2][0]
+                            ),
+                            streaming=was_tensor_matmul,
+                        )
+                else:
+                    src = fs.get("src")
+                    fun = re.search(r"\b(EXP|SIGMOID|RSQRT)\b", i["operands"])
+                    reduction = re.search(r"\bop=(ADD|MAX)\b", i["operands"])
+                    descriptor = dict(
+                        opcode={
+                            "COPY": "tensor_copy",
+                            "ACTIVATE": "activation",
+                            "RECIPROCAL": "reciprocal",
+                            "TENSOR_REDUCE": "tensor_reduce",
+                        }.get(op, op),
+                        engine=eng,
+                        dtype=dt,
+                        partitions=(
+                            number(i["operands"], "channels")
+                            if "channels=" in i["operands"]
+                            else 0
+                        ),
+                        free=free,
+                        source_free=math.prod(src[3]) if src else 0,
+                        source_memory=(
+                            ("PSUM" if src[1] >= 0x2000000 else "SBUF")
+                            if src
+                            else None
+                        ),
+                        source_dtype=DTYPE.get(src[0], src[0]) if src else None,
+                        source_stride=(
+                            abs(src[2][0])
+                            if src and all(x == 1 for x in src[3][1:])
+                            else None
+                        ),
+                        destination_stride=(
+                            abs(dst[2][0])
+                            if all(x == 1 for x in dst[3][1:])
+                            else None
+                        ),
+                        transpose=False,
+                        function=(
+                            fun[1].lower()
+                            if fun
+                            else (reduction[1].lower() if reduction else "")
+                        ),
+                    )
+                timing_descriptors[f"u{uid}_{op}"] = descriptor
+                override = evaluate(descriptor, occ, lat, None)
+                if override is not None:
+                    occ, lat, _ = override
+                    if missing.get(law_name, 0):
+                        missing[law_name] -= 1
+                    selected_law_counts["context:" + descriptor["opcode"]] += 1
             first = end = issue_node = add(
                 f"u{uid}_{op}", eng, occ, occ, lat, law_name
             )
@@ -531,6 +704,8 @@ def predict(data, *, hardware=None, in_order=True):
             for old in order
         )
     )
+    if descriptor_observer is not None:
+        descriptor_observer(timing_descriptors)
     result = evaluate_graph(graph)
     unsupported = sum(
         v for k, v in missing.items() if k.startswith("UNSUPPORTED")

@@ -1,8 +1,5 @@
 # Model × hardware compilation
 
-The Trainium experiment's formal conversion boundary and current validation are
-documented in [Trainium selected ISA plans](trainium-selected-plan.md).
-
 The default target is `voyager` (there is no separate `default` profile).
 Existing commands without a target or recipe retain their CLI defaults.
 
@@ -555,27 +552,3 @@ local ignored artifacts. The source/tests/documentation can be published using
 the commands above; external model weights, simulator binaries and large
 validation outputs are not included. Earlier development failures remain in the
 ignored results directory; the linked records are the completed acceptance runs.
-
-## Trainium adapter
-
-The `trainium-v2` and `trainium-v3` targets bind to the same shared target,
-Interstellar, buffer-plan and per-kernel bufferization interfaces as Gemmini.
-See [Trainium integration and validation](trainium.md) for analytical-model
-scope, physical capacities, instruction realization and reproduction commands.
-
-### Optional selected execution plans
-
-`CandidateEvaluation.execution_plan` carries a target's selected operation
-implementations, repeated dependency graph, instruction counts and buffering
-assumptions. It defaults to `None`; existing Voyager/Gemmini evaluation remains
-unchanged. Targets can use the shared timing evaluator from
-`codegen/transform/tiling/execution.py` inside their existing `evaluate()` hook,
-then audit the realized program through `realize()`. There is no second search
-pass. The [Trainium binding](trainium-dependency-model.md) documents the first
-consumer and the limits of its source-level realization audit.
-
-
-For the Trainium ISA integration, the converter is required to perform formal
-emission only. Layout/implementation selection, instruction subdivision,
-transfers, buffering, operation order and physical placement must be resolved
-before conversion. See [the required converter boundary and current gaps](trainium-dependency-model.md#required-converter-boundary).

@@ -453,7 +453,7 @@ class _FA3Pipeline(torch.nn.Module):
         commit(body, [*operands, pv_buf], dependencies=deps, post=sem_pv)
 
     def _softmax(
-        self, s_slot, p_slot, m, l, row_tmp, alpha, sem_scores, p_scale, probs
+        self, s_slot, p_slot, m, l, row_tmp, alpha, sem_scores, p_scale, probs, *, wait_scores=True
     ):
         """[D]'s chain: waits for S, then rowmax / m / alpha / P / rowsum
         / l (the baseline passes 2-7).  Unquantized, P lands in ``p_slot``
@@ -464,7 +464,8 @@ class _FA3Pipeline(torch.nn.Module):
         parameters -- ``probs``: the lookup table, the scale codebook and
         the midpoints -- into ``p_slot``'s codes and ``p_scale``."""
         mx = probs is not None
-        voyager.async_wait(sem_scores)
+        if wait_scores:
+            voyager.async_wait(sem_scores)
         voyager.insert(torch.amax(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(torch.maximum(m, row_tmp), row_tmp)
         voyager.insert(torch.exp(m - row_tmp), alpha)

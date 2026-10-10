@@ -34,8 +34,25 @@ class TrainiumTuning:
     # Multiplier for reusable SBUF slot pools; 1 preserves existing placement.
     # This is independent of shared software-tile max_buffer_depth.
     temporary_buffer_depth: int = 1
+    physical_model: str = "baseline"
+    layernorm_algorithm: str = "centered"
+    layernorm_fused: bool = False
+    layernorm_square_engine: str = "vector"
 
     def __post_init__(self):
+        from .normalization import ALGORITHMS
+
+        if (
+            self.layernorm_algorithm not in ALGORITHMS
+            or self.layernorm_square_engine not in ("vector", "scalar")
+        ):
+            raise ValueError("Unknown LayerNorm rewrite")
+        if type(self.layernorm_fused) is not bool:
+            raise TypeError("LayerNorm fusion must be boolean")
+        from .physical_context import MODES
+
+        if self.physical_model not in MODES:
+            raise ValueError("Unknown physical execution model")
         if (
             type(self.movement_search_budget) is not int
             or self.movement_search_budget < 0
@@ -68,31 +85,46 @@ class TrainiumTuning:
             )
         ):
             raise TypeError("Instruction mode switches must be boolean")
-        if type(self.temporary_buffer_depth) is not int or self.temporary_buffer_depth < 1:
-            raise ValueError("Temporary buffer depth must be a positive integer")
+        if (
+            type(self.temporary_buffer_depth) is not int
+            or self.temporary_buffer_depth < 1
+        ):
+            raise ValueError(
+                "Temporary buffer depth must be a positive integer"
+            )
         if self.temporary_buffer_depth != 1 and (
             not self.strict_realization or not self.isa_lowering
         ):
-            raise ValueError("Temporary buffer depth requires strict ISA realization")
+            raise ValueError(
+                "Temporary buffer depth requires strict ISA realization"
+            )
         if self.buffer_allocation not in ("compiler", "legacy_logical"):
             raise ValueError("Unknown buffer allocation contract")
         if not 1 <= self.min_buffer_depth <= self.max_buffer_depth:
             raise ValueError("Invalid minimum buffer depth")
         if self.matmul_operands not in ("staged", "direct", "reuse"):
             raise ValueError("Unknown matmul operand policy")
-        if self.matmul_weight_layout not in ("auto", "generic", "k_partitioned"):
+        if self.matmul_weight_layout not in (
+            "auto",
+            "generic",
+            "k_partitioned",
+        ):
             raise ValueError("Unknown matmul weight layout")
         if self.matmul_orientation not in ("auto", "weights", "activations"):
             raise ValueError("Unknown matmul orientation")
         if self.matmul_orientation == "activations" and not self.isa_lowering:
-            raise ValueError("Activation-stationary panels require ISA lowering")
+            raise ValueError(
+                "Activation-stationary panels require ISA lowering"
+            )
         if self.matmul_operands != "staged" and not self.isa_lowering:
             raise ValueError("Direct/reused operands require ISA lowering")
         if not self.strict_realization:
             if not self.isa_lowering:
                 raise ValueError("Relaxed realization requires ISA lowering")
             if self.movement_search_budget:
-                raise ValueError("Movement search currently requires strict realization")
+                raise ValueError(
+                    "Movement search currently requires strict realization"
+                )
         if self.copy_policy not in ("balanced", "scalar"):
             raise ValueError("Unknown ISA copy policy")
         if self.isa_lowering and not self.explicit_isa:

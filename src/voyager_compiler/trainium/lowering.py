@@ -50,6 +50,19 @@ RECIPES = {
 }
 
 
+def recipe_for(name, tuning=None):
+    if name != "layer_norm" or tuning is None:
+        return RECIPES[name]
+    from .normalization import layernorm_recipe
+
+    return layernorm_recipe(
+        Step,
+        algorithm=tuning.layernorm_algorithm,
+        fused=tuning.layernorm_fused,
+        square_engine=tuning.layernorm_square_engine,
+    )
+
+
 def operation_name(target):
     parts = str(target).replace("::", ".").split(".")
     return parts[1] if len(parts) > 1 else parts[0]
@@ -90,6 +103,12 @@ def prepare_graph(model, hardware):
 
 def expression(step, values, width, epsilon):
     args = [values[x] for x in step.inputs]
+    if step.instruction == "first":
+        return f"nisa.tensor_copy({args[0]}[:,0:1], engine=nisa.vector_engine)"
+    if step.instruction == "difference_epsilon":
+        return f"nisa.tensor_scalar({args[0]}, op0=nl.subtract, operand0={args[1]}, op1=nl.add, operand1={epsilon}, engine=nisa.vector_engine)"
+    if step.instruction == "center_scale":
+        return f"nisa.tensor_scalar({args[0]}, op0=nl.subtract, operand0={args[1]}, op1=nl.multiply, operand1={args[2]}, engine=nisa.vector_engine)"
     if step.instruction == "reduce":
         return f"nisa.tensor_reduce(nl.{step.op}, {args[0]}, axis=[1], keepdims=True, dtype=nl.float32)"
     if step.instruction == "binary":
@@ -106,7 +125,7 @@ def expression(step, values, width, epsilon):
     raise ValueError(step)
 
 
-def reduction_graph(hardware, name, rows, width):
+def reduction_graph(hardware, name, rows, width, tuning=None):
     """Concrete instruction dependencies and service; absent completion stays unknown."""
     from voyager_compiler.codegen.transform.tiling.execution import (
         OperationEvent,
@@ -116,7 +135,7 @@ def reduction_graph(hardware, name, rows, width):
     import math
 
     nodes, values = [], {}
-    for step in RECIPES[name]:
+    for step in recipe_for(name, tuning):
         engine = "ScalarE" if step.instruction == "activation" else "VectorE"
         free = (
             width if step.shape == "tile" or step.instruction == "reduce" else 1
@@ -135,7 +154,12 @@ def reduction_graph(hardware, name, rows, width):
             )
         )
         service = cycles / (1.2 if engine == "ScalarE" else 0.96)
-        impl = f"nki.{step.instruction}.float32.{engine}"
+        instruction = {
+            "first": "copy",
+            "difference_epsilon": "scalar",
+            "center_scale": "scalar",
+        }.get(step.instruction, step.instruction)
+        impl = f"nki.{instruction}.float32.{engine}"
         law = hardware.timing_profile.operation(impl)
         occupancy, latency = law.evaluate(service) if law else (service, None)
         dependencies = tuple(
@@ -184,7 +208,7 @@ def realize_reduction(converter, name, kwargs, destination):
     c.used_implementations.add(f"nki.{name}.float32")
     if hasattr(c, "row_buffers") and kwargs["input"].name in c.row_buffers:
         values = {"input": c.read(kwargs["input"])}
-        for step in RECIPES[name]:
+        for step in recipe_for(name, c.tuning):
             if step.instruction == "parameter":
                 parameter = kwargs.get(step.inputs[1])
                 if parameter is None:
@@ -245,7 +269,7 @@ def realize_reduction(converter, name, kwargs, destination):
                     f"{local}[:, {col}:{col+extent}] = nisa.tensor_copy({tile}, engine=nisa.vector_engine)"
                 )
             values[argument] = local
-        for step in RECIPES[name]:
+        for step in recipe_for(name, c.tuning):
             if step.instruction == "parameter":
                 values[step.name] = values[step.inputs[0]]
             else:
@@ -257,7 +281,7 @@ def realize_reduction(converter, name, kwargs, destination):
             tile = c.tmp(f"{values['result']}[:, {col}:{col+extent}]")
             tile = c.local_copy(tile)
             tile = c.transpose(tile)
-            for step in RECIPES[name]:
+            for step in recipe_for(name, c.tuning):
                 if step.instruction != "parameter":
                     continue
                 parameter = kwargs.get(step.inputs[1])
@@ -283,14 +307,14 @@ def realize_reduction(converter, name, kwargs, destination):
     return PanelValue(rows, width, panels)
 
 
-def reduction_workspace(name, width, parameters=0):
+def reduction_workspace(name, width, parameters=0, tuning=None):
     """Per-partition allocation envelope for the early recipe's live SSA values.
 
     All 128 partitions are reserved conservatively, including partial row tiles.
     Reuse begins only after the last reader; input/output conversion temporaries
     add two 128-wide panels. This is workspace, not fictitious hardware capacity.
     """
-    recipe = RECIPES[name]
+    recipe = recipe_for(name, tuning)
     last = {
         value: max(i for i, step in enumerate(recipe) if value in step.inputs)
         for value in {x for step in recipe for x in step.inputs}
@@ -407,7 +431,8 @@ def tile_graph(
                             )
                         )
                 computed = append(
-                    reduction_graph(hardware, name, count, width), layouts
+                    reduction_graph(hardware, name, count, width, tuning),
+                    layouts,
                 )
                 returned = []
                 for col in range(0, width, 128):
@@ -586,8 +611,10 @@ def row_reduction_graph(hardware, name, shape, inputs, tuning, repetitions):
         else:
             ready.extend(loaded)
     start = len(nodes)
-    graph = reduction_graph(hardware, name, math.prod(shape[:-1]), shape[-1])
-    for step, n in zip(RECIPES[name], graph.nodes):
+    graph = reduction_graph(
+        hardware, name, math.prod(shape[:-1]), shape[-1], tuning
+    )
+    for step, n in zip(recipe_for(name, tuning), graph.nodes):
         dependencies = tuple(
             replace(d, source=d.source + start) for d in n.dependencies
         )

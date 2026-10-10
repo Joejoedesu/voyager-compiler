@@ -67,8 +67,25 @@ class BufferizationOptions:
     flow: str = "per_kernel"
     parameter_loading: str = "on_demand"
     row_regions: bool = False
+    stream_regions: bool = False
+    block_regions: bool = False
+    # Full physical ISA evaluation before selecting a region schedule.
+    stream_region_search: str = "expanded"
+    stream_region_row_candidates: int = 2
+    stream_region_search_budget: int = 16
 
     def __post_init__(self):
+        if self.block_regions and (self.flow != "per_kernel" or self.row_regions or self.stream_regions):
+            raise ValueError("Blocked regions require a separate per_kernel search")
+        if self.stream_region_search not in ("expanded", "compact"):
+            raise ValueError("Unknown stream-region search objective")
+        for value in (self.stream_region_row_candidates, self.stream_region_search_budget):
+            if type(value) is not int or value < 1:
+                raise ValueError("Stream-region search bounds must be positive integers")
+        if type(self.stream_regions) is not bool:
+            raise TypeError("stream_regions must be boolean")
+        if self.stream_regions and (self.flow != "per_kernel" or self.row_regions):
+            raise ValueError("Stream regions require per_kernel flow without row_regions")
         if type(self.row_regions) is not bool:
             raise TypeError("row_regions must be boolean")
         if self.row_regions and self.flow != "per_kernel":

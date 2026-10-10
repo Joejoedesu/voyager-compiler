@@ -1,0 +1,886 @@
+{
+  "schema": 1,
+  "name": "isolated-ISA-access-sectors-2026-10-09",
+  "models": {
+    "copy": {
+      "template": "sector_ramp",
+      "coefficients": [
+        187.69230769230765,
+        0.8674349547511314,
+        0.8762048689668174,
+        0.09463339873208898
+      ],
+      "stride_ramp_bounds": [
+        16,
+        24
+      ],
+      "interpretation": "Empirical address-step regime; underlying bank/decoder mechanism unproven.",
+      "widths": [
+        128,
+        512
+      ],
+      "max_stride": 32,
+      "offset_scope": "alignment-tested separately"
+    },
+    "copy_vector": {
+      "template": "vector_elements",
+      "coefficients": [
+        160.51127819548861,
+        0.5207438238453276
+      ],
+      "min_width": 64,
+      "max_width": 2048
+    },
+    "exp": {
+      "template": "vector_elements",
+      "coefficients": [
+        293.46679664833005,
+        0.8333141117145973
+      ],
+      "min_width": 64,
+      "max_width": 8192
+    },
+    "psum_copy": {
+      "template": "vector_elements",
+      "coefficients": [
+        156.28571428571425,
+        1.0424107142857144
+      ],
+      "min_width": 64,
+      "max_width": 512
+    },
+    "psum_reduce_max": {
+      "template": "vector_elements",
+      "coefficients": [
+        156.28571428571425,
+        1.0424107142857144
+      ],
+      "min_width": 64,
+      "max_width": 512
+    },
+    "psum_reduce_sum": {
+      "template": "vector_elements",
+      "coefficients": [
+        156.28571428571425,
+        1.0424107142857144
+      ],
+      "min_width": 64,
+      "max_width": 512
+    },
+    "reciprocal": {
+      "template": "vector_elements",
+      "coefficients": [
+        154.33454095312047,
+        6.249291314675375
+      ],
+      "min_width": 1,
+      "max_width": 2048
+    },
+    "reduce_max": {
+      "template": "vector_elements",
+      "coefficients": [
+        152.49315275166484,
+        1.0417491745584109
+      ],
+      "min_width": 64,
+      "max_width": 8192
+    },
+    "reduce_sum": {
+      "template": "vector_elements",
+      "coefficients": [
+        152.5332033516697,
+        1.0416858882854028
+      ],
+      "min_width": 64,
+      "max_width": 8192
+    },
+    "rsqrt": {
+      "template": "vector_elements",
+      "coefficients": [
+        293.388670530408,
+        0.8333089325650904
+      ],
+      "min_width": 1,
+      "max_width": 2048
+    },
+    "sigmoid": {
+      "template": "vector_elements",
+      "coefficients": [
+        293.46679664833005,
+        0.8333141117145973
+      ],
+      "min_width": 64,
+      "max_width": 8192
+    },
+    "transpose": {
+      "template": "sectors16",
+      "coefficients": [
+        0.0,
+        3.739701704545454,
+        0.07335633116883125
+      ],
+      "stride_ramp_bounds": null,
+      "interpretation": "Dependent-chain transpose completion.",
+      "widths": [
+        128
+      ],
+      "max_stride": 32,
+      "offset_scope": "alignment-tested separately"
+    },
+    "matmul": {
+      "template": "sectors16",
+      "coefficients": {
+        "issue_ns": [
+          7.238095238095248,
+          1.7034970238095244,
+          2.0453125
+        ],
+        "completion_ns": [
+          183.95238095238082,
+          2.524695815826331,
+          3.112821691176471
+        ]
+      },
+      "widths": [
+        128,
+        512
+      ],
+      "max_stride": 32,
+      "stationary_stride": 1,
+      "stationary": 128,
+      "contraction": 128
+    },
+    "copy_stream": {
+      "template": "sector_ramp_issue",
+      "coefficients": [
+        0.0,
+        1.5546874999999998,
+        0.9296875000000004,
+        0.08691406249999997
+      ],
+      "width": 128,
+      "max_stride": 24,
+      "stride_ramp_bounds": [
+        16,
+        24
+      ],
+      "scope": "Independent commands; no same-engine waits, FP32 ScalarE. Width128 only."
+    },
+    "scatter_stream": {
+      "template": "sector_ramp_issue",
+      "coefficients": [
+        0.0,
+        1.5546875000000007,
+        0.22656249999999875,
+        0.08984375000000008
+      ],
+      "width": 128,
+      "max_stride": 24,
+      "stride_ramp_bounds": [
+        16,
+        24
+      ],
+      "scope": "Independent commands; no same-engine waits, FP32 ScalarE. Width128 only."
+    },
+    "transpose_stream": {
+      "template": "pipeline_and_allowance_scenarios",
+      "completion_ns": 377,
+      "issue_ns": 168,
+      "startup_completion_ns": 629.0,
+      "startup_issue_ns": 213.0,
+      "width": 128,
+      "max_stride": 24,
+      "note": "Full allowance is trace-confirmed only in calibration; startup slow regime has no contemporaneous allowance record. Runtime state transitions are not predicted. Scenarios are hardware-environment assumptions, not searchable kernel choices."
+    },
+    "shortk": {
+      "template": "predicted_pipeline_context",
+      "moving": 512,
+      "stationary": 128,
+      "contraction": 64,
+      "moving_stride": 1,
+      "stationary_stride": 1,
+      "issue_ns": 1707,
+      "stream_completion_ns": 2765.0,
+      "fresh_completion_ns": 2077.0,
+      "note": "FP32 only. Fresh spacing includes VectorE producer and is not an intrinsic issue rate. Busy/drained and mode-transition inference needs broader validation."
+    }
+  },
+  "evidence": [
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s1-o0/result.json",
+      "sha256": "1cfbdb488b321e1267d05df9987cabf80747beda84f9c1715864ea21ea86acb8",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s1-o1/result.json",
+      "sha256": "341cc6fd09aa3a5da8f6582ff5f3648137e975a9f36e42e036265f4fb757d2d8",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s12-o0/result.json",
+      "sha256": "3e97363b891ad2b98633bc90e01c672350739b7eb9a8c1da39b9fcd9d2b9ad9b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s15-o0/result.json",
+      "sha256": "2e1e8fa1b357013902ab18ee56d8f0e1a1e352d350e5f00a3e00003442245bad",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s16-o0/result.json",
+      "sha256": "f0da3a0e5a94b8bb5933d8acada1bb4cf26a68e7c79dc05e5860c6a46d16f5bd",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s16-o1/result.json",
+      "sha256": "2e288a2c2f2031fa0077d649f8f5c05d01185a26198427832921085443880358",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s17-o0/result.json",
+      "sha256": "ee111919d9a492b5614b53fde2a70bd963843f651cef9c4e5f1a0a36f5bb66b4",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s2-o0/result.json",
+      "sha256": "a8ba268fc7c7b371662c3d8a23686793b2253219e312451af451bb3dddb3b56e",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s24-o0/result.json",
+      "sha256": "32f4aaff4f1ff01009f7e7107afbe6f6a74a56a5c8a7391ea1bdaaadd6eba42f",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s3-o0/result.json",
+      "sha256": "437b39da417ac41508981578b9a53e84475b771d9c835c3848d91d727876dc8a",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s32-o0/result.json",
+      "sha256": "62a7f97d6ed18a94f93249afdbf9e5834ee72568fccb360d5a9569dac96b2ec3",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s4-o0/result.json",
+      "sha256": "dbf2b5d52e6bbd9ff85b07d319c2e9c3c8e6e397e31936550a3b37dbc42b2777",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s4-o1/result.json",
+      "sha256": "2354cb1e6700b0fa77d8fa85c6c580a80aba6440cff27bcaf60848154b04b89e",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s5-o0/result.json",
+      "sha256": "81d5af6459b6dddc5d3c31bd08fdf4a9f163f7aca12dd4cee1bb1f39f23d19e8",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s5-o1/result.json",
+      "sha256": "0d3299ed1a663571c7ab8c8c9c869136b0288c89188a6bf06e7aeaa92e52b7d2",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s6-o0/result.json",
+      "sha256": "768b1d231fef2ae59384fe98b51132ffd4ecc9a4698b9f03eac2cbd7b747d472",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s7-o0/result.json",
+      "sha256": "f6f5ea8ef0eda9575c5eda9eb357ae00adb4a2439abd75abd7659894169f2506",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s8-o0/result.json",
+      "sha256": "78208312aa99cff98d7f2e480b636d16818d53fc16fdd3200681803b47088543",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s8-o1/result.json",
+      "sha256": "61fa83e4f4123df008a77f172b3b0265734f17604ddbb176d73ec46e797722ba",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w128-s9-o0/result.json",
+      "sha256": "46434da390b83542d2b39bd4ac5f2cf9846354817bcd6d7bf13d045e69558b59",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s1-o0/result.json",
+      "sha256": "50ffd0686617724c869c96c65a5c33ac1bda720cafd9354dee5198087768953a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s16-o0/result.json",
+      "sha256": "6f1e6c0f2810c3c4a5a7254e13682f480e318654368d7559bacb8ab167048aac",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s2-o0/result.json",
+      "sha256": "e5e700740549de2e2cc34baa3d2b86b989abf645dc16401808e59559edf90106",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s24-o0/result.json",
+      "sha256": "b816797aa70192d2cf4b8de8b1dbf760771d58920bb2ba01acac616ab0e93343",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s3-o0/result.json",
+      "sha256": "2a279bcdcac77dcbc0d64e55f38d01acbef0ee0d3ffc5522dba87e8575d1ddf3",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s4-o0/result.json",
+      "sha256": "f0a7116072949c40682f02445df89d3cfccd7ebcfd5e600d040eeb7e58effc24",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s5-o0/result.json",
+      "sha256": "c21483eaeb185a539d452b67a905f89949339e9878b52570224bd98333dd281b",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy-w512-s8-o0/result.json",
+      "sha256": "0fc8ffd96a7df71241a48f504e9d58950969f8bf5d0fbaffce8280ea608608ca",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_vector-w128-s1-o0/result.json",
+      "sha256": "64e72d8c5216ca7a6891e01454a33e799406b30e1c9afb9f5c5d2d9ad1578750",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_vector-w2048-s1-o0/result.json",
+      "sha256": "ccd1e8f4b817f6f8785e2aedad0da72c9e7550e53de93dc9958abd9da9c1b20d",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_vector-w512-s1-o0/result.json",
+      "sha256": "bb28020d70c926ba626f4ddae867d9a755ef9985a0160570e626c6eee3bc8118",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_vector-w64-s1-o0/result.json",
+      "sha256": "7b80b99c9a582c906ec191ce6a115c940ba772a34bc5d497ddb037c0e9381da2",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w128-s1-o0/result.json",
+      "sha256": "c409e72642fade80610add55beb72647eacb757cb4d5ee2162512c98cf198d10",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w2048-s1-o0/result.json",
+      "sha256": "f8fe20554dd372dd0f3cb945e8fe8115c72e1e1e9efff97fb544248aa8cb27a7",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w4096-s1-o0/result.json",
+      "sha256": "52db53d7b0254fbcec78ea420b4f052cbfc77eea92e470136b3df619e270fdfb",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w512-s1-o0/result.json",
+      "sha256": "9f4f40b6bfb0933962ccf42e867253821588b54727699a2f7d74a8b76d81b193",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w64-s1-o0/result.json",
+      "sha256": "2c5e0befc84bf67202a5450e95243df2f3b065bc832d82cba8a06ababa1ae46f",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/exp-w8192-s1-o0/result.json",
+      "sha256": "403f60351b0c6e6920f46948701c48fca45aadcc9b5371e626e830e5dc9bec05",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_copy-w128-s1-o0/result.json",
+      "sha256": "78fd4bb7dfcf7c84fba9845e856334cc1afc2a936533c521537682cabbc97b12",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_copy-w512-s1-o0/result.json",
+      "sha256": "0f867ec30f9361e4049afecae634eaddafab797903f578ea63b5d67bdee7a989",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_copy-w64-s1-o0/result.json",
+      "sha256": "a46303dbe4a07c2a499273d244d0715b2d7c5fb5a5c948bf201f0d9ee4b8ad73",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_max-w128-s1-o0/result.json",
+      "sha256": "d20eec6dfd0bea78942bace832295bbc738f1ef2ca8c57765792ae2a9fa79619",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_max-w512-s1-o0/result.json",
+      "sha256": "2b6d16a64f9293572a5c796142fa207c9e35342f58624cfe252334ec07bc705f",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_max-w64-s1-o0/result.json",
+      "sha256": "eb0c98dfa883428c3c6398a3592f7165d14be2bb3b8e490a59a189ad3c8e4a99",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_sum-w128-s1-o0/result.json",
+      "sha256": "b5e116a4d9ddbf9a9f24a7af3f8ea2690edea59db0023db774c65fad5b49ec5b",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_sum-w512-s1-o0/result.json",
+      "sha256": "5f0d131fa0abe1547c0b79d1f78f45f9924f832139747f9559f0618522a3d439",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/psum_reduce_sum-w64-s1-o0/result.json",
+      "sha256": "f9bf18cfc8d246db9196e46a4fcdbf20c254ce552a4a4fbceb20fdeb6e12d9d7",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reciprocal-w1-s1-o0/result.json",
+      "sha256": "ff77d5b1ee090c5f601619b6717adc5020742ee0c8d55156799926e402ecbf90",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reciprocal-w128-s1-o0/result.json",
+      "sha256": "7f383c8dcb82ac2aef6cd0ec973edf6a1057a171b2602a97870a83b87cd29035",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reciprocal-w2048-s1-o0/result.json",
+      "sha256": "7168b0234665d8f874c8146088d2db1ee1fe6476fea51c5f98a6acb458606a2a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reciprocal-w512-s1-o0/result.json",
+      "sha256": "50920c8e19fc56a7a027250aaa4695c01d83d1d56f5072063610275819741176",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reciprocal-w64-s1-o0/result.json",
+      "sha256": "2c948495216f6b61e0381568b7de909542617d9b733785427cf6ecebf1a28f59",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w128-s1-o0/result.json",
+      "sha256": "3f32a6e068fef9ea179f082581b43c005e3bb04bf884d2cf7e90cc228d233ec6",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w2048-s1-o0/result.json",
+      "sha256": "5fc428b0a6f7a4a8bc53d29bbadc57f80feac945c5acf4a7c66a1c8e76488cea",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w4096-s1-o0/result.json",
+      "sha256": "4588929fbb860d5ed5e4ab063c1419477d1541d022d94ce522bf594fdbc9483a",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w512-s1-o0/result.json",
+      "sha256": "e272a86557bb128e16201bef06373589e4db70f0d4433bf2975031a008b039b3",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w64-s1-o0/result.json",
+      "sha256": "47e7109679c59beb557bf92291f64ab209f218df517ddd5826b306bf6b9e291a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_max-w8192-s1-o0/result.json",
+      "sha256": "a435427e2a04d52982d5202fb1cc2eb483682bb8c9b72bf68bf6db7f0ed17e62",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w128-s1-o0/result.json",
+      "sha256": "28820d6e74fd3188201821dad3e3ad9b22536ae50473f51fdfe8982ac6888d1b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w2048-s1-o0/result.json",
+      "sha256": "d21a381bd30fffd8f3e76b53cf3706ae56689acfa779a9b00e849db9de2ba75a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w4096-s1-o0/result.json",
+      "sha256": "686ebe3c033e9e3fe711fbb3d1e4f284c6e9a4816619e90e9e454067872ede26",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w512-s1-o0/result.json",
+      "sha256": "144c07b57407cb0dcfb09605fb3d00b38bff0ef6133c92fe5d4b278c2a49470a",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w64-s1-o0/result.json",
+      "sha256": "728efb6cebf1c752408c9574893f76fd563251b3f80df725b9d005682148e118",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/reduce_sum-w8192-s1-o0/result.json",
+      "sha256": "46f6d5ade28a4fa5222ab345333b8f74a0a1d779bfcdb47a973c64f6640d50ab",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/rsqrt-w1-s1-o0/result.json",
+      "sha256": "63aaa7059e4bd6f305c1459587a46bcd9d839e898b70e97bee4970e2ebab4670",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/rsqrt-w128-s1-o0/result.json",
+      "sha256": "66765050026cca87e8128a10724f96b492ead3fc3fd7770982bf9bf74067f354",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/rsqrt-w2048-s1-o0/result.json",
+      "sha256": "f9dfc970133a1e351e247a75583ce69ef473437218b68ebc2e9264f494ea503c",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/rsqrt-w512-s1-o0/result.json",
+      "sha256": "6cb4758c82ec1cf42730b7b9735e59e6fc2b30c7f4e8ce09dc0ff16be9f3fabe",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/rsqrt-w64-s1-o0/result.json",
+      "sha256": "1ff923853457ffddda2dbf659af44689e54c85d5b3b1f1362c79dfe381be2a4c",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w128-s1-o0/result.json",
+      "sha256": "ed369ef79f8237f570af3c4fec39f2319ddb76a6f14dc848e5051e1137a3038c",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w2048-s1-o0/result.json",
+      "sha256": "d5a0598e26f1d803eaba2fb7e43ec92f54db875c52a71a9d780ad8b69ff9343b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w3072-s1-o0/result.json",
+      "sha256": "61bc69c07816711ee48add3a896772ba01c270e0f2b18928e18f1cd3395e18f2",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w512-s1-o0/result.json",
+      "sha256": "fe13a987c0fb17badf7b1e6311398ba2650dd4e064fca85491c4681703e43f5c",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w64-s1-o0/result.json",
+      "sha256": "f3d621141e909fad4e64535222402ff24ad958b306960d65e674f9abc5451b0b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/sigmoid-w8192-s1-o0/result.json",
+      "sha256": "7e83159e85aac6529c1ec42a2b3875ccd3413217f7a82f26b323555dd305d341",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s1-o0/result.json",
+      "sha256": "0920af0e20f6dd775aef3e2e7cda7edcee044617e2090970e2601d0bcb85febc",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s1-o1/result.json",
+      "sha256": "4c156e5b8e92a2be94ae092a0abf0abfd31f0e1cbc4db774c20804f394c2c41b",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s12-o0/result.json",
+      "sha256": "ac5bd20819097be52bd46df731477059784a215a91517d12a41e39650dd871ec",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s15-o0/result.json",
+      "sha256": "e2d7b3d1e089defe2bf854997aaecb1c8d4a83a6a61de5ab17c8fb6c68a9aa73",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s16-o0/result.json",
+      "sha256": "e8e294188c09a1f6948c3661d3e495a608ee5f6aa716cd99104fc819e24bb96f",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s16-o1/result.json",
+      "sha256": "9b56d61f9c71131cfa5e7dce53dc29d7790993775f6265da614a00c2fcf45b24",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s17-o0/result.json",
+      "sha256": "fb8758437439dc57adf8a7583f8fad971615a76af3e1e87861bbeb6f774ec448",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s2-o0/result.json",
+      "sha256": "76fa628c2f548bd066e9115a97ad44bbcad743bac66491c5bb6f12a6cb78e9b5",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s24-o0/result.json",
+      "sha256": "42fc532fdd39e66e2c15a7bf47419ce5e70e0d87b519544c79ce46efb5b4fb82",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s3-o0/result.json",
+      "sha256": "8597da44a130d920f60495910450e08475ebc15c90d785c91a4bb3f521077755",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s32-o0/result.json",
+      "sha256": "e3d9add79d04b680f488146b5bcc21cdd43fdb0b3b34403eddd1af3a33aee288",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s4-o0/result.json",
+      "sha256": "c83463dbe306414030ebc5788dbe055a712ac1b1c5c75bd1d8dbef27db97f40a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s4-o1/result.json",
+      "sha256": "43e6a3b232da750a5f5027c69ee251f9b27dfdb22b4d882cdeded1bf8a8c4e45",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s5-o0/result.json",
+      "sha256": "d3abbbf05f372f0fb20420e4d685f9171dc5189cf86b5c69f5a15bd650e67e13",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s5-o1/result.json",
+      "sha256": "54c9a868158fa979ae9e9016929191b7b4dda5ce3812b83698ea32f47b1e954d",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s6-o0/result.json",
+      "sha256": "e34ae051e59773bd53ba06699ff83b4bfa87c197230b24a5254f59c72ba749b7",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s7-o0/result.json",
+      "sha256": "d04352dc9f4c62aa733c4328ad3474378af21a5ae323eeaf9f69e4d7c91fd8c3",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s8-o0/result.json",
+      "sha256": "0248a1b7c54d346d688ec5c0086836c101f7608b9c03516debad9afa73be2163",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s8-o1/result.json",
+      "sha256": "d0c156e416e3d4c6c28947d672a007d7227bc09f586cd7ad0be4d74be2ca26a2",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose-w128-s9-o0/result.json",
+      "sha256": "66cbe16ab690d331c70d40cc7c5654a2762a7dae2abfeb9146e27603a405de5c",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m5-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "01f89c571966021eb6e2f504f26e1884802fced8cf913abe76d2c4ec4ecfaf1b",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m17-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "c539afd4c0ea81c024ea410410371b547f971ff67034200feacf5c26b08ae012",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m32-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "b130e04d95346e8ad311165781ab8dda3becdb32f0027e19f8b8c21c397080b0",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m1-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "e88465d01d07e2302122537e1024642220e0976abc6c5f3805378901c8aa0cae",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m3-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "0dc17162d84a34bcdb0d049d00481160d6a3ec9ea271728959ab9fce22413a61",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m24-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "dcf896a04f55b0ea671c293d11408e41ade2cf1733af1814cf9e4e8384bdd46f",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m1-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "e7d2fc6dc0b355cfc7efb71c84b97bb000836615fe8730cb9aff175762a0872b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m4-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "971056353cdb5b0c32859318b725959a80344c42b01e713c32a549b738efac14",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m24-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "aaf83939f780ccf899bf13104e8a8863c9c010f2030cafa590dd69f25575e745",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m2-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "8cd4fdbbd558de108469e872ea3f1fe525b784d0f52d49fd033d3521b10366a0",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m5-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "c255390b99d425599ff944110b66973318024f2863a8a5e517d5a3fbff9b0565",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m3-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "a51dae7370b0c614c13e6287617cc149dd1eb50ee2c7162bf7d498fb3bd549c3",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m8-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "ea396a9b6c3806471457064429d2f54fdf8f25965219951aa8bd7e141ad7c3a9",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m16-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "a0b7872cfa78534d5fbb3147b9541f05bf04bb0fcafb2fc5e34ae1353cba0ff5",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m32-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "653e946961928b556b9fb3f91fbe59b44d16b3f4dba3e0df92388d11dba57971",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m16-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "69a85bd6a2807b69944e23fec56eb439ae59a345c529ae20a6ede6b8a692a53e",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m4-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "930dc4e281a178fa788d9f540c9e5f1616dbaaf9f53c831c2f663498615ebbb1",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m17-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "6738f144cffc5cb72ad98a45403048360a35ea001d0f9ef228f9442738f676d5",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w128-m2-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "4d2de41171f5baeeb2861697c14009c267b6e2cfea1ca25e11e522624a3cc696",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/matmul/w512-m8-s1-k128-n128-o0-v0-ordered/result.json",
+      "sha256": "6f6229d5f60f49558c0ac0ce87b4e1fd53520b4769c19d590ee241e9d9ff7dbc",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s3-o0/result.json",
+      "sha256": "96cc9d665ba7fab397078122c09a41cb4d435cb8d497b889f22f2b3c77ab6890",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s1-o0-n256/result.json",
+      "sha256": "d9032a94cf88c797c4c7e8608e6ddbe5acfd498c9e3a63c6f227247d47212013",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_stream-w128-s4-o0/result.json",
+      "sha256": "8b7f7e98af91180041efed71626576aa8207573ae76dcd3da80f3df99ac1252a",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s8-o0-n256/result.json",
+      "sha256": "d1326ee129c1ab7c8607c3c244997debedd5a8b9f550b99f41e5c9ea185e9654",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s8-o0/result.json",
+      "sha256": "36a243cdffe6895da5b84d50e459326b387240778ca4f6c3177c9553ca54ed90",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/scatter_stream-w128-s4-o0-n8/result.json",
+      "sha256": "f7e06cefe028123900ec94f64f82a4f7784ca8264a36aeb03b993a4c4ba23285",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_stream-w128-s3-o0/result.json",
+      "sha256": "67cd06e31e8e14e18d998cb6040e7fb926c8fed960baf2de75c5fb160252975d",
+      "split": "heldout"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s24-o0/result.json",
+      "sha256": "795d2347f01c32986840cf1ac69cc3674c27e94a631e735f23f5e8a374fb445b",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s1-o0/result.json",
+      "sha256": "5a3cf1e59a5e07149fa6671b730e38bc4335e647ac56d29a1ef895cca83f4eaf",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/scatter_stream-w128-s1-o0-n8/result.json",
+      "sha256": "99e3efc40430be686806752631a7cd5e91c709f7e5facbb6ceb40f67d6ae3446",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s24-o0-n256/result.json",
+      "sha256": "38e2bce65b422f28847866f0234453e392b8be4fe2797b5a078724a0aaf8f9ad",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/scatter_stream-w128-s8-o0-n8/result.json",
+      "sha256": "7212017878962888fd69350435e0f3a483f7f32c6214dad99e5032e096597f05",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_stream-w128-s24-o0/result.json",
+      "sha256": "4451b5c07a10adaf214e20c66119814de900d96d7a3dc906aa553c3c0c34656e",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_stream-w128-s8-o0/result.json",
+      "sha256": "7696926e34f470c78771fa688873be28ae7165e4d72cab521caad0a921d019fd",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/transpose_stream-w128-s4-o0/result.json",
+      "sha256": "65028cc9e69a28d1e82cb3a61fcbad338c49796ee2951e6abcd329db98e5d644",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/copy_stream-w128-s1-o0/result.json",
+      "sha256": "171ede288547adb6afa66266bb07f468ddd149023c32fb09fad6cf116dca497d",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/probes/scatter_stream-w128-s24-o0-n8/result.json",
+      "sha256": "e73a0ebf2fd0206c8012a5d2018bd3585676ceac9291b89fdb64601d32f1fefc",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/shortk/w512-m1-s1-k64-n128-o0-v0-ordered/result.json",
+      "sha256": "b8828895b9269e5e9b7c6c70f4772b8d73ee0860ed8a66e7b6fb688697c56b79",
+      "split": "train"
+    },
+    {
+      "path": "/home/ubuntu/ML/AGEN-voyager/voyager-trainium-10-09-context-isa/results/shortk/w512-m1-s1-k64-n128-o0-v0-ordered-refresh/result.json",
+      "sha256": "c48a706bd53a4998268baaa3f5ffffbc871b91586991698503c109b061050bb0",
+      "split": "train"
+    }
+  ],
+  "scope": "FP32,128partitions. Completion from dependent chains and context probes; issue from independent streams where characterized, otherwise existing law. Sector count is an empirical access-pressure hypothesis, not a proven bank mapping.",
+  "limitations": [
+    "No kernel latency fitting.",
+    "No claimed memory-bank mapping.",
+    "Unknown geometries keep previous law."
+  ]
+}

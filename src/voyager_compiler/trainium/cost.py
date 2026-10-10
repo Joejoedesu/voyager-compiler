@@ -900,7 +900,7 @@ def vector_candidate(config, node, tile_sizes, shapes, tiling, tuning=None):
         scalar += layout_panels * c
         vector += groups * timing.duration_ns
         # Extra row-major ISA workspace is checked in addition to named scratch.
-        workspace = reduction_workspace(reduction_name, width, parameters)
+        workspace = reduction_workspace(reduction_name, width, parameters, tuning=tuning)
         if row_layout:
             storage = max(storage, workspace + parameters * 128 * width * 4)
         # Workspace is shared across pipeline slots (nonmatrix_slot_size).
