@@ -747,7 +747,15 @@ class _SparseGemm(torch.nn.Module):
             )
 
     def _async_kernel(
-        self, idx, in_slots, out_slots, scratch, in_sems, out_sems, post
+        self,
+        idx,
+        in_slots,
+        out_slots,
+        scratch,
+        in_sems,
+        out_sems,
+        post,
+        prev_post,
     ):
         """The async step: gather, then dispatch the dense kernel's commit.
 
@@ -823,8 +831,8 @@ class _SparseGemm(torch.nn.Module):
                 & (self._ordinal(idx, self.grid_k) >= self.store_slots),
                 self._drain_csr_stores,
             )
-        self._scratch_and_kernel(tail)[1](
-            idx, tiles, out_slots, scratch, deps, out_sems, post
+        return self._scratch_and_kernel(tail)[1](
+            idx, tiles, out_slots, scratch, deps, out_sems, post, prev_post
         )
 
     # --- entry --------------------------------------------------------------

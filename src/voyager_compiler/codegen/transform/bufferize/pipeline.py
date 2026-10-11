@@ -27,6 +27,7 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_depthwise_conv,
     is_full_reduction,
     is_nop,
     is_reshape_op,
@@ -864,6 +865,12 @@ class AsyncPipelinedKernel(PipelinedKernel):
     in the loop; the only loop-level wait is the lagged retire on compute-done.
     Inputs prefetch ``num_slots - 2`` ahead (one less than the base), so a slot
     a load overwrites was already retired — reuse-WAR-safe.
+
+    A commit that reads what the previous step's commit wrote, with no unit
+    ordering the two, waits that step's compute-done as a dependency instead
+    (``prev_post``; see ``_gemm_scratch_and_kernel``).  The kernel returns
+    the predicate under which it did not, and the lagged retire runs only
+    there: each post is consumed once.
     """
 
     _async_pipeline = True
@@ -972,11 +979,18 @@ class AsyncPipelinedKernel(PipelinedKernel):
 
             post = get_slot(done_sem, step % _DONE_DEPTH)
 
+            # Built where it is used, so a step that never waits it carries
+            # no slot arithmetic.
+            def prev_post():
+                return get_slot(done_sem, (step - 1) % _DONE_DEPTH)
+
             # 3. Dispatch the tile's compute: the async kernel issues the
             #    ``commit`` itself — waiting the input load semaphores and, on
             #    the round it writes the output, that slot's store semaphore
             #    free (seeded with a credit, so first uses never underflow).
-            self.kernel(
+            #    It returns ``None``, or the predicate under which its commit
+            #    did not also wait the previous step's compute-done.
+            pending = self.kernel(
                 ctx.cur,
                 in_slots,
                 out_slots,
@@ -984,20 +998,19 @@ class AsyncPipelinedKernel(PipelinedKernel):
                 in_sems,
                 out_sems,
                 post,
+                prev_post,
             )
 
             # 4. Lagged retire of tile step-1 (nothing at step 0): wait its
-            #    compute-done every step, and store each output once its *own*
-            #    block has finished (slot ordinal one behind the tile committed
-            #    now).  Flat conds — a ``SymBool`` predicate cannot be captured
-            #    into an outer cond's operands, so ``step >= 1`` folds into the
-            #    store predicate.
-            effect_cond(
-                step >= 1,
-                lambda: voyager.async_wait(
-                    get_slot(done_sem, (step - 1) % _DONE_DEPTH)
-                ),
-            )
+            #    compute-done unless the commit just dispatched waited it, and
+            #    store each output once its *own* block has finished (slot
+            #    ordinal one behind the tile committed now).  Flat conds — a
+            #    ``SymBool`` predicate cannot be captured into an outer cond's
+            #    operands, so ``step >= 1`` folds into the store predicate.
+            retire = step >= 1
+            if pending is not None:
+                retire = retire & pending
+            effect_cond(retire, lambda: voyager.async_wait(prev_post()))
 
             # 5. Retire (store) + advance the finished-tile count, per output.
             #    An output that advances every step stores every step (guard
@@ -1412,7 +1425,14 @@ def _single_pass_kernel(
         return inner
 
     def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+        grid_index,
+        in_slots,
+        out_slots,
+        scratch,
+        in_sems,
+        out_sems,
+        post,
+        prev_post,
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
         commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
@@ -1476,7 +1496,14 @@ def _inplace_tail_kernel(
         return inner
 
     def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+        grid_index,
+        in_slots,
+        out_slots,
+        scratch,
+        in_sems,
+        out_sems,
+        post,
+        prev_post,
     ):
         operands = [grid_index, *in_slots, *out_slots]
         commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
@@ -1484,8 +1511,55 @@ def _inplace_tail_kernel(
     return kernel
 
 
+def _commit_round(body, operands, dependencies, post, prev_post, wait, on=None):
+    """``commit`` one reduction round, also waiting the previous step's
+    compute-done (``prev_post()``) when ``wait`` is set.
+
+    ``on``, if given, returns the predicate on the grid coordinate that
+    limits the wait to the rounds where it holds.  It is called inside the
+    caller's branch, since a ``SymBool`` cannot enter a cond as an operand.
+    """
+
+    def ordered():
+        commit(
+            body,
+            operands,
+            dependencies=[*dependencies, prev_post()],
+            post=post,
+        )
+        return 0
+
+    def unordered():
+        commit(body, operands, dependencies=dependencies, post=post)
+        return 0
+
+    if not wait:
+        unordered()
+    elif on is None:
+        ordered()
+    else:
+        torch.cond(on(), ordered, unordered)
+
+
+def _retire_pending(grid_index, reduction_dim, wait_partial):
+    """A reduction kernel's answer to :class:`AsyncPipelinedKernel`: ``None``
+    when no round waits the previous step's compute-done, else the predicate
+    under which this step's commit did not -- every coord but ``1``.  The
+    step before the ``1`` coord is the ``0`` round of the same tile only
+    because the reduction dim is the grid's innermost.
+    """
+    if not wait_partial:
+        return None
+    assert reduction_dim == len(grid_index) - 1, "reduction dim not innermost"
+    return grid_index[reduction_dim] != 1
+
+
 def _reduction_inplace_kernel(
-    compute: Callable, reduction_dim: int, async_pipeline: bool = False
+    compute: Callable,
+    reduction_dim: int,
+    async_pipeline: bool = False,
+    last_idx: Optional[int] = None,
+    wait_partial: bool = False,
 ):
     """Kernel for a reduction with nothing left to do once it completes — no
     cast (the accumulator's dtype is the output's) and no fused tail.  It
@@ -1497,7 +1571,10 @@ def _reduction_inplace_kernel(
 
     ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant:
     the accumulator *is* the output slot, first written on the ``0`` reduction
-    coord, so the commit dispatch waits the slot free there.
+    coord, so the commit dispatch waits the slot free there.  With
+    ``wait_partial`` the round on the ``1`` coord also waits the ``0``
+    round's compute-done (see ``_gemm_scratch_and_kernel``); ``last_idx``, the
+    final reduction coord, drops that round's predicate when it is ``1``.
     """
 
     def inner(grid_index, *args):
@@ -1530,7 +1607,14 @@ def _reduction_inplace_kernel(
         voyager.insert(compute(in_slots, False) + out_slot, out_slot)
 
     def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+        grid_index,
+        in_slots,
+        out_slots,
+        scratch,
+        in_sems,
+        out_sems,
+        post,
+        prev_post,
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
 
@@ -1543,13 +1627,25 @@ def _reduction_inplace_kernel(
             )
             return 0
 
+        def round_1():
+            return grid_index[reduction_dim] == 1
+
         def not_first():
-            commit(
-                accumulate_body, operands, dependencies=[*in_sems], post=post
+            # Round 1 is the only reader of a round-0 partial; with two
+            # rounds it is the only round here.
+            _commit_round(
+                accumulate_body,
+                operands,
+                in_sems,
+                post,
+                prev_post,
+                wait_partial,
+                None if last_idx == 1 else round_1,
             )
             return 0
 
         torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
+        return _retire_pending(grid_index, reduction_dim, wait_partial)
 
     return kernel
 
@@ -1754,6 +1850,7 @@ def _reduction_fused_kernel(
     fused_operand_indices: List[int] = (),
     scratch_slots: int = 1,
     async_pipeline: bool = False,
+    wait_partial: bool = False,
 ):
     """Kernel for an op whose finished tile passes through scratch: a
     reduction over several K tiles, or a single round whose tail cannot ride
@@ -1796,6 +1893,9 @@ def _reduction_fused_kernel(
             it (async variant only).
         async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
             instead of the synchronous body.
+        wait_partial: The round on the ``1`` coord also waits the ``0``
+            round's compute-done before it reads the partial (async variant
+            only; see ``_gemm_scratch_and_kernel``).
 
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
@@ -1916,16 +2016,25 @@ def _reduction_fused_kernel(
                 _staged_quantize(in_slots, out_slots, scratch)
 
     def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+        grid_index,
+        in_slots,
+        out_slots,
+        scratch,
+        in_sems,
+        out_sems,
+        post,
+        prev_post,
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
 
         def on_last():
-            commit(
+            _commit_round(
                 finalize_body,
                 operands,
-                dependencies=[*in_sems, *out_sems],
-                post=post,
+                [*in_sems, *out_sems],
+                post,
+                prev_post,
+                wait_partial and last_idx == 1,
             )
             # With one scratch slot the next sweep's round-0 accumulate
             # would overwrite the tile this tail still reads, so the tail
@@ -1938,17 +2047,29 @@ def _reduction_fused_kernel(
                     _staged_quantize(in_slots, out_slots, scratch[0])
             return 0
 
+        def round_1():
+            return grid_index[reduction_dim] == 1
+
         def not_last():
-            commit(
-                accumulate_body, operands, dependencies=[*in_sems], post=post
+            # Round 1 is the only reader of a round-0 partial; with two
+            # rounds it is the last round, which ``on_last`` commits.
+            _commit_round(
+                accumulate_body,
+                operands,
+                in_sems,
+                post,
+                prev_post,
+                wait_partial and last_idx > 1,
+                round_1,
             )
             return 0
 
         if single_round:
             # Every step completes its tile: skip the constant-predicate cond.
             on_last()
-            return
+            return None
         torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
+        return _retire_pending(grid_index, reduction_dim, wait_partial)
 
     return kernel
 
@@ -2074,6 +2195,25 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
 _CLASSIFY = object()
 
 
+def _array_writes_memory(anchor, acc_shape) -> bool:
+    """Whether the bare ``anchor`` op's output tile goes from the matrix unit
+    straight to memory, with no vector pass behind it.
+
+    The toolchain sends the array's output through the vector unit for a
+    matrix-vector product (an input tile of one row), a depthwise conv, a
+    fused SpMM, and any op that carries a second one, such as a weight
+    decode (``output_to_memory`` in ``test/toolchain/MatrixOps.h``).  The
+    input tile's rows are the accumulator tile's leading dims.
+    """
+    if is_conv2d(anchor):
+        return not is_depthwise_conv(anchor)
+    if anchor.kwargs.get("A_indptr") is not None:
+        return False
+    if weight_transforms(anchor.args[1])[3] is not None:
+        return False
+    return math.prod(acc_shape[:-1]) != 1
+
+
 def _gemm_scratch_and_kernel(
     gemm_kernel,
     fused_gm,
@@ -2135,6 +2275,20 @@ def _gemm_scratch_and_kernel(
     out_dtype = anchor.value.dtype
     # A single round has no running sum to widen.
     acc_dtype = torch.float32 if accumulate_fp32 and num_k > 1 else out_dtype
+    # Round 1 reads back the partial round 0 wrote to L2.  When round 0 is the
+    # bare op on the array, the matrix unit writes that partial to memory by
+    # itself, and nothing orders round 1's read behind the writes: the vector
+    # unit's start waits only for the previous vector pass, and round 1's
+    # commit for its own input loads.  So round 1 also waits round 0's
+    # compute-done.  A round 0 with a vector pass of its own (the dequantize
+    # head below, a fused SpMM) is already ordered by that gate.  A caller
+    # that passes ``split`` (the sparse GEMM) rebuilds its kernel under export
+    # tracing, where this check cannot read the graph.
+    wait_partial = (
+        split is _CLASSIFY
+        and num_k > 1
+        and _array_writes_memory(anchor, acc_shape)
+    )
     # A multi-round reduction accumulates in L2, so its partials have to reach
     # the accumulator already scaled -- the psum type lives on chip only.  Every
     # round scales its own partial, so the head rides the op rather than the
@@ -2145,6 +2299,7 @@ def _gemm_scratch_and_kernel(
         and (dequant_split := _split_leading_dequantize(fused_gm))
     ):
         dequantize, fused_gm = dequant_split
+        wait_partial = False
 
         def gemm_kernel(in_tiles, first, op=gemm_kernel):
             return dequantize(
@@ -2193,6 +2348,8 @@ def _gemm_scratch_and_kernel(
             gemm_kernel,
             reduction_dim=reduction_dim,
             async_pipeline=async_pipeline,
+            last_idx=num_k - 1,
+            wait_partial=wait_partial,
         )
     else:
         if single_buffer_tail and not async_pipeline and num_k > 1:
@@ -2221,6 +2378,7 @@ def _gemm_scratch_and_kernel(
             fused_operand_indices=fused_idx,
             scratch_slots=slots,
             async_pipeline=async_pipeline,
+            wait_partial=wait_partial,
         )
     return scratch_specs, kernel
 
