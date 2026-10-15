@@ -1455,13 +1455,16 @@ def _fold_reencode(
         # per-tensor quantize with a unit scale.
         graph = model.graph
         with graph.inserting_before(branch.cond):
-            # On the cache's device: propagated values live on the CPU.
+            # A real tensor on the cache's device: propagated values may be
+            # fake, and live on the CPU.
             unit = create_getattr_from_value(
                 model,
                 graph,
                 f"{fold.cache}_unit_scale",
-                fused.value.new_ones(
-                    1, device=fetch_attr(model, fold.cache).device
+                torch.ones(
+                    1,
+                    dtype=fused.value.dtype,
+                    device=fetch_attr(model, fold.cache).device,
                 ),
             )
         propagate_shape(unit, model)
