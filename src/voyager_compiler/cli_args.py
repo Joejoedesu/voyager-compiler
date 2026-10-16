@@ -139,6 +139,12 @@ def add_quantization_args(parser=None):
         action="store_true",
         help="Use bf16 (mixed) precision instead of 32-bit float.",
     )
+    parser.add_argument(
+        "--merge_linears",
+        action="store_true",
+        help="Merge the bias-free linears that read one input, such as q, k "
+        "and v, into one GEMM whose operands share their scales.",
+    )
     return parser
 
 

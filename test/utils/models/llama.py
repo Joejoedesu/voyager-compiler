@@ -15,7 +15,7 @@ import math
 import os
 import re
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import torch
@@ -43,6 +43,7 @@ from voyager_compiler import (
     convert_pt2e,
     export_model,
     fake_like,
+    merge_sibling_linears,
     prepare_pt2e,
     split_kv_cache,
     transform,
@@ -198,11 +199,14 @@ def build_prefill(model, tokenizer, args):
         "use_cache": False,
         "logits_to_keep": 1,
     }
-    if args.attn_implementation == "sdpa":
-        with _sdpa_is_causal():
-            gm = export_model(model, example_args, example_kwargs)
-    else:
-        gm = export_model(model, example_args, example_kwargs)
+    sdpa = args.attn_implementation == "sdpa"
+    with _sdpa_is_causal() if sdpa else nullcontext():
+        gm = export_model(
+            model,
+            example_args,
+            example_kwargs,
+            merge_linears=args.merge_linears,
+        )
     return gm, example_args, example_kwargs
 
 
@@ -252,6 +256,8 @@ def build_decode(model, tokenizer, args, config, tokens):
             example_cache_position=cache_position,
         )
     gm = ep.module()
+    if args.merge_linears:
+        merge_sibling_linears(gm)
 
     prompt = prompt[:, : args.context_length]
     cache = StaticCache(

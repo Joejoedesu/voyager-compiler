@@ -16,24 +16,36 @@ Hadamard transform where the recipe has one; its GEMM is a ``linear_mx`` or
 - each FP8 ``quantize`` becomes one cast to FP8 (``quantize_fp8``), and each
   GEMM with its dequantize one ``fp8_linear``.  That GEMM takes both operands
   K-major (TN), the only layout torch's FP8 GEMM takes, so an operand a dgrad
-  or wgrad contracts along its rows is a transposed copy of its FP8 codes;
+  or wgrad contracts along its rows is a transposed copy of its FP8 codes.  A
+  matrix the program takes as input and a dgrad reads, a weight, is cast to
+  both layouts by one Triton kernel (``quantize_fp8_transpose``), which also
+  gives its delayed-scaling update the matrix's amax;
 - each NVFP4 ``quantize_mx`` becomes one cast to packed codes
   (``quantize_nvfp4``, with its stochastic rounding's seed), and each GEMM one
   ``nvfp4_linear``.  A weight in 16x16 blocks is cast once
   (``quantize_nvfp4_square``) and packed both ways, so the dgrad reads the
-  forward's codes transposed.
+  forward's codes transposed.  The random Hadamard transform in front of a
+  cast is folded into it, the cast reading the graph's Hadamard matrix, one
+  Triton kernel reading the operand in place.  A tensor cast both ways, its
+  rows and its transpose's, is first merged into one
+  ``quantize_mx_transpose`` (``pair_quantize_transposes``), and becomes one
+  cast to both layouts (``quantize_nvfp4_pair``).
 
-The delayed-scaling updates, the rotations and every other op run as written.
+The delayed-scaling updates and every other op run as written.
 """
 
 import operator
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.fx import Graph, GraphModule, Node
 
 from voyager_compiler.codegen.node_info import get_arg_value
-from voyager_compiler.quantization.training import _VIEWS
+from voyager_compiler.quantization.training import (
+    _VIEWS,
+    pair_quantize_transposes,
+    rotation_input,
+)
 
 from . import nvfp4
 from .fp8 import (
@@ -44,6 +56,7 @@ from .fp8 import (
     QUANTIZE,
     fp8_linear,
     quantize_fp8,
+    quantize_fp8_transpose,
 )
 from .nvfp4 import (
     BLOCK_SIZE,
@@ -53,14 +66,24 @@ from .nvfp4 import (
     NVFP4_LINEAR,
     QUANTIZE_MX,
     quantize_nvfp4,
+    quantize_nvfp4_pair,
     quantize_nvfp4_square,
 )
 
-__all__ = ["lower_training"]
+__all__ = ["lower_training", "return_gradients"]
 
 aten = torch.ops.aten
 
 MATMUL_MX = torch.ops.quantized_ops.matmul_mx.default
+QUANTIZE_MX_TRANSPOSE = torch.ops.quantized_ops.quantize_mx_transpose.default
+# The indices of ``quantize_mx_transpose``'s row-wise scale and codes; the
+# transpose's follow them.
+PAIR_ROWS = (0, 1)
+CONVERT_ELEMENT_TYPE = torch.ops.prims.convert_element_type.default
+
+# A cast's packed codes and block scales, by the axis a GEMM reads them
+# along.
+Packed = Dict[int, Tuple[Node, Node]]
 
 # The axes of a ``quantize_mx`` in 16x16 blocks.
 SQUARE_BLOCKS = (-2, -1)
@@ -84,17 +107,22 @@ def _fp8_quantize(operand: Node) -> Node:
     return quantize
 
 
-def _insert_fp8_gemm(graph: Graph, gemm: Node) -> Node:
+def _insert_fp8_gemm(
+    graph: Graph, gemm: Node, transposes: Dict[Node, Node]
+) -> Node:
     """Insert the real GEMM computing an FP8 ``gemm`` and the dequantize after
     it, before that dequantize.
 
-    A linear reads its ``[N, K]`` weight as it is; a matmul's ``[K, N]``
-    second operand is copied transposed, so the GEMM reads it K-major.
+    A linear reads its ``[N, K]`` weight as it is; a matmul reads its
+    ``[K, N]`` second operand's transposed codes where its cast made them,
+    and otherwise a transposed copy, so the GEMM reads it K-major.
 
     Args:
         graph: The program's graph, its FP8 casts in place.
         gemm: A linear, or a matmul whose second operand is 2-d, of two FP8
             operands; its only user scales it back.
+        transposes: Each matrix's FP8 codes -> its transpose's, for the
+            matrices cast both ways.
 
     Returns:
         The GEMM.
@@ -106,12 +134,82 @@ def _insert_fp8_gemm(graph: Graph, gemm: Node) -> Node:
             aten._to_copy.default, (output.args[1],), {"dtype": torch.float32}
         )
         if gemm.target is MATMUL:
-            other = graph.call_function(
+            other = transposes.get(other) or graph.call_function(
                 aten.clone.default,
                 (graph.call_function(aten.t.default, (other,)),),
                 {"memory_format": torch.contiguous_format},
             )
         return graph.call_function(fp8_linear, (input, other, scale))
+
+
+def _nvfp4_pair(codes: Node) -> Optional[Tuple[Node, str]]:
+    """The ``quantize_mx_transpose`` whose codes a GEMM reads as ``codes``,
+    through a view or a permute, and which of its layouts: ``"rows"`` or
+    ``"transpose"``; None if ``codes`` are not a pair's.
+
+    Raises:
+        NotImplementedError: The pair's codes are not NVFP4 codes.
+    """
+    node = codes
+    while node.target in (aten.view.default, aten.permute.default):
+        node = node.args[0]
+    if (
+        node.target is not operator.getitem
+        or node.args[0].target is not QUANTIZE_MX_TRANSPOSE
+    ):
+        return None
+    pair = node.args[0]
+    if (
+        pair.meta.get("dtype") != NVFP4_DTYPES
+        or pair.args[2:4] != (BLOCK_SIZE, FP4_MAX)
+        or get_arg_value(pair, 8, "global_scale") is None
+    ):
+        raise NotImplementedError(f"{codes.name} is not cast to NVFP4")
+    return pair, "rows" if node.args[1] in PAIR_ROWS else "transpose"
+
+
+def _insert_pair_cast(graph: Graph, pair: Node) -> Dict[str, Packed]:
+    """Insert the cast replacing an NVFP4 ``quantize_mx_transpose``
+    (``quantize_nvfp4_pair``), before it, and make each ``alpha`` read its
+    global scales.
+
+    Args:
+        graph: The program's graph.
+        pair: The ``quantize_mx_transpose``.
+
+    Returns:
+        Each layout's packed codes and block scales, by the axis a GEMM
+        reads them along: the row-wise ones along the last, their codes in
+        the shape the pair's are viewed in; the transposed ones along the
+        transpose's last, or in place along the second-to-last.
+    """
+    (codes,) = [user for user in pair.users if user.args[1] == PAIR_ROWS[1]]
+    (view,) = codes.users
+    with graph.inserting_before(pair):
+        cast = graph.call_function(
+            quantize_nvfp4_pair,
+            (
+                pair.args[0],
+                get_arg_value(pair, 7, "seed"),
+                get_arg_value(pair, 9, "transpose_seed"),
+                get_arg_value(pair, 11, "hadamard"),
+            ),
+        )
+        outputs = [
+            graph.call_function(operator.getitem, (cast, i)) for i in range(6)
+        ]
+        outputs[0] = graph.call_function(
+            aten.view.default, (outputs[0], [*view.args[1][:-1], -1])
+        )
+    get_arg_value(pair, 8, "global_scale").replace_all_uses_with(outputs[2])
+    get_arg_value(pair, 10, "transpose_global_scale").replace_all_uses_with(
+        outputs[5]
+    )
+    transpose = tuple(outputs[3:5])
+    return {
+        "rows": {-1: tuple(outputs[:2])},
+        "transpose": {-1: transpose, -2: transpose},
+    }
 
 
 def _nvfp4_quantize(codes: Node) -> Node:
@@ -131,11 +229,10 @@ def _nvfp4_quantize(codes: Node) -> Node:
     return quantize
 
 
-def _insert_nvfp4_cast(
-    graph: Graph, quantize: Node
-) -> Dict[int, Tuple[Node, Node]]:
+def _insert_nvfp4_cast(graph: Graph, quantize: Node) -> Packed:
     """Insert the cast replacing an NVFP4 ``quantize``, before it, and make
-    each ``alpha`` read the cast's global scale.
+    each ``alpha`` read the cast's global scale.  A rotation ending at the
+    quantize's input, along its blocks' axis, is cast with it.
 
     Args:
         graph: The program's graph.
@@ -154,7 +251,14 @@ def _insert_nvfp4_cast(
     seed = get_arg_value(quantize, 8, "seed")
     with graph.inserting_before(quantize):
         if len(axes) == 1:
-            cast = graph.call_function(quantize_nvfp4, (input, axes[0], seed))
+            operand, hadamard = input, None
+            rotation = rotation_input(input)
+            ndim = input.meta["val"].ndim
+            if rotation is not None and rotation[1] == axes[0] % ndim:
+                operand, _, hadamard = rotation
+            cast = graph.call_function(
+                quantize_nvfp4, (operand, axes[0], seed, hadamard)
+            )
             packed_along = axes
         elif axes == SQUARE_BLOCKS and seed is None:
             cast = graph.call_function(quantize_nvfp4_square, (input,))
@@ -179,7 +283,7 @@ def _insert_nvfp4_cast(
 def _insert_nvfp4_gemm(
     program: GraphModule,
     gemm: Node,
-    casts: Dict[Node, Dict[int, Tuple[Node, Node]]],
+    casts: Dict[Node, Union[Packed, Dict[str, Packed]]],
 ) -> Node:
     """Insert the casts of an NVFP4 ``gemm``'s operands no earlier GEMM
     inserted, and its real GEMM before it.
@@ -188,8 +292,9 @@ def _insert_nvfp4_gemm(
         program: The gradient program.
         gemm: A ``linear_mx``, or a ``matmul_mx`` whose second operand is
             2-d.
-        casts: Each NVFP4 ``quantize_mx`` cast so far -> its cast's packed
-            operands, as ``_insert_nvfp4_cast`` returns them; updated.
+        casts: Each NVFP4 ``quantize_mx`` or ``quantize_mx_transpose`` cast
+            so far -> its packed operands, as ``_insert_nvfp4_cast`` or
+            ``_insert_pair_cast`` returns them; updated.
 
     Returns:
         The GEMM.
@@ -204,15 +309,23 @@ def _insert_nvfp4_gemm(
     contraction = (-1, -1 if gemm.target is LINEAR_MX else -2)
     operands = []
     for codes, axis in zip(gemm.args[:2], contraction):
-        quantize = _nvfp4_quantize(codes)
-        if quantize not in casts:
-            casts[quantize] = _insert_nvfp4_cast(graph, quantize)
-        if axis not in casts[quantize]:
+        pair = _nvfp4_pair(codes)
+        if pair is not None:
+            source, layout = pair
+            if source not in casts:
+                casts[source] = _insert_pair_cast(graph, source)
+            packed = casts[source][layout]
+        else:
+            quantize = _nvfp4_quantize(codes)
+            if quantize not in casts:
+                casts[quantize] = _insert_nvfp4_cast(graph, quantize)
+            packed = casts[quantize]
+        if axis not in packed:
             raise NotImplementedError(
                 f"{codes.name} is not blocked along {gemm.name}'s "
                 "contraction axis"
             )
-        operands.extend(casts[quantize][axis])
+        operands.extend(packed[axis])
     bias = get_arg_value(gemm, 2, "bias")
     with graph.inserting_before(gemm):
         alpha, one = nvfp4.insert_gemm_scalars(
@@ -221,9 +334,60 @@ def _insert_nvfp4_gemm(
         return graph.call_function(NVFP4_LINEAR, (*operands, alpha, one, bias))
 
 
+def _insert_input_matrix_cast(
+    graph: Graph, quantize: Node, dtype: torch.dtype
+) -> Tuple[Node, Node]:
+    """Cast a placeholder matrix to FP8 in both layouts in one op.
+
+    Inserts a ``quantize_fp8_transpose`` replacing ``quantize``, before it,
+    and makes every ``amax(abs(matrix))`` over the whole matrix, the
+    delayed-scaling update's, read the cast's amax instead.  The ops reading
+    that amax, the amax history's update, move after the cast: the scale the
+    cast divides by comes from the history before that update.
+
+    Args:
+        graph: The program's graph.
+        quantize: The FP8 ``quantize`` of a 2-d placeholder.
+        dtype: Its torch FP8 dtype.
+
+    Returns:
+        The matrix's FP8 codes and its transpose's.
+    """
+    matrix = quantize.args[0]
+    with graph.inserting_before(quantize):
+        cast = graph.call_function(
+            quantize_fp8_transpose, (*quantize.args[:2], dtype)
+        )
+        codes, transpose, amax = (
+            graph.call_function(operator.getitem, (cast, i)) for i in range(3)
+        )
+    reductions = [
+        reduction
+        for magnitude in matrix.users
+        if magnitude.target is aten.abs.default
+        for reduction in magnitude.users
+        if reduction.target is aten.amax.default and reduction.args[1:] == ([],)
+    ]
+    for reduction in reductions:
+        reduction.replace_all_uses_with(amax)
+        moved, last = {amax}, amax
+        node = reduction.next
+        while node is not cast:
+            following = node.next
+            if moved.intersection(node.all_input_nodes):
+                moved.add(node)
+                last.append(node)
+                last = node
+            node = following
+    return codes, transpose
+
+
 def _lower_fp8_gemms(graph: Graph) -> List[str]:
     """Replace each FP8 ``quantize`` with one cast to FP8 that every GEMM it
     fed reads, and each FP8 GEMM with its dequantize by one ``fp8_linear``.
+    A matrix the program takes as input and a matmul reads as its second
+    operand, such as a weight in its dgrad, is cast to both layouts at once
+    (``_insert_input_matrix_cast``).
 
     Args:
         graph: The program's graph, rewritten in place.
@@ -244,17 +408,27 @@ def _lower_fp8_gemms(graph: Graph) -> List[str]:
     quantizes = dict.fromkeys(
         _fp8_quantize(operand) for gemm in gemms for operand in gemm.args
     )
+    transposes = {}
     for quantize in quantizes:
         dtype = FP8_DTYPES[quantize.meta["dtype"]]
-        with graph.inserting_before(quantize):
-            cast = graph.call_function(
-                quantize_fp8, (*quantize.args[:2], dtype)
-            )
+        input = quantize.args[0]
+        transposed = any(
+            user.target is MATMUL and user.args[1] is quantize
+            for user in quantize.users
+        )
+        if input.op == "placeholder" and transposed:
+            cast, transpose = _insert_input_matrix_cast(graph, quantize, dtype)
+            transposes[cast] = transpose
+        else:
+            with graph.inserting_before(quantize):
+                cast = graph.call_function(
+                    quantize_fp8, (*quantize.args[:2], dtype)
+                )
         quantize.replace_all_uses_with(cast)
         graph.erase_node(quantize)
     for gemm in gemms:
         (output,) = gemm.users
-        output.replace_all_uses_with(_insert_fp8_gemm(graph, gemm))
+        output.replace_all_uses_with(_insert_fp8_gemm(graph, gemm, transposes))
         graph.erase_node(output)
         graph.erase_node(gemm)
     return [gemm.name for gemm in gemms]
@@ -305,6 +479,7 @@ def lower_training(program: GraphModule) -> Dict[str, str]:
             is then left partly rewritten.
     """
     graph = program.graph
+    pair_quantize_transposes(program)
     lowered = dict.fromkeys(_lower_fp8_gemms(graph), "fp8")
     nvfp4_gemms = _lower_nvfp4_gemms(program)
     lowered.update(dict.fromkeys(nvfp4_gemms, "nvfp4"))
@@ -312,3 +487,39 @@ def lower_training(program: GraphModule) -> Dict[str, str]:
     graph.lint()
     program.recompile()
     return lowered
+
+
+def return_gradients(program: GraphModule) -> List[str]:
+    """Make a gradient program return its gradients after the loss instead
+    of copying them into its gradient buffers, in place.  Each ``copy_``
+    into a ``<name>_grad`` input becomes an output, in the input's dtype,
+    and the input goes.
+
+    Args:
+        program: A program ``gradient_program`` built.
+
+    Returns:
+        Each output gradient's parameter name, as the program's inputs spell
+        it, in output order.
+    """
+    graph = program.graph
+    output = graph.output_node()
+    names, gradients = [], []
+    for copy in graph.find_nodes(op="call_function", target=aten.copy_.default):
+        buffer, gradient = copy.args
+        if buffer.op != "placeholder" or not buffer.name.endswith("_grad"):
+            continue
+        # A conversion to the dtype it already has is no op to Inductor.
+        with graph.inserting_before(copy):
+            gradient = graph.call_function(
+                CONVERT_ELEMENT_TYPE, (gradient, buffer.meta["val"].dtype)
+            )
+        gradient.meta["val"] = buffer.meta["val"]
+        names.append(buffer.name.removesuffix("_grad"))
+        gradients.append(gradient)
+        graph.erase_node(copy)
+        graph.erase_node(buffer)
+    output.args = ((*output.args[0], *gradients),)
+    graph.lint()
+    program.recompile()
+    return names

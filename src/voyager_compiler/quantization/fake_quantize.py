@@ -4,11 +4,17 @@ import math
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
-from voyager_compiler.ops import compiled_on_gpu, expand, quantize_mx, vmap
+from voyager_compiler.ops import (
+    HADAMARD_SIZE,
+    compiled_on_gpu,
+    expand,
+    hadamard_rotate,
+    quantize_mx,
+    vmap,
+)
 from voyager_compiler.quantization.dtypes import (
     quantize_to_minifloat,
     quantize_to_nf,
@@ -40,8 +46,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Elements a random Hadamard transform mixes together, as in NVFP4.
-HADAMARD_SIZE = 16
 # The random signs of the transform: Transformer Engine's fixed vector
 # (``get_wgrad_sign_vector``), shared by every operand.
 HADAMARD_SIGNS = (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
@@ -68,36 +72,6 @@ def hadamard_matrix(device=None) -> torch.Tensor:
         )
     signs = torch.tensor(HADAMARD_SIGNS, dtype=torch.float)
     return (signs[:, None] * matrix / math.sqrt(HADAMARD_SIZE)).to(device)
-
-
-def _rotate(x: torch.Tensor, axis: int, matrix: torch.Tensor) -> torch.Tensor:
-    """``x`` with each run of ``HADAMARD_SIZE`` elements along ``axis``,
-    its last or second-to-last, multiplied by ``matrix`` in float32, the axis
-    first zero-padded to a whole number of runs.
-
-    The result keeps the padded length: both operands of a GEMM rotated
-    along its contraction axis multiply to their product over the padded
-    axis, their padding being zero.  ``x`` is multiplied where it lies -- its
-    runs along the last axis by ``matrix``, along the second-to-last by
-    ``matrix.T`` from the left -- so it is never moved.  The training
-    lowering inserts these same ops into its graph (``_insert_rotation``).
-
-    Raises:
-        ValueError: ``axis`` is neither of the last two.
-    """
-    axis %= x.ndim
-    if axis < x.ndim - 2:
-        raise ValueError(f"cannot rotate along axis {axis} of {x.ndim}")
-    padding = -x.shape[axis] % HADAMARD_SIZE
-    if padding:
-        x = F.pad(x, (0, 0) * (x.ndim - 1 - axis) + (0, padding))
-    runs = x.float().unflatten(axis, (-1, HADAMARD_SIZE))
-    matrix = matrix.float()
-    if axis == x.ndim - 1:
-        rotated = runs @ matrix
-    else:
-        rotated = matrix.T @ runs
-    return rotated.flatten(axis, axis + 1).to(x.dtype)
 
 
 @functools.lru_cache(maxsize=None)
@@ -560,8 +534,8 @@ class _QuantizeTransform:
 class RandomHadamardTransform(_QuantizeTransform):
     """Rotate the input by ``hadamard_matrix`` before it is quantized and
     rotate it back after, while fake-quantization is on.  The rotated axis
-    keeps ``_rotate``'s padding, so the GEMM the input feeds runs over the
-    padded axis, as the hardware's does.
+    keeps ``hadamard_rotate``'s padding, so the GEMM the input feeds runs
+    over the padded axis, as the hardware's does.
 
     Args:
         rht_axis: Axis to rotate along, or None.
@@ -589,18 +563,18 @@ class RandomHadamardTransform(_QuantizeTransform):
 
     def prepare(self, x: torch.Tensor) -> torch.Tensor:
         if self.rht_axis is not None:
-            x = _rotate(x, self.rht_axis, self.rht_matrix)
+            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix)
         return super().prepare(x)
 
     def pre(self, x: torch.Tensor) -> torch.Tensor:
         if self.rht_axis is not None and self.fake_quant_enabled:
-            x = _rotate(x, self.rht_axis, self.rht_matrix)
+            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix)
         return super().pre(x)
 
     def post(self, x: torch.Tensor) -> torch.Tensor:
         x = super().post(x)
         if self.rht_axis is not None and self.fake_quant_enabled:
-            x = _rotate(x, self.rht_axis, self.rht_matrix.T)
+            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix.T)
         return x
 
 

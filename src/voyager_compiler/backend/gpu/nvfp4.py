@@ -21,12 +21,14 @@ itself, packed for its GEMM and, transposed, for its input gradient's.
 
 import operator
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch.fx import GraphModule, Node
-from torch.library import Library, impl
+from torch.library import Library, impl, triton_op, wrap_triton
 from torch.nn.functional import ScalingType, SwizzleType
 from torchao.prototype.mx_formats.kernels import (
     f4_unpacked_to_f32,
@@ -37,12 +39,13 @@ from torchao.prototype.mx_formats.kernels import (
 from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 
 from voyager_compiler.codegen.node_info import get_arg_value
-from voyager_compiler.ops import expand
-from voyager_compiler.ops.quantized import _random_bytes
+from voyager_compiler.ops import expand, hadamard_rotate
+from voyager_compiler.ops.quantized import (
+    PHILOX_ROUNDS,
+    _random_bytes,
+)
 from voyager_compiler.quantization.fake_quantize import (
-    _rotate,
     calculate_global_scale,
-    hadamard_matrix,
 )
 from voyager_compiler.shape_prop import fetch_attr
 
@@ -66,6 +69,21 @@ BLOCK_SCALED_CUDA = (12, 8)
 # The buffer of a lowered graph holding the 1 its ``nvfp4_linear`` calls
 # take as ``one``.
 ONE = "nvfp4_one"
+
+# The rows and the runs of 16 along K one program of the CUDA cast takes.
+CAST_TILE = 64
+CAST_RUNS = 4
+# The runs of 16 along each axis one program of the CUDA pair cast takes.
+PAIR_CAST_RUNS = 4
+# FP4_MAX and E4M3_MAX as the cast's kernels read them.
+_FP4_MAX = tl.constexpr(FP4_MAX)
+_E4M3_MAX = tl.constexpr(E4M3_MAX)
+# The least global scale, as ``calculate_global_scale`` clamps it.
+_FLOAT32_TINY = tl.constexpr(torch.finfo(torch.float32).tiny)
+# float32's sign bit, as an int32.
+_SIGN_BIT = tl.constexpr(-(2**31))
+# The rounds of _random_bytes' Philox4x32, which tl.philox runs in the casts.
+_PHILOX_ROUNDS = tl.constexpr(PHILOX_ROUNDS)
 
 
 @dataclass
@@ -156,11 +174,662 @@ def _block_scales(
     return torch.where(scale > 0, scale, 1.0)
 
 
+@triton.jit
+def _runs(
+    x,
+    h,
+    m,
+    k0,
+    rows,
+    stride_m,
+    stride_k,
+    ROTATE: tl.constexpr,
+    TILE: tl.constexpr,
+    RUNS: tl.constexpr,
+):
+    """A ``[TILE, RUNS, 16]`` tile of the cast's matrix: rows ``m``, ``RUNS``
+    runs of 16 along K from ``k0``, each rotated by the 16x16 matrix at ``h``
+    if ``ROTATE`` and rounded to bfloat16 as ``hadamard_rotate`` rounds it;
+    values as float32."""
+    k = k0 + tl.arange(0, RUNS * 16)
+    mask = m[:, None] < rows
+    tile = tl.load(
+        x + m[:, None] * stride_m + k[None, :] * stride_k,
+        mask=mask,
+        other=0.0,
+    )
+    tile = tl.reshape(tile, (TILE * RUNS, 16))
+    if ROTATE:
+        run = tl.arange(0, 16)
+        # +-1/4: exact in bfloat16.
+        hm = tl.load(h + run[:, None] * 16 + run[None, :]).to(tl.bfloat16)
+        tile = tl.dot(tile, hm).to(tl.bfloat16)
+    return tl.reshape(tile.to(tl.float32), (TILE, RUNS, 16))
+
+
+@triton.jit
+def _amax_kernel(
+    x,
+    h,
+    amax,
+    rows,
+    stride_m,
+    stride_k,
+    ROTATE: tl.constexpr,
+    TILE: tl.constexpr,
+    RUNS: tl.constexpr,
+):
+    """The cast's first pass: the largest magnitude, into ``amax``."""
+    m = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    tile = _runs(
+        x,
+        h,
+        m,
+        tl.program_id(1) * RUNS * 16,
+        rows,
+        stride_m,
+        stride_k,
+        ROTATE,
+        TILE,
+        RUNS,
+    )
+    tl.atomic_max(amax, tl.max(tl.max(tl.max(tl.abs(tile), 2), 1), 0))
+
+
+@triton.jit
+def _fp4_code(value):
+    """The fp4_e2m1 code of float32 ``value``, rounded to nearest even and
+    saturating at 6, its sign in bit 3, negative zero's included."""
+    m = tl.abs(value)
+    code = (
+        (m > 0.25).to(tl.int32)
+        + (m >= 0.75).to(tl.int32)
+        + (m > 1.25).to(tl.int32)
+        + (m >= 1.75).to(tl.int32)
+        + (m > 2.5).to(tl.int32)
+        + (m >= 3.5).to(tl.int32)
+        + (m > 5.0).to(tl.int32)
+    )
+    sign = (value.to(tl.int32, bitcast=True) < 0).to(tl.int32)
+    return code | (sign << 3)
+
+
+@triton.jit
+def _cast_tile(
+    tile,
+    run_amax,
+    m,
+    first,
+    rows,
+    cols,
+    amax,
+    seed,
+    codes,
+    scales,
+    flat_m,
+    flat_k,
+    scale_col_tiles,
+    STOCHASTIC: tl.constexpr,
+    K_FLAT: tl.constexpr,
+    TILE: tl.constexpr,
+    RUNS: tl.constexpr,
+):
+    """Cast a ``[TILE, RUNS, 16]`` float32 tile -- rows ``m``, runs of 16
+    from run ``first``, each scaled by the ``[TILE, RUNS]`` ``run_amax`` --
+    with ``quantize_nvfp4``'s bfloat16 arithmetic op for op: each run's
+    scale, its elements rounded to nearest or, if ``STOCHASTIC``, by
+    ``_random_bytes``' Philox bits, packed two to a byte, and the scales
+    stored in cuBLAS's swizzled layout."""
+    mask = m[:, None] < rows
+    run = tl.arange(0, 16)
+    # Eager torch divides by a Python number as a product with its
+    # reciprocal, and by a tensor exactly.
+    t = (tl.load(amax) * (1.0 / (_FP4_MAX * _E4M3_MAX))).to(tl.bfloat16)
+    t = tl.maximum(t.to(tl.float32), _FLOAT32_TINY)
+    s = (run_amax * (1.0 / _FP4_MAX)).to(tl.bfloat16)
+    s = tl.math.div_rn(s.to(tl.float32), t).to(tl.bfloat16).to(tl.float32)
+    s = tl.minimum(s, _E4M3_MAX)
+    s = s.to(tl.float8e4nv, fp_downcast_rounding="rtne").to(tl.float32)
+    s = tl.where(s > 0, s, 1.0)
+    denominator = (s * t).to(tl.bfloat16).to(tl.float32)
+    elements = tl.math.div_rn(tile, denominator[:, :, None])
+    elements = elements.to(tl.bfloat16).to(tl.float32)
+
+    if STOCHASTIC:
+        key = tl.load(seed)
+        block = first + tl.arange(0, RUNS)
+        if K_FLAT:
+            # K runs along the flat index, so a run is one Philox draw.
+            row_start = m[:, None].to(tl.int64) * flat_m
+            index = row_start + (block * 16)[None, :].to(tl.int64)
+        else:
+            k = block[:, None] * 16 + run[None, :]
+            index = (
+                m[:, None, None].to(tl.int64) * flat_m
+                + k[None, :, :].to(tl.int64) * flat_k
+            )
+        counter = index // 16
+        c0 = (counter & 0xFFFFFFFF).to(tl.uint32)
+        c1 = (counter >> 32).to(tl.uint32)
+        zero = tl.zeros_like(c0)
+        w0, w1, w2, w3 = tl.philox(key, c0, c1, zero, zero, _PHILOX_ROUNDS)
+        if K_FLAT:
+            which = run[None, None, :] // 4
+            shift = ((run[None, None, :] % 4) * 8).to(tl.uint32)
+            w0, w1 = w0[:, :, None], w1[:, :, None]
+            w2, w3 = w2[:, :, None], w3[:, :, None]
+        else:
+            which = (index % 16) // 4
+            shift = ((index % 4) * 8).to(tl.uint32)
+        word = tl.where(
+            which == 0,
+            w0,
+            tl.where(which == 1, w1, tl.where(which == 2, w2, w3)),
+        )
+        byte = ((word >> shift) & 0xFF).to(tl.float32)
+        value = tl.minimum(tl.maximum(elements, -_FP4_MAX), _FP4_MAX)
+        magnitude = tl.abs(value)
+        gap = tl.where(magnitude < 2, 0.5, tl.where(magnitude < 4, 1.0, 2.0))
+        near = tl.floor(magnitude / gap) * gap
+        far = tl.where(near == magnitude, near, near + gap)
+        rounded = tl.where(
+            magnitude + byte / 256 * (far - near) >= far, far, near
+        )
+        sign = value.to(tl.int32, bitcast=True) & _SIGN_BIT
+        elements = (rounded.to(tl.int32, bitcast=True) | sign).to(
+            tl.float32, bitcast=True
+        )
+
+    low, high = tl.split(tl.reshape(_fp4_code(elements), (TILE, RUNS * 8, 2)))
+    pair = first * 8 + tl.arange(0, RUNS * 8)
+    tl.store(
+        codes + m[:, None] * (cols // 2) + pair[None, :],
+        (low | (high << 4)).to(tl.uint8),
+        mask=mask,
+    )
+
+    # ``to_blocked``: 128 x 4 tiles of (row, run), each 32 rows of 4 row
+    # groups x 4 runs.
+    block = first + tl.arange(0, RUNS)
+    tiles = (m[:, None] // 128) * scale_col_tiles + block[None, :] // 4
+    within = (
+        (m[:, None] % 32) * 16
+        + ((m[:, None] % 128) // 32) * 4
+        + block[None, :] % 4
+    )
+    tl.store(
+        scales + tiles * 512 + within,
+        s.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _cast_kernel(
+    x,
+    h,
+    amax,
+    seed,
+    codes,
+    scales,
+    rows,
+    cols,
+    stride_m,
+    stride_k,
+    flat_m,
+    flat_k,
+    scale_col_tiles,
+    ROTATE: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+    K_FLAT: tl.constexpr,
+    TILE: tl.constexpr,
+    RUNS: tl.constexpr,
+):
+    """The cast's second pass: ``_cast_tile`` of each tile of ``_runs``."""
+    m = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    first = tl.program_id(1) * RUNS
+    tile = _runs(
+        x, h, m, first * 16, rows, stride_m, stride_k, ROTATE, TILE, RUNS
+    )
+    _cast_tile(
+        tile,
+        tl.max(tl.abs(tile), 2),
+        m,
+        first,
+        rows,
+        cols,
+        amax,
+        seed,
+        codes,
+        scales,
+        flat_m,
+        flat_k,
+        scale_col_tiles,
+        STOCHASTIC,
+        K_FLAT,
+        TILE,
+        RUNS,
+    )
+
+
+@triton.jit
+def _pair_tile(x, cols, RUNS_M: tl.constexpr, RUNS_K: tl.constexpr):
+    """A ``[16 RUNS_M, 16 RUNS_K]`` bfloat16 tile of a contiguous matrix and
+    its row and column indices."""
+    m = tl.program_id(0) * RUNS_M * 16 + tl.arange(0, RUNS_M * 16)
+    k = tl.program_id(1) * RUNS_K * 16 + tl.arange(0, RUNS_K * 16)
+    return tl.load(x + m[:, None] * cols + k[None, :]), m, k
+
+
+@triton.jit
+def _transpose_runs(
+    tile,
+    h,
+    ROTATE: tl.constexpr,
+    RUNS_M: tl.constexpr,
+    RUNS_K: tl.constexpr,
+):
+    """``_pair_tile``'s transpose as a ``[16 RUNS_K, RUNS_M, 16]`` float32
+    tile of runs of 16, each rotated by ``h`` if ``ROTATE`` and rounded to
+    bfloat16 as ``hadamard_rotate`` rounds it."""
+    transpose = tl.reshape(tl.trans(tile), (RUNS_K * RUNS_M * 16, 16))
+    if ROTATE:
+        run = tl.arange(0, 16)
+        hm = tl.load(h + run[:, None] * 16 + run[None, :]).to(tl.bfloat16)
+        transpose = tl.dot(transpose, hm).to(tl.bfloat16)
+    return tl.reshape(transpose.to(tl.float32), (RUNS_K * 16, RUNS_M, 16))
+
+
+@triton.jit
+def _pair_amax_kernel(
+    x,
+    h,
+    amax,
+    transpose_amax,
+    cols,
+    ROTATE: tl.constexpr,
+    RUNS_M: tl.constexpr,
+    RUNS_K: tl.constexpr,
+):
+    """The pair cast's first pass: each layout's largest magnitude."""
+    tile, _, _ = _pair_tile(x, cols, RUNS_M, RUNS_K)
+    tl.atomic_max(amax, tl.max(tl.max(tl.abs(tile.to(tl.float32)), 1), 0))
+    transpose = _transpose_runs(tile, h, ROTATE, RUNS_M, RUNS_K)
+    tl.atomic_max(
+        transpose_amax, tl.max(tl.max(tl.max(tl.abs(transpose), 2), 1), 0)
+    )
+
+
+@triton.jit
+def _pair_cast_kernel(
+    x,
+    h,
+    amax,
+    transpose_amax,
+    seed,
+    transpose_seed,
+    codes,
+    scales,
+    transpose_codes,
+    transpose_scales,
+    rows,
+    cols,
+    ROTATE: tl.constexpr,
+    STOCHASTIC: tl.constexpr,
+    TRANSPOSE_STOCHASTIC: tl.constexpr,
+    RUNS_M: tl.constexpr,
+    RUNS_K: tl.constexpr,
+):
+    """The pair cast's second pass: ``_cast_tile`` of a
+    ``[16 RUNS_M, 16 RUNS_K]`` tile's rows or, in the grid's second half,
+    of its transpose's."""
+    m = tl.program_id(0) * RUNS_M * 16 + tl.arange(0, RUNS_M * 16)
+    k = tl.program_id(1) * RUNS_K * 16 + tl.arange(0, RUNS_K * 16)
+    if tl.program_id(2) == 0:
+        tile = _runs(
+            x,
+            h,
+            m,
+            k0=tl.program_id(1) * RUNS_K * 16,
+            rows=rows,
+            stride_m=cols,
+            stride_k=1,
+            ROTATE=False,
+            TILE=RUNS_M * 16,
+            RUNS=RUNS_K,
+        )
+        _cast_tile(
+            tile,
+            tl.max(tl.abs(tile), 2),
+            m,
+            first=tl.program_id(1) * RUNS_K,
+            rows=rows,
+            cols=cols,
+            amax=amax,
+            seed=seed,
+            codes=codes,
+            scales=scales,
+            flat_m=cols,
+            flat_k=1,
+            scale_col_tiles=tl.cdiv(cols // 16, 4),
+            STOCHASTIC=STOCHASTIC,
+            K_FLAT=True,
+            TILE=RUNS_M * 16,
+            RUNS=RUNS_K,
+        )
+    else:
+        # Named apart from the rows' tile: the two differ in shape unless
+        # RUNS_M equals RUNS_K.
+        transpose = _runs(
+            x,
+            h,
+            k,
+            k0=tl.program_id(0) * RUNS_M * 16,
+            rows=cols,
+            stride_m=1,
+            stride_k=cols,
+            ROTATE=ROTATE,
+            TILE=RUNS_K * 16,
+            RUNS=RUNS_M,
+        )
+        _cast_tile(
+            transpose,
+            tl.max(tl.abs(transpose), 2),
+            k,
+            first=tl.program_id(0) * RUNS_M,
+            rows=cols,
+            cols=rows,
+            amax=transpose_amax,
+            seed=transpose_seed,
+            codes=transpose_codes,
+            scales=transpose_scales,
+            flat_m=rows,
+            flat_k=1,
+            scale_col_tiles=tl.cdiv(rows // 16, 4),
+            STOCHASTIC=TRANSPOSE_STOCHASTIC,
+            K_FLAT=True,
+            TILE=RUNS_K * 16,
+            RUNS=RUNS_M,
+        )
+
+
+@triton.jit
+def _square_cast_kernel(
+    x,
+    amax,
+    codes,
+    scales,
+    transpose_codes,
+    transpose_scales,
+    rows,
+    cols,
+    RUNS_M: tl.constexpr,
+    RUNS_K: tl.constexpr,
+):
+    """The square cast's second pass: ``_cast_tile`` of a
+    ``[16 RUNS_M, 16 RUNS_K]`` tile's rows and of its transpose's, each run
+    scaled by the amax of the 16x16 block it lies in."""
+    tile, m, k = _pair_tile(x, cols, RUNS_M, RUNS_K)
+    tile = tile.to(tl.float32)
+    blocks = tl.reshape(tl.abs(tile), (RUNS_M, 16, RUNS_K, 16))
+    block_amax = tl.max(tl.max(blocks, 3), 1)
+    run_amax = tl.broadcast_to(block_amax[:, None, :], (RUNS_M, 16, RUNS_K))
+    _cast_tile(
+        tl.reshape(tile, (RUNS_M * 16, RUNS_K, 16)),
+        tl.reshape(run_amax, (RUNS_M * 16, RUNS_K)),
+        m,
+        first=tl.program_id(1) * RUNS_K,
+        rows=rows,
+        cols=cols,
+        amax=amax,
+        seed=amax,
+        codes=codes,
+        scales=scales,
+        flat_m=cols,
+        flat_k=1,
+        scale_col_tiles=tl.cdiv(cols // 16, 4),
+        STOCHASTIC=False,
+        K_FLAT=True,
+        TILE=RUNS_M * 16,
+        RUNS=RUNS_K,
+    )
+    transpose_amax = tl.broadcast_to(
+        tl.trans(block_amax)[:, None, :], (RUNS_K, 16, RUNS_M)
+    )
+    _cast_tile(
+        tl.reshape(tl.trans(tile), (RUNS_K * 16, RUNS_M, 16)),
+        tl.reshape(transpose_amax, (RUNS_K * 16, RUNS_M)),
+        k,
+        first=tl.program_id(0) * RUNS_M,
+        rows=cols,
+        cols=rows,
+        amax=amax,
+        seed=amax,
+        codes=transpose_codes,
+        scales=transpose_scales,
+        flat_m=rows,
+        flat_k=1,
+        scale_col_tiles=tl.cdiv(rows // 16, 4),
+        STOCHASTIC=False,
+        K_FLAT=True,
+        TILE=RUNS_K * 16,
+        RUNS=RUNS_M,
+    )
+
+
+def _runs_dividing(length: int, most: int) -> int:
+    """The most runs of 16, up to ``most`` and halving from it, that divide
+    a ``length`` long axis."""
+    runs = most
+    while length // BLOCK_SIZE % runs:
+        runs //= 2
+    return runs
+
+
+def _cast_outputs(
+    rows: int, cols: int, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A cast's packed codes, ``[rows, cols / 2]``, and its block scales,
+    zeroed and padded to ``pack_nvfp4``'s swizzled tiles."""
+    codes = torch.empty((rows, cols // 2), dtype=torch.uint8, device=device)
+    scales = torch.zeros(
+        triton.cdiv(rows, 128) * 128 * triton.cdiv(cols // BLOCK_SIZE, 4) * 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    return codes, scales
+
+
+def _global_scale(amax: torch.Tensor) -> torch.Tensor:
+    """The global scale ``t`` of a tensor whose largest magnitude is
+    ``amax``, as ``calculate_global_scale`` takes it from the tensor."""
+    return calculate_global_scale(amax.to(torch.bfloat16), FP4_MAX, E4M3_MAX)
+
+
+def _paired_castable(x: torch.Tensor) -> bool:
+    """Whether the paired Triton casts take ``x``: a contiguous CUDA
+    bfloat16 matrix whose sides are multiples of 16."""
+    return (
+        x.is_cuda
+        and x.dtype is torch.bfloat16
+        and x.ndim == 2
+        and x.is_contiguous()
+        and x.shape[0] % BLOCK_SIZE == x.shape[1] % BLOCK_SIZE == 0
+    )
+
+
+@triton_op("voyager_gpu::cast_nvfp4", mutates_args=())
+def cast_nvfp4(
+    x: torch.Tensor,
+    hadamard: Optional[torch.Tensor],
+    seed: Optional[torch.Tensor],
+    axis: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``quantize_nvfp4`` of a CUDA bfloat16 matrix as two Triton kernels:
+    the amax, then the cast.
+
+    Args:
+        x: The matrix.
+        hadamard: ``quantize_nvfp4``'s.
+        seed: ``quantize_nvfp4``'s.
+        axis: The axis the blocks run along, 0 or 1.
+
+    Returns:
+        ``quantize_nvfp4``'s outputs.
+    """
+    if axis == 0:
+        cols, rows = x.shape
+        stride_k, stride_m = x.stride()
+        flat_m, flat_k = 1, x.shape[1]
+    else:
+        rows, cols = x.shape
+        stride_m, stride_k = x.stride()
+        flat_m, flat_k = x.shape[1], 1
+    runs = _runs_dividing(cols, CAST_RUNS)
+    grid = (triton.cdiv(rows, CAST_TILE), cols // BLOCK_SIZE // runs)
+    amax = torch.zeros((), dtype=torch.float32, device=x.device)
+    rotate = hadamard is not None
+    matrix = hadamard if rotate else x
+    wrap_triton(_amax_kernel)[grid](
+        x, matrix, amax, rows, stride_m, stride_k, rotate, CAST_TILE, runs
+    )
+    codes, scales = _cast_outputs(rows, cols, x.device)
+    wrap_triton(_cast_kernel)[grid](
+        x,
+        matrix,
+        amax,
+        amax if seed is None else seed,
+        codes,
+        scales,
+        rows,
+        cols,
+        stride_m,
+        stride_k,
+        flat_m,
+        flat_k,
+        triton.cdiv(cols // BLOCK_SIZE, 4),
+        rotate,
+        seed is not None,
+        flat_k == 1,
+        CAST_TILE,
+        runs,
+    )
+    return codes, scales, _global_scale(amax)
+
+
+def _pair_cast_layout(
+    x: torch.Tensor,
+) -> Tuple[List[int], Tuple[int, int], List[torch.Tensor]]:
+    """How a cast of a matrix's rows and of its transpose's rows splits it,
+    and the outputs it writes.
+
+    Args:
+        x: CUDA matrix ``[M, K]``, both multiples of 16.
+
+    Returns:
+        ``(runs, grid, outputs)``: the runs of 16 along M and along K one
+        program takes, at most ``PAIR_CAST_RUNS`` and dividing each length;
+        the grid of programs over M and K; and the codes and the zeroed,
+        swizzle-padded scales of the rows, then of the transpose's rows.
+    """
+    rows, cols = x.shape
+    runs = [_runs_dividing(length, PAIR_CAST_RUNS) for length in (rows, cols)]
+    grid = (rows // BLOCK_SIZE // runs[0], cols // BLOCK_SIZE // runs[1])
+    outputs = [
+        *_cast_outputs(rows, cols, x.device),
+        *_cast_outputs(cols, rows, x.device),
+    ]
+    return runs, grid, outputs
+
+
+@triton_op("voyager_gpu::cast_nvfp4_pair", mutates_args=())
+def cast_nvfp4_pair(
+    x: torch.Tensor,
+    hadamard: Optional[torch.Tensor],
+    seed: Optional[torch.Tensor],
+    transpose_seed: Optional[torch.Tensor],
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """``cast_nvfp4`` of a contiguous CUDA bfloat16 matrix along its columns
+    and of its transpose along its columns, as two Triton kernels: both
+    amaxes from one read, then both casts.
+
+    Args:
+        x: The matrix.
+        hadamard: ``quantize_nvfp4``'s, for the transpose.
+        seed: The rows' ``quantize_nvfp4`` seed.
+        transpose_seed: The transpose's.
+
+    Returns:
+        ``quantize_nvfp4_pair``'s outputs.
+    """
+    rows, cols = x.shape
+    runs, grid, outputs = _pair_cast_layout(x)
+    amax = torch.zeros(2, dtype=torch.float32, device=x.device)
+    rotate = hadamard is not None
+    matrix = hadamard if rotate else x
+    wrap_triton(_pair_amax_kernel)[grid](
+        x, matrix, amax, amax[1:], cols, rotate, *runs
+    )
+    wrap_triton(_pair_cast_kernel)[(*grid, 2)](
+        x,
+        matrix,
+        amax,
+        amax[1:],
+        amax if seed is None else seed,
+        amax if transpose_seed is None else transpose_seed,
+        *outputs,
+        rows,
+        cols,
+        rotate,
+        seed is not None,
+        transpose_seed is not None,
+        *runs,
+    )
+    return (
+        *outputs[:2],
+        _global_scale(amax[0]),
+        *outputs[2:],
+        _global_scale(amax[1]),
+    )
+
+
+@triton_op("voyager_gpu::cast_nvfp4_square", mutates_args=())
+def cast_nvfp4_square(x: torch.Tensor) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """``quantize_nvfp4_square`` of a contiguous CUDA bfloat16 matrix as two
+    Triton kernels: the amax, then both layouts' casts from one read.
+
+    Returns:
+        ``quantize_nvfp4_square``'s outputs.
+    """
+    rows, cols = x.shape
+    runs, grid, outputs = _pair_cast_layout(x)
+    amax = torch.zeros((), dtype=torch.float32, device=x.device)
+    # ``x`` stands in for the Hadamard matrix, unread without ROTATE.
+    wrap_triton(_amax_kernel)[grid](
+        x, x, amax, rows, cols, 1, False, runs[0] * BLOCK_SIZE, runs[1]
+    )
+    wrap_triton(_square_cast_kernel)[grid](x, amax, *outputs, rows, cols, *runs)
+    return (*outputs, _global_scale(amax))
+
+
 def quantize_nvfp4(
     input: torch.Tensor,
     axis: int = -1,
     seed: Optional[torch.Tensor] = None,
-    rotate: bool = False,
+    hadamard: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize ``input`` to NVFP4 as Voyager's fake-quant does, packed for
     ``nvfp4_linear``.
@@ -169,7 +838,9 @@ def quantize_nvfp4(
     random Hadamard transform, the global scale ``t`` from the tensor's amax,
     each block's scale -- its amax over 6 and over ``t``, rounded to
     ``fp8_e4m3``, and 1 where that is 0 -- and each element divided by its
-    block scale times ``t`` and rounded to ``fp4_e2m1``.
+    block scale times ``t`` and rounded to ``fp4_e2m1``.  A CUDA matrix, or
+    a tensor blocked along its last axis, is cast by ``cast_nvfp4``'s two
+    Triton kernels, the same arithmetic reading ``input`` twice in place.
 
     Args:
         input: bfloat16 tensor, a multiple of 16 long along ``axis``.
@@ -177,15 +848,31 @@ def quantize_nvfp4(
         seed: int64 scalar keying stochastic rounding, by the random bits
             ``quantize`` draws for a tensor of ``input``'s shape; None
             rounds to nearest.
-        rotate: Apply the random Hadamard transform along ``axis`` first.
+        hadamard: ``hadamard_matrix``, on ``input``'s device, to apply the
+            random Hadamard transform along ``axis`` first; None does not.
 
     Returns:
         ``(codes, scales, t)``: the codes with ``axis`` moved last,
         ``[..., K / 2]``, and their block scales, as ``pack_nvfp4`` packs
         them over the codes' rows; and ``t``, a 0-d tensor.
     """
-    if rotate:
-        input = _rotate(input, axis, hadamard_matrix(input.device))
+    ndim, axis = input.ndim, axis % input.ndim
+    if (
+        input.is_cuda
+        and input.dtype is torch.bfloat16
+        and input.shape[axis] % BLOCK_SIZE == 0
+        and (axis == ndim - 1 or (ndim == 2 and axis == 0))
+    ):
+        codes, scales, global_scale = cast_nvfp4(
+            input.reshape(-1, input.shape[-1]),
+            hadamard,
+            seed,
+            1 if axis == ndim - 1 else 0,
+        )
+        shape = input.movedim(axis, -1).shape[:-1]
+        return codes.view(*shape, -1), scales, global_scale
+    if hadamard is not None:
+        input = hadamard_rotate(input, axis, hadamard)
     global_scale = calculate_global_scale(input, FP4_MAX, E4M3_MAX)
     blocks = input.movedim(axis, -1).unflatten(-1, (-1, BLOCK_SIZE))
     scale = _block_scales(blocks.abs().amax(-1), global_scale)
@@ -201,6 +888,34 @@ def quantize_nvfp4(
     return codes.view(*values.shape[:-1], -1), scales, global_scale
 
 
+def quantize_nvfp4_pair(
+    input: torch.Tensor,
+    seed: Optional[torch.Tensor] = None,
+    transpose_seed: Optional[torch.Tensor] = None,
+    hadamard: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, ...]:
+    """``quantize_nvfp4`` of a matrix along its last axis and of its
+    transpose along its last axis, as ``quantize_mx_transpose`` quantizes
+    them.  A contiguous CUDA bfloat16 matrix is cast by ``cast_nvfp4_pair``,
+    reading it once per pass for both.
+
+    Args:
+        input: Matrix ``[M, K]``, ``M`` and ``K`` multiples of 16.
+        seed: The row-wise cast's ``seed`` for ``quantize_nvfp4``.
+        transpose_seed: The transpose's.
+        hadamard: ``quantize_nvfp4``'s, for the transpose.
+
+    Returns:
+        ``quantize_nvfp4``'s outputs for the rows, then for the transpose.
+    """
+    if _paired_castable(input):
+        return cast_nvfp4_pair(input, hadamard, seed, transpose_seed)
+    return (
+        *quantize_nvfp4(input, -1, seed),
+        *quantize_nvfp4(input.mT, -1, transpose_seed, hadamard),
+    )
+
+
 def quantize_nvfp4_square(
     weight: torch.Tensor,
 ) -> Tuple[torch.Tensor, ...]:
@@ -209,7 +924,9 @@ def quantize_nvfp4_square(
 
     ``quantize_nvfp4``'s arithmetic over 16x16 blocks: the global scale ``t``
     from the weight's amax, each block's scale from its amax, and each
-    element divided by its block scale times ``t``.
+    element divided by its block scale times ``t``.  A contiguous CUDA
+    weight is cast by ``cast_nvfp4_square``, reading it once per pass for
+    both layouts.
 
     Args:
         weight: bfloat16 ``[N, K]``, both multiples of 16.
@@ -220,6 +937,8 @@ def quantize_nvfp4_square(
         each beside its block scales as ``pack_nvfp4`` packs them; and ``t``,
         a 0-d tensor.
     """
+    if _paired_castable(weight):
+        return cast_nvfp4_square(weight)
     global_scale = calculate_global_scale(weight, FP4_MAX, E4M3_MAX)
     blocks = weight.unflatten(-1, (-1, BLOCK_SIZE)).unflatten(
         -3, (-1, BLOCK_SIZE)

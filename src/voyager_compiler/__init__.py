@@ -66,6 +66,7 @@ from voyager_compiler.export_utils import (
     get_aten_graph_module,
     get_conv_bn_layers,
     get_node_name_to_scope,
+    merge_sibling_linears,
     print_node_scope_tabular,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
@@ -159,6 +160,7 @@ __all__ = [
     "gradient_program",
     "insert_align_device_nodes",
     "match_and_fuse_rms_norm",
+    "merge_sibling_linears",
     "pad_vit_embeddings_output",
     "prepare_from_args",
     "prepare_pt2e",

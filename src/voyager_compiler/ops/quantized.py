@@ -960,6 +960,42 @@ def calculate_mx_qparam(
     return scale
 
 
+# Elements a random Hadamard transform mixes together, as in NVFP4.
+HADAMARD_SIZE = 16
+
+
+def hadamard_rotate(
+    x: torch.Tensor, axis: int, matrix: torch.Tensor
+) -> torch.Tensor:
+    """``x`` with each run of ``HADAMARD_SIZE`` elements along ``axis``,
+    its last or second-to-last, multiplied by ``matrix`` in float32, the axis
+    first zero-padded to a whole number of runs.
+
+    The result keeps the padded length: both operands of a GEMM rotated
+    along its contraction axis multiply to their product over the padded
+    axis, their padding being zero.  ``x`` is multiplied where it lies -- its
+    runs along the last axis by ``matrix``, along the second-to-last by
+    ``matrix.T`` from the left -- so it is never moved.  The training
+    lowering inserts these same ops into its graph (``_insert_rotation``).
+
+    Raises:
+        ValueError: ``axis`` is neither of the last two.
+    """
+    axis %= x.ndim
+    if axis < x.ndim - 2:
+        raise ValueError(f"cannot rotate along axis {axis} of {x.ndim}")
+    padding = -x.shape[axis] % HADAMARD_SIZE
+    if padding:
+        x = F.pad(x, (0, 0) * (x.ndim - 1 - axis) + (0, padding))
+    runs = x.float().unflatten(axis, (-1, HADAMARD_SIZE))
+    matrix = matrix.float()
+    if axis == x.ndim - 1:
+        rotated = runs @ matrix
+    else:
+        rotated = matrix.T @ runs
+    return rotated.flatten(axis, axis + 1).to(x.dtype)
+
+
 quantized_ops_lib.define(
     "quantize_mx(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
@@ -1005,6 +1041,64 @@ def quantize_mx(
         input, element_scale, None, axes, block_size, qmap, output_code, seed
     )
     return scale, input
+
+
+quantized_ops_lib.define(
+    "quantize_mx_transpose(Tensor self, Tensor qmap, int block_size, "
+    "float quant_max, bool force_scale_power_of_two=False, "
+    "Tensor scale_qmap=None, Tensor output_code=None, Tensor? seed=None, "
+    "Tensor? global_scale=None, Tensor? transpose_seed=None, "
+    "Tensor? transpose_global_scale=None, Tensor? hadamard=None) "
+    "-> (Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+@impl(quantized_ops_lib, "quantize_mx_transpose", "CompositeExplicitAutograd")
+def quantize_mx_transpose(
+    input: torch.Tensor,
+    qmap: torch.Tensor,
+    block_size: int,
+    quant_max: float,
+    force_scale_power_of_two: bool = False,
+    scale_qmap: Optional[torch.Tensor] = None,
+    output_code: Optional[torch.Tensor] = None,
+    seed: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+    transpose_seed: Optional[torch.Tensor] = None,
+    transpose_global_scale: Optional[torch.Tensor] = None,
+    hadamard: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor]:
+    """Quantize ``input`` in microscaling blocks twice, as Transformer
+    Engine's quantize-transpose does: along its last axis, and transposed
+    (its last two axes swapped) along the transpose's last, the transpose
+    first rotated by ``hadamard`` (``hadamard_rotate``) if given.
+
+    Each layout is ``quantize_mx`` with its own seed and global scale; the
+    transposed one's global scale is taken over the rotated transpose.
+
+    Returns:
+        ``(scale, codes, transpose_scale, transpose_codes)``: ``input``'s,
+        ``[..., M, K]``, then the transpose's, ``[..., K, M]``, each as
+        ``quantize_mx`` returns them.
+    """
+    transpose = input.mT
+    if hadamard is not None:
+        transpose = hadamard_rotate(transpose, -1, hadamard)
+    arguments = (
+        qmap,
+        (-1,),
+        block_size,
+        quant_max,
+        force_scale_power_of_two,
+        scale_qmap,
+        output_code,
+    )
+    return (
+        *quantize_mx(input, *arguments, seed, global_scale),
+        *quantize_mx(
+            transpose, *arguments, transpose_seed, transpose_global_scale
+        ),
+    )
 
 
 quantized_ops_lib.define(

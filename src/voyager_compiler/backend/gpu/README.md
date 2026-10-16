@@ -121,7 +121,7 @@ per GEMM node, `"fp8"`, `"nvfp4"` or why it was left alone:
   codes and block scales; casts that keep the scale in float32 (torchao, TE)
   differ in about 1% of codes. Its stochastic rounding draws Voyager's
   Philox bits, indexed by element in the tensor `quantize_mx` sees, and its
-  random Hadamard transform is Voyager's `_rotate`. On the CPU: 0
+  random Hadamard transform is Voyager's `hadamard_rotate`. On the CPU: 0
   mismatches on random and edge tensors, with and without either.
 - Unpacked NVFP4 operands are exact in bfloat16, so the emulator
   (`emulate_nvfp4_linear`: unpack, then `linear_mx`) gives the converted

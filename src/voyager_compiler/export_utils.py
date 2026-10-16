@@ -8,6 +8,7 @@ provenance capture stamps on every node.
 """
 
 import logging
+import operator
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -24,6 +25,7 @@ __all__ = [
     "get_conv_bn_layers",
     "get_module_stack",
     "get_node_name_to_scope",
+    "merge_sibling_linears",
     "print_node_scope_tabular",
 ]
 
@@ -35,6 +37,7 @@ def export_model(
     *,
     dynamic_shapes: Optional[Dict[str, Any]] = None,
     strict: bool = False,
+    merge_linears: bool = False,
 ):
     """Export ``model`` to a training-safe ``GraphModule``.
 
@@ -47,15 +50,138 @@ def export_model(
         kwargs: Keyword example inputs.
         dynamic_shapes: Dynamic-shape spec forwarded to ``torch.export``.
         strict: Whether export runs under torchdynamo.
+        merge_linears: Merge the bias-free linears that read one input into
+            one (``merge_sibling_linears``), their stacked weights held by
+            the export alone.
 
     Returns:
         The exported program's ``GraphModule``.
     """
     with _disable_aten_to_metadata_assertions():
-        gm = torch.export.export(
+        exported = torch.export.export(
             model, args, kwargs, dynamic_shapes=dynamic_shapes, strict=strict
         )
-    return gm.module(check_guards=False)
+    gm = exported.module(check_guards=False)
+    if merge_linears:
+        merge_sibling_linears(gm)
+    return gm
+
+
+def merge_sibling_linears(
+    export: GraphModule,
+    model: Optional[torch.nn.Module] = None,
+    mergeable: Optional[Callable[[Node, Node], bool]] = None,
+) -> None:
+    """Merge the bias-free linears that read one input into one linear over
+    their weights stacked, its output split back into theirs, in place.
+
+    A linear takes part when no other node reads its weight; those whose
+    weights share the first's dtype, device and ``requires_grad``, and for
+    which ``mergeable(first, linear)`` holds, merge.  The merged linear takes
+    the first's metadata, its module path among them.  Their stacked weight
+    is a new parameter of their closest common module, named after them
+    joined by ``_`` (``q_proj_k_proj_v_proj_weight``) and registered on
+    ``export`` and ``model`` alike; each linear's weight becomes a view of
+    its rows, so the two share their values, and a state dict keeps the
+    views alone.  ``merged_parameters`` on both maps each stacked weight's
+    name to its views' names, in row order.
+
+    Args:
+        export: An export of ``model``, rewritten in place.
+        model: The exported model, which shares ``export``'s parameters;
+            None when only ``export`` holds them.
+        mergeable: Whether two linears may share one weight; None merges
+            any.
+    """
+    graph = export.graph
+    owners = [export] if model is None else [export, model]
+    parameters = dict(export.named_parameters())
+    groups = {}
+    for linear in graph.find_nodes(
+        op="call_function", target=torch.ops.aten.linear.default
+    ):
+        operand, weight, *bias = linear.args
+        if (
+            weight.target in parameters
+            and len(weight.users) == 1
+            and all(b is None for b in bias)
+        ):
+            groups.setdefault(operand, []).append(linear)
+
+    def kind(linear):
+        weight = parameters[linear.args[1].target]
+        return weight.dtype, weight.device, weight.requires_grad
+
+    merged = {}
+    for linears in groups.values():
+        first = linears[0]
+        linears = [
+            linear
+            for linear in linears
+            if kind(linear) == kind(first)
+            and (mergeable is None or mergeable(first, linear))
+        ]
+        if len(linears) < 2:
+            continue
+        names = [linear.args[1].target for linear in linears]
+        weights = [parameters[name] for name in names]
+        paths = [name.split(".")[:-1] for name in names]
+        depth = 0
+        while all(
+            len(path) > depth + 1 and path[depth] == paths[0][depth]
+            for path in paths
+        ):
+            depth += 1
+        parent = ".".join(paths[0][:depth])
+        attribute = "_".join("_".join(path[depth:]) for path in paths)
+        attribute = f"{attribute}_{names[0].split('.')[-1]}"
+        stacked = torch.nn.Parameter(
+            torch.cat([weight.detach() for weight in weights]),
+            requires_grad=weights[0].requires_grad,
+        )
+        row = 0
+        for weight in weights:
+            weight.data = stacked.data[row : row + weight.shape[0]]
+            row += weight.shape[0]
+
+        # A state dict saves and loads the views, which hold the values.
+        def drop(module, state_dict, prefix, local_metadata, name=attribute):
+            del state_dict[prefix + name]
+
+        def keep(module, state_dict, prefix, *unused, name=attribute):
+            state_dict[prefix + name] = getattr(module, name)
+
+        for owner in owners:
+            module = owner.get_submodule(parent)
+            module.register_parameter(attribute, stacked)
+            module.register_state_dict_post_hook(drop)
+            module.register_load_state_dict_pre_hook(keep)
+        target = f"{parent}.{attribute}" if parent else attribute
+        merged[target] = names
+        with graph.inserting_before(first):
+            merged_linear = graph.call_function(
+                torch.ops.aten.linear.default,
+                (first.args[0], graph.get_attr(target)),
+            )
+            split = graph.call_function(
+                torch.ops.aten.split_with_sizes.default,
+                (merged_linear, [weight.shape[0] for weight in weights], -1),
+            )
+            parts = [
+                graph.call_function(operator.getitem, (split, index))
+                for index in range(len(linears))
+            ]
+        merged_linear.meta = {
+            key: value for key, value in first.meta.items() if key != "val"
+        }
+        for linear, part in zip(linears, parts):
+            linear.replace_all_uses_with(part)
+            weight = linear.args[1]
+            graph.erase_node(linear)
+            graph.erase_node(weight)
+    for owner in owners:
+        owner.merged_parameters = merged
+    export.recompile()
 
 
 def get_conv_bn_layers(model: torch.nn.Module) -> List[List[str]]:

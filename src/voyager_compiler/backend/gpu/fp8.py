@@ -14,7 +14,10 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from torch.fx import GraphModule, Node
+from torch.library import triton_op, wrap_triton
 
 from voyager_compiler.codegen.node_info import get_arg_value
 from voyager_compiler.shape_prop import fetch_attr
@@ -35,6 +38,9 @@ FP8_DTYPES = {
 GEMM_ALIGNMENT = 16
 # The compute capability majors torch runs torch._scaled_grouped_mm on.
 BATCHED_GEMM_MAJORS = (9, 10)
+# The rows and columns of the matrix one program of the CUDA cast-transpose
+# takes.
+CAST_TRANSPOSE_TILE = 64
 
 
 @dataclass
@@ -251,6 +257,116 @@ def quantize_fp8(
     saturating at its largest, as Voyager's ``quantize`` rounds it."""
     limit = torch.finfo(dtype).max
     return (input / scale).clamp(-limit, limit).to(dtype)
+
+
+@triton.jit
+def _fp8_code(value, dtype: tl.constexpr, LIMIT: tl.constexpr):
+    """bfloat16 ``value`` clamped to +-``LIMIT`` and rounded to ``dtype``."""
+    value = tl.clamp(
+        value.to(tl.float32), -LIMIT, LIMIT, propagate_nan=tl.PropagateNan.ALL
+    )
+    return value.to(dtype)
+
+
+@triton.jit
+def _cast_transpose_kernel(
+    x,
+    scale,
+    codes,
+    transpose,
+    amax,
+    rows,
+    cols,
+    LIMIT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """One tile's FP8 codes in both layouts, and its amax's bits.
+
+    Writes the codes of a ``[TILE, TILE]`` tile of ``x`` into ``codes`` and
+    ``transpose``, and raises ``amax`` to its largest magnitude's bits.
+    """
+    m = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    n = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    mask = (m[:, None] < rows) & (n[None, :] < cols)
+    tile = tl.load(x + m[:, None] * cols + n[None, :], mask=mask, other=0.0)
+    # A bfloat16 magnitude's bits order as the magnitude does, NaN above all.
+    bits = tile.to(tl.int16, bitcast=True).to(tl.int32) & 0x7FFF
+    tl.atomic_max(amax, tl.max(tl.max(bits, 1), 0))
+    # quantize_fp8 rounds the quotient to bfloat16 before it clamps.
+    value = tl.div_rn(tile.to(tl.float32), tl.load(scale).to(tl.float32))
+    value = value.to(tl.bfloat16)
+    tl.store(
+        codes + m[:, None] * cols + n[None, :],
+        _fp8_code(value, codes.dtype.element_ty, LIMIT),
+        mask=mask,
+    )
+    # The bfloat16 tile is transposed, not its FP8 codes.
+    tl.store(
+        transpose + n[:, None] * rows + m[None, :],
+        _fp8_code(tl.trans(value), codes.dtype.element_ty, LIMIT),
+        mask=tl.trans(mask),
+    )
+
+
+@triton_op("voyager_gpu::cast_transpose_fp8", mutates_args=())
+def cast_transpose_fp8(
+    x: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``quantize_fp8_transpose`` as one Triton kernel.
+
+    The kernel reads a contiguous CUDA bfloat16 matrix, scaled by a bfloat16
+    scale, once for its codes, its transpose's and its amax.
+    """
+    rows, cols = x.shape
+    codes = torch.empty((rows, cols), dtype=dtype, device=x.device)
+    transpose = torch.empty((cols, rows), dtype=dtype, device=x.device)
+    amax = torch.zeros((), dtype=torch.int32, device=x.device)
+    grid = (
+        triton.cdiv(rows, CAST_TRANSPOSE_TILE),
+        triton.cdiv(cols, CAST_TRANSPOSE_TILE),
+    )
+    wrap_triton(_cast_transpose_kernel)[grid](
+        x,
+        scale,
+        codes,
+        transpose,
+        amax,
+        rows,
+        cols,
+        torch.finfo(dtype).max,
+        CAST_TRANSPOSE_TILE,
+    )
+    return codes, transpose, amax.to(torch.int16).view(torch.bfloat16)
+
+
+def quantize_fp8_transpose(
+    input: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``quantize_fp8`` of a matrix and of its transpose, and its amax.
+
+    A contiguous CUDA bfloat16 matrix with a bfloat16 scale is cast by
+    ``cast_transpose_fp8``, one Triton kernel reading it once for all three.
+
+    Args:
+        input: Matrix ``[M, N]``.
+        scale: One scale, in ``input``'s dtype.
+        dtype: The torch FP8 dtype to cast to.
+
+    Returns:
+        ``(codes, transpose, amax)``: the codes ``[M, N]``, the transpose's
+        ``[N, M]``, contiguous, and ``amax(abs(input))``, a 0-d tensor in
+        ``input``'s dtype.
+    """
+    if (
+        input.is_cuda
+        and input.dtype is scale.dtype is torch.bfloat16
+        and input.ndim == 2
+        and input.is_contiguous()
+        and scale.numel() == 1
+    ):
+        return cast_transpose_fp8(input, scale, dtype)
+    codes = quantize_fp8(input, scale, dtype)
+    return codes, codes.t().contiguous(), input.abs().amax()
 
 
 def fp8_linear(

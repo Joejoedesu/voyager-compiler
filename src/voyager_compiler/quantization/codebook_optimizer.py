@@ -31,10 +31,13 @@ from typing import NamedTuple
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops import calculate_mx_qparam, expand
+from voyager_compiler.ops import (
+    calculate_mx_qparam,
+    expand,
+    hadamard_rotate,
+)
 from voyager_compiler.quantization.fake_quantize import (
     MXFakeQuantize,
-    _rotate,
     calculate_global_scale,
     entry_levels,
 )
@@ -1733,7 +1736,7 @@ def _as_quantized(module, tensor):
     """``tensor`` as ``module`` quantizes it: rotated first if it rotates."""
     if getattr(module, "rht_axis", None) is None:
         return tensor
-    return _rotate(tensor, module.rht_axis, module.rht_matrix)
+    return hadamard_rotate(tensor, module.rht_axis, module.rht_matrix)
 
 
 def _training_operand_names(model, operands):

@@ -63,13 +63,14 @@ from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
 from voyager_compiler.export_utils import (
     create_getattr_from_value,
     export_model,
+    merge_sibling_linears,
 )
+from voyager_compiler.ops import HADAMARD_SIZE
 from voyager_compiler.quantization.fake_quantize import (
     SEED_BOUND,
     FusedAmaxObsFakeQuantize,
     MXFakeQuantize,
     RandomHadamardTransform,
-    HADAMARD_SIZE,
     _DerivedObserverOrFakeQuantize,
 )
 from voyager_compiler.quantization.quantize_pt2e import (
@@ -372,6 +373,48 @@ def _is_transpose(node: Node) -> bool:
     return {d % ndim for d in node.args[1:3]} == {ndim - 2, ndim - 1}
 
 
+def _same_annotation(a: Node, b: Node) -> bool:
+    """Whether the quantizer annotated two GEMMs with the same specs."""
+    annotations = [n.meta.get("quantization_annotation") for n in (a, b)]
+    if None in annotations:
+        return annotations[0] is annotations[1]
+    first, second = (
+        (annotation.output_qspec, list(annotation.input_qspec_map.values()))
+        for annotation in annotations
+    )
+    return first == second
+
+
+def _merge_duplicate_views(joint: GraphModule) -> None:
+    """Make the readers of one view of a tensor read one view node.
+
+    The joint graph traces a view per GEMM that reads a tensor through it --
+    q, k and v's weight gradients each reshape the layer's input -- and
+    ``prepare`` gives a tensor's readers one fake-quant only when they read
+    the same node.  Views on the same side of the forward/backward split
+    merge.
+
+    Args:
+        joint: Joint graph, rewritten in place.
+    """
+    graph = joint.graph
+    seen = {}
+    for node in list(graph.nodes):
+        if node.target not in _VIEWS:
+            continue
+        key = (
+            node.target,
+            str(node.args),
+            str(node.kwargs),
+            node.meta.get("partitioner_tag"),
+        )
+        if key in seen:
+            node.replace_all_uses_with(seen[key])
+            graph.erase_node(node)
+        else:
+            seen[key] = node
+
+
 def _share_quantized_views(joint: GraphModule) -> None:
     """Quantize once a tensor that one GEMM reads and another views.
 
@@ -441,6 +484,7 @@ def capture_training(
         Callable[[GraphModule], Callable[[GraphModule], GraphModule]]
     ] = None,
     hidden: Sequence[str] = (),
+    merge_linears: bool = False,
 ) -> None:
     """Run ``model`` through the graphs AOTAutograd derives from its export.
 
@@ -470,6 +514,8 @@ def capture_training(
             the joint graph.  None leaves the joint graph as traced.
         hidden: Names of ``model``'s submodules to detach while exporting,
             so that state the forward never reads stays out of the graphs.
+        merge_linears: Merge the bias-free linears that read one input into
+            one (``merge_sibling_linears``).
 
     Raises:
         ValueError: ``model`` is in eval mode.
@@ -484,6 +530,8 @@ def capture_training(
         gm = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
     finally:
         model._modules.update(detached)
+    if merge_linears:
+        merge_sibling_linears(gm, model)
     transform = None if make_transform is None else make_transform(gm)
     in_spec, out_spec = gm._in_spec, gm._out_spec
     inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
@@ -594,6 +642,7 @@ def prepare_training(
     example_args: Tuple[Any, ...],
     example_kwargs: Optional[Dict[str, Any]],
     dynamic_shapes,
+    merge_linears: bool = False,
 ) -> nn.Module:
     """Quantize ``model``'s GEMMs in the forward and the backward pass.
 
@@ -608,6 +657,9 @@ def prepare_training(
         example_args: Positional inputs to export with.
         example_kwargs: Keyword inputs to export with.
         dynamic_shapes: Dynamic dimensions of the inputs.
+        merge_linears: Merge the bias-free linears that read one input with
+            the same specs into one (``merge_sibling_linears``), whose operands
+            then share their scales.
 
     Returns:
         ``model``.
@@ -622,6 +674,8 @@ def prepare_training(
 
     def make_transform(export):
         quantizer.annotate(export)
+        if merge_linears:
+            merge_sibling_linears(export, model, _same_annotation)
         for node in export.graph.nodes:
             annotation = node.meta.pop("quantization_annotation", None)
             if (
@@ -637,6 +691,7 @@ def prepare_training(
                 )
 
         def transform(joint):
+            _merge_duplicate_views(joint)
             errors = _tag_operands(joint)
             quantizer.annotate(joint)
             for node in joint.graph.nodes:
@@ -809,7 +864,8 @@ def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
 def _insert_rotation(
     graph: Graph, operand: Node, axis: int, matrix: Node
 ) -> Node:
-    """Insert the ops ``_rotate`` runs, at the graph's insertion point.
+    """Insert the ops ``hadamard_rotate`` runs, at the graph's insertion
+    point.
 
     A length known at capture is padded only if it needs to be; a symbolic
     one is padded by a size computed in the graph, zero when it is whole.
@@ -856,6 +912,279 @@ def _insert_rotation(
         rotated = call(aten.matmul.default, call(aten.t.default, matrix), runs)
     flat = call(aten.flatten.using_ints, rotated, axis, axis + 1)
     return call(aten._to_copy.default, flat, dtype=value.dtype)
+
+
+def _hadamard_of(node: Node) -> Optional[Node]:
+    """The ``get_attr`` of the Hadamard matrix ``node`` reads through the
+    casts and the transpose ``_insert_rotation`` puts in front of it, or
+    None."""
+    while node.target in (aten._to_copy.default, aten.t.default):
+        node = node.args[0]
+    if node.op == "get_attr" and node.target.startswith("rht_matrix"):
+        return node
+    return None
+
+
+def rotation_input(node: Node) -> Optional[Tuple[Node, int, Node]]:
+    """What ``node`` rotates, if it ends a rotation ``_insert_rotation``
+    inserted and that rotation pads nothing.
+
+    Returns:
+        ``(tensor, axis, matrix)``: the tensor rotated, the axis and the
+        Hadamard matrix's ``get_attr``; or None.
+    """
+    if node.target is not aten._to_copy.default:
+        return None
+    flat = node.args[0]
+    if flat.target is not aten.flatten.using_ints:
+        return None
+    product = flat.args[0]
+    if product.target is not aten.matmul.default:
+        return None
+    matrices = [_hadamard_of(arg) for arg in product.args]
+    if not any(matrices):
+        return None
+    side = 0 if matrices[0] else 1
+    runs = product.args[1 - side]
+    if runs.target is not aten.unflatten.int:
+        return None
+    upcast = runs.args[0]
+    if upcast.target is not aten._to_copy.default:
+        return None
+    source = upcast.args[0]
+    if source.target is aten.constant_pad_nd.default:
+        return None
+    return source, runs.args[1], matrices[side]
+
+
+_QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+_QUANTIZE_MX_TRANSPOSE = torch.ops.quantized_ops.quantize_mx_transpose.default
+# The views that keep a tensor's elements in order.
+_RESHAPES = (
+    aten.view.default,
+    aten._unsafe_view.default,
+    aten.reshape.default,
+    aten.alias.default,
+)
+# quantize_mx's arguments a pair shares: index and name.
+_PAIR_SHARED = (
+    (1, "qmap"),
+    (3, "block_size"),
+    (4, "quant_max"),
+    (5, "force_scale_power_of_two"),
+    (6, "scale_qmap"),
+    (7, "output_code"),
+)
+
+
+def _argument(node: Node, index: int, name: str):
+    """``node``'s argument at ``index``, given positionally or by ``name``."""
+    if index < len(node.args):
+        return node.args[index]
+    return node.kwargs.get(name)
+
+
+def _root(node: Node) -> Node:
+    """The tensor ``node`` is, through the views that keep its elements in
+    order."""
+    while node.target in _RESHAPES:
+        node = node.args[0]
+    return node
+
+
+def _layout(quantize: Node):
+    """How a single-axis ``quantize_mx`` reads its tensor, for pairing.
+
+    Returns:
+        ``("rows", tensor, None)`` for blocks along ``tensor``'s last axis;
+        ``("transpose", tensor, matrix)`` for blocks along its transpose's
+        last axis -- read through a permute of the last two axes, or in
+        place along the second-to-last, which rounds nearest -- rotated by
+        ``matrix``'s Hadamard rotation if not None; None otherwise.
+    """
+    axes = quantize.args[2]
+    if len(axes) != 1:
+        return None
+    value = quantize.args[0]
+    ndim = value.meta["val"].ndim
+    axis = axes[0] % ndim
+    matrix = None
+    rotation = rotation_input(value)
+    if rotation is not None:
+        value, rotated_axis, matrix = rotation
+        if rotated_axis % ndim != axis:
+            return None
+    if axis == ndim - 1:
+        swap = [*range(ndim - 2), ndim - 1, ndim - 2]
+        permuted = value.target is aten.permute.default
+        if permuted and list(value.args[1]) == swap:
+            return "transpose", value.args[0], matrix
+        return ("rows", value, None) if matrix is None else None
+    if axis == ndim - 2 and _argument(quantize, 8, "seed") is None:
+        return "transpose", value, matrix
+    return None
+
+
+def _same_settings(program: GraphModule, a: Node, b: Node) -> bool:
+    """Whether two quantize_mx nodes quantize alike but for their axes,
+    seeds and global scales."""
+    for index, name in _PAIR_SHARED:
+        x, y = _argument(a, index, name), _argument(b, index, name)
+        if isinstance(x, Node) and isinstance(y, Node):
+            if x.op != "get_attr" or y.op != "get_attr":
+                if x is not y:
+                    return False
+                continue
+            # Lookup tables hold NaNs, which equal nothing.
+            tx, ty = program.get_buffer(x.target), program.get_buffer(y.target)
+            if (
+                tx.shape != ty.shape
+                or not ((tx == ty) | (tx.isnan() & ty.isnan())).all()
+            ):
+                return False
+        elif x != y:
+            return False
+    return True
+
+
+def _hoist(graph: Graph, values: Sequence[Node], before: Node) -> bool:
+    """Move what ``values`` are computed from, where it comes after
+    ``before``, to just before it, in order.
+
+    Returns:
+        False, and moves nothing, if that would move a seed's draw past
+        another's: torch's generator hands them out in graph order.
+    """
+    order = {node: i for i, node in enumerate(graph.nodes)}
+    start = order[before]
+    moving, pending = set(), [v for v in values if isinstance(v, Node)]
+    while pending:
+        node = pending.pop()
+        if node in moving or order[node] < start:
+            continue
+        moving.add(node)
+        pending.extend(node.all_input_nodes)
+    draws = [n for n in moving if n.target is aten.randint.default]
+    if draws:
+        last = max(order[n] for n in draws)
+        for node in graph.nodes:
+            if (
+                start <= order[node] < last
+                and node.target is aten.randint.default
+                and node not in moving
+            ):
+                return False
+    for node in sorted(moving, key=order.__getitem__):
+        before.prepend(node)
+    return True
+
+
+def pair_quantize_transposes(program: GraphModule) -> None:
+    """Merge each pair of ``quantize_mx`` reading one tensor -- along its
+    last axis and along its transpose's, that one maybe rotated -- into one
+    ``quantize_mx_transpose``, as a backend that casts both layouts in one
+    read wants them.  The program computes what it did, bit for bit, once
+    the caller recompiles it.
+
+    Args:
+        program: A ``gradient_program``, rewritten in place.
+    """
+    graph = program.graph
+    rows, transposes = {}, {}
+    for node in graph.nodes:
+        if node.target is not _QUANTIZE_MX:
+            continue
+        layout = _layout(node)
+        if layout is None:
+            continue
+        kind, tensor, matrix = layout
+        found = rows if kind == "rows" else transposes
+        found.setdefault(_root(tensor), []).append((node, tensor, matrix))
+    for root, row_quantizes in rows.items():
+        for transpose, tensor, matrix in transposes.get(root, []):
+            match = next(
+                (
+                    (quantize, value)
+                    for quantize, value, _ in row_quantizes
+                    if _same_settings(program, quantize, transpose)
+                    and value.meta["val"].numel() == tensor.meta["val"].numel()
+                    and value.meta["val"].shape[-1]
+                    == tensor.meta["val"].shape[-1]
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            quantize, value = match
+            if _merge_pair(program, quantize, value, transpose, tensor, matrix):
+                row_quantizes.remove((quantize, value, None))
+    graph.eliminate_dead_code()
+
+
+def _merge_pair(
+    program: GraphModule,
+    rows: Node,
+    value: Node,
+    transpose: Node,
+    tensor: Node,
+    matrix: Optional[Node],
+) -> bool:
+    """Replace ``rows`` (``quantize_mx`` of ``value`` along its last axis)
+    and ``transpose`` (of ``tensor``'s transpose) by one
+    ``quantize_mx_transpose`` of ``tensor``.
+
+    Returns:
+        Whether they were merged; not when that would reorder seed draws.
+    """
+    graph = program.graph
+    order = {node: i for i, node in enumerate(graph.nodes)}
+    first = min(rows, transpose, key=order.__getitem__)
+    arguments = (
+        tensor,
+        *(_argument(rows, index, name) for index, name in _PAIR_SHARED),
+        _argument(rows, 8, "seed"),
+        _argument(rows, 9, "global_scale"),
+        _argument(transpose, 8, "seed"),
+        _argument(transpose, 9, "global_scale"),
+        matrix,
+    )
+    if not _hoist(graph, arguments, first):
+        return False
+    with graph.inserting_before(first):
+        pair = graph.call_function(_QUANTIZE_MX_TRANSPOSE, arguments)
+        pair.meta["dtype"] = rows.meta.get("dtype")
+        outputs = [
+            graph.call_function(operator.getitem, (pair, i)) for i in range(4)
+        ]
+    # The row-wise outputs in the shapes ``rows`` gave them: the codes in
+    # ``value``'s, the scales one per block of its last axis.
+    shape = list(value.meta["val"].shape)
+    block_size = _argument(rows, 3, "block_size")
+    with graph.inserting_after(outputs[3]):
+        row_outputs = [
+            graph.call_function(
+                aten.view.default,
+                (outputs[0], [*shape[:-1], shape[-1] // block_size]),
+            ),
+            graph.call_function(aten.view.default, (outputs[1], shape)),
+        ]
+    transpose_outputs = outputs[2:]
+    ndim = transpose.args[0].meta["val"].ndim
+    if transpose.args[2][0] % ndim == ndim - 2:
+        # Blocked in place along the second-to-last axis: the transpose's
+        # outputs swapped back.
+        swap = [*range(ndim - 2), ndim - 1, ndim - 2]
+        with graph.inserting_after(row_outputs[-1]):
+            transpose_outputs = [
+                graph.call_function(aten.permute.default, (output, swap))
+                for output in transpose_outputs
+            ]
+    for old, new in ((transpose, transpose_outputs), (rows, row_outputs)):
+        for user in list(old.users):
+            user.replace_all_uses_with(new[user.args[1]])
+            graph.erase_node(user)
+        graph.erase_node(old)
+    return True
 
 
 def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
@@ -1425,12 +1754,14 @@ def prepare_from_args(
             example_args,
             example_kwargs,
             dynamic_shapes,
+            args.merge_linears,
         )
     exported = export_model(
         model.train(),
         example_args,
         example_kwargs,
         dynamic_shapes=dynamic_shapes,
+        merge_linears=args.merge_linears,
     )
     model = prepare_qat_pt2e(exported, quantizer)
 
