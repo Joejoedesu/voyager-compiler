@@ -19,7 +19,9 @@ Hadamard transform where the recipe has one; its GEMM is a ``linear_mx`` or
   or wgrad contracts along its rows is a transposed copy of its FP8 codes.  A
   matrix the program takes as input and a dgrad reads, a weight, is cast to
   both layouts by one Triton kernel (``quantize_fp8_transpose``), which also
-  gives its delayed-scaling update the matrix's amax;
+  gives its delayed-scaling update the matrix's amax.  An activation's codes,
+  and the transposed copy its wgrads read, are each stored once for all the
+  GEMMs reading them, and its delayed-scaling amax is taken row by row;
 - each NVFP4 ``quantize_mx`` becomes one cast to packed codes
   (``quantize_nvfp4``, with its stochastic rounding's seed), and each GEMM one
   ``nvfp4_linear``.  A weight in 16x16 blocks is cast once
@@ -38,6 +40,10 @@ import operator
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+
+# Registers torch.ops.prims.inductor_force_stride_order.
+import torch._inductor.inductor_prims  # noqa: F401
+from torch._prims_common import make_contiguous_strides_for
 from torch.fx import Graph, GraphModule, Node
 
 from voyager_compiler.codegen.node_info import get_arg_value
@@ -69,6 +75,7 @@ from .nvfp4 import (
     quantize_nvfp4_pair,
     quantize_nvfp4_square,
 )
+from .rmsnorm import fuse_rmsnorm_backward
 
 __all__ = ["lower_training", "return_gradients"]
 
@@ -80,6 +87,11 @@ QUANTIZE_MX_TRANSPOSE = torch.ops.quantized_ops.quantize_mx_transpose.default
 # transpose's follow them.
 PAIR_ROWS = (0, 1)
 CONVERT_ELEMENT_TYPE = torch.ops.prims.convert_element_type.default
+# Stores a tensor in one buffer of the given strides; Inductor gives each
+# GEMM reading a tensor it has not stored a copy of its own.
+FORCE_STRIDES = torch.ops.prims.inductor_force_stride_order.default
+# The views that only reshape a tensor.
+RESHAPES = (aten.view.default, aten._unsafe_view.default, aten.reshape.default)
 
 # A cast's packed codes and block scales, by the axis a GEMM reads them
 # along.
@@ -122,7 +134,7 @@ def _insert_fp8_gemm(
         gemm: A linear, or a matmul whose second operand is 2-d, of two FP8
             operands; its only user scales it back.
         transposes: Each matrix's FP8 codes -> its transpose's, for the
-            matrices cast both ways.
+            weights cast both ways and the activations wgrads read.
 
     Returns:
         The GEMM.
@@ -334,6 +346,81 @@ def _insert_nvfp4_gemm(
         return graph.call_function(NVFP4_LINEAR, (*operands, alpha, one, bias))
 
 
+def _whole_amaxes(tensor: Node) -> List[Node]:
+    """The ``amax(abs(tensor))`` reductions over the whole of ``tensor``, as
+    a delayed-scaling update takes them."""
+    return [
+        reduction
+        for magnitude in tensor.users
+        if magnitude.target is aten.abs.default
+        for reduction in magnitude.users
+        if reduction.target is aten.amax.default and reduction.args[1:] == ([],)
+    ]
+
+
+def _insert_activation_cast(
+    graph: Graph,
+    quantize: Node,
+    dtype: torch.dtype,
+    transposes: Dict[Node, Node],
+) -> Node:
+    """Cast an activation to FP8 once for every GEMM reading it.
+
+    Inserts, before ``quantize``, a ``quantize_fp8`` whose codes are stored
+    in one contiguous buffer (``FORCE_STRIDES``).  The codes as one
+    ``[rows, K]`` matrix -- themselves, or one view standing for every
+    reshape of ``quantize`` to it -- get one stored transposed copy for the
+    wgrads, added to ``transposes``; dead-code elimination drops it if no
+    wgrad reads it.  Each delayed-scaling ``amax(abs(input))`` over the
+    whole input becomes the amax of its rows' amaxes, the same value, which
+    Inductor computes in the kernel making the input.
+
+    Args:
+        graph: The program's graph.
+        quantize: The FP8 ``quantize`` of an activation.
+        dtype: Its torch FP8 dtype.
+        transposes: Each matrix's FP8 codes -> its transpose's; updated in
+            place.
+
+    Returns:
+        The codes.
+    """
+    input = quantize.args[0]
+    shape = input.meta["val"].shape
+    rows = shape[:-1].numel()
+    with graph.inserting_before(quantize):
+        cast = graph.call_function(quantize_fp8, (*quantize.args[:2], dtype))
+        codes = graph.call_function(
+            FORCE_STRIDES, (cast, make_contiguous_strides_for(shape))
+        )
+    matrix = codes
+    if len(shape) > 2:
+        with graph.inserting_before(quantize):
+            matrix = graph.call_function(
+                aten.reshape.default, (codes, [rows, shape[-1]])
+            )
+        views = [
+            view
+            for view in quantize.users
+            if view.target in RESHAPES
+            and view.meta["val"].shape == (rows, shape[-1])
+        ]
+        for view in views:
+            view.replace_all_uses_with(matrix)
+    with graph.inserting_before(quantize):
+        transposes[matrix] = graph.call_function(
+            FORCE_STRIDES,
+            (graph.call_function(aten.t.default, (matrix,)), [rows, 1]),
+        )
+    for reduction in _whole_amaxes(input):
+        with graph.inserting_before(reduction):
+            row_amaxes = graph.call_function(
+                aten.amax.default, (reduction.args[0], [-1])
+            )
+        reduction.args = (row_amaxes, [])
+    return codes
+
+
 def _insert_input_matrix_cast(
     graph: Graph, quantize: Node, dtype: torch.dtype
 ) -> Tuple[Node, Node]:
@@ -361,14 +448,7 @@ def _insert_input_matrix_cast(
         codes, transpose, amax = (
             graph.call_function(operator.getitem, (cast, i)) for i in range(3)
         )
-    reductions = [
-        reduction
-        for magnitude in matrix.users
-        if magnitude.target is aten.abs.default
-        for reduction in magnitude.users
-        if reduction.target is aten.amax.default and reduction.args[1:] == ([],)
-    ]
-    for reduction in reductions:
+    for reduction in _whole_amaxes(matrix):
         reduction.replace_all_uses_with(amax)
         moved, last = {amax}, amax
         node = reduction.next
@@ -420,10 +500,7 @@ def _lower_fp8_gemms(graph: Graph) -> List[str]:
             cast, transpose = _insert_input_matrix_cast(graph, quantize, dtype)
             transposes[cast] = transpose
         else:
-            with graph.inserting_before(quantize):
-                cast = graph.call_function(
-                    quantize_fp8, (*quantize.args[:2], dtype)
-                )
+            cast = _insert_activation_cast(graph, quantize, dtype, transposes)
         quantize.replace_all_uses_with(cast)
         graph.erase_node(quantize)
     for gemm in gemms:
@@ -464,7 +541,8 @@ def lower_training(program: GraphModule) -> Dict[str, str]:
     place.
 
     Every quantized GEMM is a linear's: a forward linear, or a backward
-    matmul whose second operand is 2-d.  The ops the old casts leave unused,
+    matmul whose second operand is 2-d.  Each RMSNorm's backward becomes one
+    kernel (``fuse_rmsnorm_backward``).  The ops the old casts leave unused,
     such as the global scales' amaxes, are dropped.
 
     Args:
@@ -483,6 +561,7 @@ def lower_training(program: GraphModule) -> Dict[str, str]:
     lowered = dict.fromkeys(_lower_fp8_gemms(graph), "fp8")
     nvfp4_gemms = _lower_nvfp4_gemms(program)
     lowered.update(dict.fromkeys(nvfp4_gemms, "nvfp4"))
+    fuse_rmsnorm_backward(graph)
     graph.eliminate_dead_code()
     graph.lint()
     program.recompile()

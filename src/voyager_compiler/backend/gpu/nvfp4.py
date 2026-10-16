@@ -28,7 +28,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch.fx import GraphModule, Node
-from torch.library import Library, impl, triton_op, wrap_triton
+from torch.library import Library, impl
 from torch.nn.functional import ScalingType, SwizzleType
 from torchao.prototype.mx_formats.kernels import (
     f4_unpacked_to_f32,
@@ -75,6 +75,10 @@ CAST_TILE = 64
 CAST_RUNS = 4
 # The runs of 16 along each axis one program of the CUDA pair cast takes.
 PAIR_CAST_RUNS = 4
+_LIBRARY = Library("voyager_gpu", "DEF")
+# The casts' ops read their input's strides at run time, so Inductor may
+# pass any layout: it writes a producer once and hands each cast a view.
+CAST_TAGS = (torch.Tag.flexible_layout,)
 # FP4_MAX and E4M3_MAX as the cast's kernels read them.
 _FP4_MAX = tl.constexpr(FP4_MAX)
 _E4M3_MAX = tl.constexpr(E4M3_MAX)
@@ -266,6 +270,7 @@ def _cast_tile(
     seed,
     codes,
     scales,
+    global_scale,
     flat_m,
     flat_k,
     scale_col_tiles,
@@ -279,13 +284,16 @@ def _cast_tile(
     with ``quantize_nvfp4``'s bfloat16 arithmetic op for op: each run's
     scale, its elements rounded to nearest or, if ``STOCHASTIC``, by
     ``_random_bytes``' Philox bits, packed two to a byte, and the scales
-    stored in cuBLAS's swizzled layout."""
+    stored in cuBLAS's swizzled layout.  The grid's first program stores
+    the global scale ``t`` to ``global_scale``."""
     mask = m[:, None] < rows
     run = tl.arange(0, 16)
     # Eager torch divides by a Python number as a product with its
     # reciprocal, and by a tensor exactly.
     t = (tl.load(amax) * (1.0 / (_FP4_MAX * _E4M3_MAX))).to(tl.bfloat16)
     t = tl.maximum(t.to(tl.float32), _FLOAT32_TINY)
+    if (tl.program_id(0) == 0) & (tl.program_id(1) == 0):
+        tl.store(global_scale, t.to(tl.bfloat16))
     s = (run_amax * (1.0 / _FP4_MAX)).to(tl.bfloat16)
     s = tl.math.div_rn(s.to(tl.float32), t).to(tl.bfloat16).to(tl.float32)
     s = tl.minimum(s, _E4M3_MAX)
@@ -372,6 +380,7 @@ def _cast_kernel(
     seed,
     codes,
     scales,
+    global_scale,
     rows,
     cols,
     stride_m,
@@ -402,6 +411,7 @@ def _cast_kernel(
         seed,
         codes,
         scales,
+        global_scale,
         flat_m,
         flat_k,
         scale_col_tiles,
@@ -470,8 +480,10 @@ def _pair_cast_kernel(
     transpose_seed,
     codes,
     scales,
+    global_scale,
     transpose_codes,
     transpose_scales,
+    transpose_global_scale,
     rows,
     cols,
     ROTATE: tl.constexpr,
@@ -509,6 +521,7 @@ def _pair_cast_kernel(
             seed=seed,
             codes=codes,
             scales=scales,
+            global_scale=global_scale,
             flat_m=cols,
             flat_k=1,
             scale_col_tiles=tl.cdiv(cols // 16, 4),
@@ -543,6 +556,7 @@ def _pair_cast_kernel(
             seed=transpose_seed,
             codes=transpose_codes,
             scales=transpose_scales,
+            global_scale=transpose_global_scale,
             flat_m=rows,
             flat_k=1,
             scale_col_tiles=tl.cdiv(rows // 16, 4),
@@ -561,6 +575,7 @@ def _square_cast_kernel(
     scales,
     transpose_codes,
     transpose_scales,
+    global_scale,
     rows,
     cols,
     RUNS_M: tl.constexpr,
@@ -568,7 +583,8 @@ def _square_cast_kernel(
 ):
     """The square cast's second pass: ``_cast_tile`` of a
     ``[16 RUNS_M, 16 RUNS_K]`` tile's rows and of its transpose's, each run
-    scaled by the amax of the 16x16 block it lies in."""
+    scaled by the amax of the 16x16 block it lies in.  Both layouts store
+    the same global scale to ``global_scale``."""
     tile, m, k = _pair_tile(x, cols, RUNS_M, RUNS_K)
     tile = tile.to(tl.float32)
     blocks = tl.reshape(tl.abs(tile), (RUNS_M, 16, RUNS_K, 16))
@@ -585,6 +601,7 @@ def _square_cast_kernel(
         seed=amax,
         codes=codes,
         scales=scales,
+        global_scale=global_scale,
         flat_m=cols,
         flat_k=1,
         scale_col_tiles=tl.cdiv(cols // 16, 4),
@@ -607,6 +624,7 @@ def _square_cast_kernel(
         seed=amax,
         codes=transpose_codes,
         scales=transpose_scales,
+        global_scale=global_scale,
         flat_m=rows,
         flat_k=1,
         scale_col_tiles=tl.cdiv(rows // 16, 4),
@@ -628,22 +646,18 @@ def _runs_dividing(length: int, most: int) -> int:
 
 def _cast_outputs(
     rows: int, cols: int, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """A cast's packed codes, ``[rows, cols / 2]``, and its block scales,
-    zeroed and padded to ``pack_nvfp4``'s swizzled tiles."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A cast's packed codes, ``[rows, cols / 2]``, its block scales,
+    zeroed and padded to ``pack_nvfp4``'s swizzled tiles, and its 0-d
+    bfloat16 global scale."""
     codes = torch.empty((rows, cols // 2), dtype=torch.uint8, device=device)
     scales = torch.zeros(
         triton.cdiv(rows, 128) * 128 * triton.cdiv(cols // BLOCK_SIZE, 4) * 4,
         dtype=torch.uint8,
         device=device,
     )
-    return codes, scales
-
-
-def _global_scale(amax: torch.Tensor) -> torch.Tensor:
-    """The global scale ``t`` of a tensor whose largest magnitude is
-    ``amax``, as ``calculate_global_scale`` takes it from the tensor."""
-    return calculate_global_scale(amax.to(torch.bfloat16), FP4_MAX, E4M3_MAX)
+    global_scale = torch.empty((), dtype=torch.bfloat16, device=device)
+    return codes, scales, global_scale
 
 
 def _paired_castable(x: torch.Tensor) -> bool:
@@ -658,7 +672,14 @@ def _paired_castable(x: torch.Tensor) -> bool:
     )
 
 
-@triton_op("voyager_gpu::cast_nvfp4", mutates_args=())
+_LIBRARY.define(
+    "cast_nvfp4(Tensor x, Tensor? hadamard, Tensor? seed, int axis) "
+    "-> (Tensor, Tensor, Tensor)",
+    tags=CAST_TAGS,
+)
+
+
+@impl(_LIBRARY, "cast_nvfp4", "CUDA")
 def cast_nvfp4(
     x: torch.Tensor,
     hadamard: Optional[torch.Tensor],
@@ -690,17 +711,18 @@ def cast_nvfp4(
     amax = torch.zeros((), dtype=torch.float32, device=x.device)
     rotate = hadamard is not None
     matrix = hadamard if rotate else x
-    wrap_triton(_amax_kernel)[grid](
+    _amax_kernel[grid](
         x, matrix, amax, rows, stride_m, stride_k, rotate, CAST_TILE, runs
     )
-    codes, scales = _cast_outputs(rows, cols, x.device)
-    wrap_triton(_cast_kernel)[grid](
+    codes, scales, global_scale = _cast_outputs(rows, cols, x.device)
+    _cast_kernel[grid](
         x,
         matrix,
         amax,
         amax if seed is None else seed,
         codes,
         scales,
+        global_scale,
         rows,
         cols,
         stride_m,
@@ -714,7 +736,13 @@ def cast_nvfp4(
         CAST_TILE,
         runs,
     )
-    return codes, scales, _global_scale(amax)
+    return codes, scales, global_scale
+
+
+@torch.library.register_fake("voyager_gpu::cast_nvfp4")
+def _(x, hadamard, seed, axis):
+    rows, cols = x.shape if axis == 1 else x.shape[::-1]
+    return _cast_outputs(rows, cols, x.device)
 
 
 def _pair_cast_layout(
@@ -729,8 +757,8 @@ def _pair_cast_layout(
     Returns:
         ``(runs, grid, outputs)``: the runs of 16 along M and along K one
         program takes, at most ``PAIR_CAST_RUNS`` and dividing each length;
-        the grid of programs over M and K; and the codes and the zeroed,
-        swizzle-padded scales of the rows, then of the transpose's rows.
+        the grid of programs over M and K; and ``_cast_outputs`` for the
+        rows, then for the transpose's rows.
     """
     rows, cols = x.shape
     runs = [_runs_dividing(length, PAIR_CAST_RUNS) for length in (rows, cols)]
@@ -742,7 +770,15 @@ def _pair_cast_layout(
     return runs, grid, outputs
 
 
-@triton_op("voyager_gpu::cast_nvfp4_pair", mutates_args=())
+_LIBRARY.define(
+    "cast_nvfp4_pair(Tensor x, Tensor? hadamard, Tensor? seed, "
+    "Tensor? transpose_seed) -> (Tensor, Tensor, Tensor, Tensor, Tensor, "
+    "Tensor)",
+    tags=CAST_TAGS,
+)
+
+
+@impl(_LIBRARY, "cast_nvfp4_pair", "CUDA")
 def cast_nvfp4_pair(
     x: torch.Tensor,
     hadamard: Optional[torch.Tensor],
@@ -756,9 +792,9 @@ def cast_nvfp4_pair(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """``cast_nvfp4`` of a contiguous CUDA bfloat16 matrix along its columns
-    and of its transpose along its columns, as two Triton kernels: both
-    amaxes from one read, then both casts.
+    """``cast_nvfp4`` of a CUDA bfloat16 matrix along its columns and of
+    its transpose along its columns, as two Triton kernels over the matrix
+    made contiguous: both amaxes from one read, then both casts.
 
     Args:
         x: The matrix.
@@ -769,15 +805,14 @@ def cast_nvfp4_pair(
     Returns:
         ``quantize_nvfp4_pair``'s outputs.
     """
+    x = x.contiguous()
     rows, cols = x.shape
     runs, grid, outputs = _pair_cast_layout(x)
     amax = torch.zeros(2, dtype=torch.float32, device=x.device)
     rotate = hadamard is not None
     matrix = hadamard if rotate else x
-    wrap_triton(_pair_amax_kernel)[grid](
-        x, matrix, amax, amax[1:], cols, rotate, *runs
-    )
-    wrap_triton(_pair_cast_kernel)[(*grid, 2)](
+    _pair_amax_kernel[grid](x, matrix, amax, amax[1:], cols, rotate, *runs)
+    _pair_cast_kernel[(*grid, 2)](
         x,
         matrix,
         amax,
@@ -792,15 +827,34 @@ def cast_nvfp4_pair(
         transpose_seed is not None,
         *runs,
     )
-    return (
-        *outputs[:2],
-        _global_scale(amax[0]),
-        *outputs[2:],
-        _global_scale(amax[1]),
-    )
+    return tuple(outputs)
 
 
-@triton_op("voyager_gpu::cast_nvfp4_square", mutates_args=())
+@torch.library.register_fake("voyager_gpu::cast_nvfp4_pair")
+def _(x, hadamard, seed, transpose_seed):
+    _, _, outputs = _pair_cast_layout(x)
+    return tuple(outputs)
+
+
+def _square_cast_layout(
+    x: torch.Tensor,
+) -> Tuple[List[int], Tuple[int, int], List[torch.Tensor]]:
+    """``_pair_cast_layout`` for ``cast_nvfp4_square``, its outputs in
+    ``quantize_nvfp4_square``'s order: one global scale, last, for both
+    layouts."""
+    runs, grid, outputs = _pair_cast_layout(x)
+    codes, scales, global_scale, transpose_codes, transpose_scales, _ = outputs
+    outputs = [codes, scales, transpose_codes, transpose_scales, global_scale]
+    return runs, grid, outputs
+
+
+_LIBRARY.define(
+    "cast_nvfp4_square(Tensor x) -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    tags=CAST_TAGS,
+)
+
+
+@impl(_LIBRARY, "cast_nvfp4_square", "CUDA")
 def cast_nvfp4_square(x: torch.Tensor) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -808,21 +862,29 @@ def cast_nvfp4_square(x: torch.Tensor) -> Tuple[
     torch.Tensor,
     torch.Tensor,
 ]:
-    """``quantize_nvfp4_square`` of a contiguous CUDA bfloat16 matrix as two
-    Triton kernels: the amax, then both layouts' casts from one read.
+    """``quantize_nvfp4_square`` of a CUDA bfloat16 matrix as two Triton
+    kernels over the matrix made contiguous: the amax, then both layouts'
+    casts from one read.
 
     Returns:
         ``quantize_nvfp4_square``'s outputs.
     """
+    x = x.contiguous()
     rows, cols = x.shape
-    runs, grid, outputs = _pair_cast_layout(x)
+    runs, grid, outputs = _square_cast_layout(x)
     amax = torch.zeros((), dtype=torch.float32, device=x.device)
     # ``x`` stands in for the Hadamard matrix, unread without ROTATE.
-    wrap_triton(_amax_kernel)[grid](
+    _amax_kernel[grid](
         x, x, amax, rows, cols, 1, False, runs[0] * BLOCK_SIZE, runs[1]
     )
-    wrap_triton(_square_cast_kernel)[grid](x, amax, *outputs, rows, cols, *runs)
-    return (*outputs, _global_scale(amax))
+    _square_cast_kernel[grid](x, amax, *outputs, rows, cols, *runs)
+    return tuple(outputs)
+
+
+@torch.library.register_fake("voyager_gpu::cast_nvfp4_square")
+def _(x):
+    _, _, outputs = _square_cast_layout(x)
+    return tuple(outputs)
 
 
 def quantize_nvfp4(
@@ -863,7 +925,7 @@ def quantize_nvfp4(
         and input.shape[axis] % BLOCK_SIZE == 0
         and (axis == ndim - 1 or (ndim == 2 and axis == 0))
     ):
-        codes, scales, global_scale = cast_nvfp4(
+        codes, scales, global_scale = torch.ops.voyager_gpu.cast_nvfp4(
             input.reshape(-1, input.shape[-1]),
             hadamard,
             seed,
@@ -909,7 +971,9 @@ def quantize_nvfp4_pair(
         ``quantize_nvfp4``'s outputs for the rows, then for the transpose.
     """
     if _paired_castable(input):
-        return cast_nvfp4_pair(input, hadamard, seed, transpose_seed)
+        return torch.ops.voyager_gpu.cast_nvfp4_pair(
+            input, hadamard, seed, transpose_seed
+        )
     return (
         *quantize_nvfp4(input, -1, seed),
         *quantize_nvfp4(input.mT, -1, transpose_seed, hadamard),
@@ -938,7 +1002,7 @@ def quantize_nvfp4_square(
         a 0-d tensor.
     """
     if _paired_castable(weight):
-        return cast_nvfp4_square(weight)
+        return torch.ops.voyager_gpu.cast_nvfp4_square(weight)
     global_scale = calculate_global_scale(weight, FP4_MAX, E4M3_MAX)
     blocks = weight.unflatten(-1, (-1, BLOCK_SIZE)).unflatten(
         -3, (-1, BLOCK_SIZE)
@@ -1026,7 +1090,6 @@ def unpack_nvfp4(
     return values, block_scales.to(torch.bfloat16)
 
 
-_LIBRARY = Library("voyager_gpu", "DEF")
 _LIBRARY.define(
     "nvfp4_linear(Tensor input, Tensor input_scale, Tensor weight, "
     "Tensor weight_scale, Tensor alpha, Tensor one, Tensor? bias) -> Tensor"
