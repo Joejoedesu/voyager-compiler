@@ -11,6 +11,14 @@ translation with ``backend/trainium/runtime/check.py``).
         --model meta-llama/Llama-3.1-8B-Instruct --phase prefill \\
         --context 1024 --layers 1 --out <dir> [--target trn2] [--dtype bf16]
 
+The attention is one flash-attention kernel (``--attention sdpa``, the
+graph's ``scaled_dot_product_attention``) unless ``--attention eager``
+decomposes it into matmul / softmax / matmul.
+
+The layouts are Trainium's ``LAYOUT`` unless ``--tensor_layout``,
+``--gemm_layout`` or ``--gemv_layout`` says otherwise: ``--gemm_layout
+xc,ck`` keeps the activations between GEMMs row-major.
+
 ``--dtype fp8`` quantizes the linear layers' activations and weights, per
 tensor, to the E4M3 Trn2 multiplies natively: the IEEE format
 (``fp8_e4m3_ieee``), whose largest value is 240.  ``--dtype mxfp8`` (Trn3)
@@ -32,7 +40,7 @@ from torch.utils._pytree import tree_flatten
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
 )
-from test_codegen import VECTOR_PIPELINE  # noqa: E402
+from test_codegen import FUSION_PATTERNS  # noqa: E402
 from utils.models import llama  # noqa: E402
 
 from voyager_compiler import (  # noqa: E402
@@ -52,6 +60,7 @@ from voyager_compiler.backend.trainium import (  # noqa: E402
 )
 from voyager_compiler.cli_args import (  # noqa: E402
     add_compile_args,
+    add_layout_args,
     add_quantization_args,
 )
 
@@ -69,8 +78,8 @@ ACCUMULATION = "fp32"
 
 def voyager_args(args, config):
     """The ``test_codegen.py`` arguments the export helpers read: its
-    defaults, the BF16 LLM flags ``run_ci.py`` compiles with, and the
-    design point."""
+    defaults, the BF16 LLM flags ``run_ci.py`` compiles with, the layouts
+    and the design point."""
     parser = argparse.ArgumentParser()
     add_quantization_args(parser)
     add_compile_args(parser)
@@ -79,7 +88,7 @@ def voyager_args(args, config):
     voyager.model_name_or_path = args.model
     voyager.context_length = args.context
     voyager.num_hidden_layers = args.layers
-    voyager.attn_implementation = "eager"
+    voyager.attn_implementation = args.attention
     voyager.bf16 = True
     voyager.remove_fp32_casts = True
     voyager.qconfig = None
@@ -89,6 +98,9 @@ def voyager_args(args, config):
     voyager.debug = False
     voyager.model_output_dir = args.out
     voyager.dump_tensors = False
+    voyager.tensor_layout = args.tensor_layout
+    voyager.gemm_layout = args.gemm_layout
+    voyager.gemv_layout = args.gemv_layout
     # The decode cache is sized in whole vector-lane groups of this core.
     voyager.pe_array_size = config.pe_array_size
     voyager.vector_unit_width = config.vector_unit_width
@@ -103,12 +115,17 @@ def main():
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--target", choices=TARGETS, default="trn2")
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
+    parser.add_argument(
+        "--attention", choices=("sdpa", "eager"), default="sdpa"
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--no-reference",
         action="store_true",
         help="keep only the inputs and parameters, not every step's result",
     )
+    add_layout_args(parser)
+    parser.set_defaults(**LAYOUT)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -130,13 +147,15 @@ def main():
             model,
             tokenizer,
             quantizer,
-            VECTOR_PIPELINE,
+            FUSION_PATTERNS,
             voyager,
             reference=False,
         )
     )
-    transform_args.update(LAYOUT, config=config)
+    transform_args["config"] = config
     compile_args["config"] = config
+    # The flash attention's causal table is the additive fill.
+    compile_args["bool_mask"] = False
     transform(gm, example_args, example_kwargs, **transform_args)
     nodes = kernel_nodes(gm)
     model = compile(gm, example_args, example_kwargs, **compile_args)
@@ -150,12 +169,8 @@ def main():
     total = sum(predicted)
     with open(os.path.join(args.out, "predicted.json"), "w") as f:
         json.dump({"total_s": total, "kernels_s": predicted}, f, indent=1)
-    manifest = translate(model, args.out, values)
+    manifest = translate(model, args.out, config, values)
     kernels = [s for s in manifest["steps"] if s["kernel"] is not None]
-    if len(predicted) != len(kernels):
-        raise RuntimeError(
-            f"{len(predicted)} compute nodes made {len(kernels)} kernels"
-        )
     flat_args, _ = tree_flatten((example_args, example_kwargs))
     path = os.path.join(args.out, "tensors.pt")
     record(gm, flat_args, manifest, path, steps=not args.no_reference)

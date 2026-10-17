@@ -25,30 +25,18 @@ from torch.fx import GraphModule, Node
 from torch.fx.graph import _illegal_names
 
 from voyager_compiler.codegen.node_info import (
-    DYNAMIC_QUANTIZE_OPS,
-    NORM_OPS,
-    SOFTMAX_OPS,
     bound_operands,
-    csr_quantize_node,
-    gemm_produces_csr,
     get_anchor_node,
     is_aliasing_op,
     is_compute_op,
-    is_conv2d,
-    is_elementwise_op,
     is_gemm_op,
-    is_axis_reduction,
-    is_full_reduction,
     is_nop,
-    is_pooling,
     quant_param_arg_nodes,
 )
 from voyager_compiler.codegen.subgraph import replace_node_with_graph_module
-from voyager_compiler.codegen.transform.bufferize.attention import (
-    build_attention,
-)
-from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
-    build_attention_fa3,
+from voyager_compiler.codegen.transform.bufferize.builders import (
+    SHARED_BUILDERS,
+    BuilderRule,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
@@ -57,26 +45,19 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _single_pass_kernel,
-    build_conv2d,
-    build_gemm,
     build_pipelined_buffers,
-    build_pointwise,
-    build_pool,
-)
-from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
-    build_sparse_gemm,
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     BASE_TABLE_TAG,
     GEOMETRY_META,
     PRODUCER_META,
-    build_quantize_mx_outlier,
     merge_base_tables,
 )
 from voyager_compiler.codegen.transform.bufferize.view_lowering import (
     lower_views,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    BuildContext,
     _collect_codebook_nodes,
     _InputSpec,
     _OutputSpec,
@@ -90,6 +71,7 @@ from voyager_compiler.codegen.transform.tiling.csr_slice_planning import (
 from voyager_compiler.codegen.transform.tiling.matrix_search import (
     prefetch_tilings,
 )
+from voyager_compiler.hardware_config import DEFAULT_ASYNC_PIPELINE
 from voyager_compiler.shape_prop import set_node_value
 
 logger = logging.getLogger(__name__)
@@ -109,8 +91,6 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
 _WITH_SCRATCH = torch.ops.higher_order.with_scratch
-_SDPA = torch.ops.aten.scaled_dot_product_attention.default
-_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
 
 
 def _produces_tensor(node: Node) -> bool:
@@ -132,13 +112,23 @@ _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
 _VOYAGER_FILL = torch.ops.voyager.fill.default
 _SUBVIEW = torch.ops.voyager.subview.default
 
+# The space a ``voyager.alloc`` at each on-chip level lives in; an alloc at
+# any other level is in DRAM.
+_ALLOC_SPACE = {
+    int(MemoryLevel.SRAM): "Scratchpad",
+    int(MemoryLevel.LOCAL): "Local",
+}
+# The spaces the datapath reads its tiles from and stores its results to.
+_ON_CHIP = ("Scratchpad", "Local")
+
 
 def annotate_tensor_spaces(gm: GraphModule) -> None:
     """Alloc-only memory model: mark the *buffers* and validate that every tile
     computation lands in one.
 
       * **Buffers** carry ``node.meta['space']``: a ``voyager.alloc`` is
-        Scratchpad (``MemoryLevel.SRAM``) or DRAM (its level arg), a
+        Scratchpad (``MemoryLevel.SRAM``), Local (``MemoryLevel.LOCAL``) or
+        DRAM (any other level arg), a
         ``voyager.zeros`` accumulator / semaphore buffer is Scratchpad, and a
         top-level input placeholder or weight ``get_attr`` is DRAM.  A *view* of
         a buffer — a slot-slot ``select``, a reshape, a loop result — takes the
@@ -147,9 +137,9 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
         unmarked.  Everything else (DMA, semaphore waits, index arithmetic)
         names no memory and so carries no space.
       * **Compute** is *not* given a space; it is *validated*.  The array only
-        reaches Scratchpad, so every tile a compute op reads must be there
-        (bar codebooks and scalars, which it reads whole), and its result must
-        be written back there via ``insert``.
+        reaches on-chip memory (Scratchpad or Local), so every tile a compute
+        op reads must be there (bar codebooks and scalars, which it reads
+        whole), and its result must be written back there via ``insert``.
 
     Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
     when an op's result is the body's output, the check threads to the users of
@@ -273,16 +263,17 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
 
 
 def _validate_compute(node: Node, codebooks: set, ctx: tuple) -> None:
-    """The array only reaches Scratchpad, so every tile a compute op reads must
-    be there, and its result must be stored back there (via ``insert``)."""
+    """The array only reaches on-chip memory, so every tile a compute op reads
+    must be there, and its result must be stored back there (via
+    ``insert``)."""
     for inp in node.all_input_nodes:
         if not _produces_tensor(inp) or _passed_whole(inp, codebooks):
             continue
-        if _space(inp) != "Scratchpad":
+        if _space(inp) not in _ON_CHIP:
             raise Exception(
                 f"compute on {_space(inp)}: {node.op} '{node.name}' "
-                f"({node.target}) reads '{inp.name}', which is not a "
-                f"Scratchpad tile"
+                f"({node.target}) reads '{inp.name}', which is not an "
+                f"on-chip tile"
             )
     if not _stored(node, ctx):
         raise Exception(
@@ -328,9 +319,7 @@ def _annotate_and_validate(
             level = (
                 node.args[2] if len(node.args) > 2 else int(MemoryLevel.DRAM)
             )
-            node.meta["space"] = (
-                "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
-            )
+            node.meta["space"] = _ALLOC_SPACE.get(level, "DRAM")
         elif node.target in (_VOYAGER_ZEROS, _VOYAGER_FILL):
             # A semaphore buffer (``zeros`` = 0, ``fill`` = a seed credit), not a
             # tensor buffer: no space (and so not the DRAM default below either).
@@ -351,15 +340,15 @@ def _annotate_and_validate(
             _validate_compute(node, codebooks, ctx)
         elif node.target is _VOYAGER_INSERT:
             src, dst = node.args[0], node.args[1]
-            # The Scratchpad rule is about datapath tiles.  A cloned buffer
+            # The on-chip rule is about datapath tiles.  A cloned buffer
             # stored off-chip (``insert(src.clone(), <DRAM window>)`` — the
             # view-lowering pass's parameter copy) is a host move the control
             # processor runs, not a tile leaving the array.
             host_move = isinstance(src, Node) and src.target is _ATEN_CLONE
-            if _space(dst) != "Scratchpad" and not host_move:
+            if _space(dst) not in _ON_CHIP and not host_move:
                 raise Exception(
                     f"tile store violation: '{node.name}' writes '{dst.name}', "
-                    f"which is in {_space(dst)}, not Scratchpad"
+                    f"which is in {_space(dst)}, not on chip"
                 )
         elif (viewed := _viewed_buffer(node)) is not None:
             node.meta["space"] = _space(viewed)
@@ -897,21 +886,29 @@ def bufferize_graph(
     model: GraphModule,
     pipelined: bool = False,
     tiler=None,
+    async_pipeline: bool = DEFAULT_ASYNC_PIPELINE,
     single_buffer_tail: bool = False,
     flash_attention_v3: bool = True,
-    bool_mask: bool = True,
+    *,
+    bool_mask: bool,
+    builders: tuple[BuilderRule, ...] = SHARED_BUILDERS,
 ) -> GraphModule:
     """Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
 
     Assumes shapes are already populated (``node.value``); each node is built
-    from its (and its inputs') shapes/dtypes and spliced in place.  Returns the
-    same (mutated) model.
+    by the first of ``builders`` that matches it, from its (and its inputs')
+    shapes/dtypes, and spliced in place.  Returns the same (mutated) model.
 
     Args:
         model: The FX GraphModule to rewrite in place.
         pipelined: Emit software-pipelined (double-buffered) loop nests,
           reusing the tiler's decision that two L2 tiles fit.
         tiler: The ``Tiler`` supplying per-node tile factors.
+        async_pipeline: A pipelined GEMM (dense and sparse) / conv dispatches
+          each tile's compute asynchronously (``AsyncPipelinedKernel``,
+          prefetching ``num_slots - 2`` ahead); off => the synchronous
+          ``PipelinedKernel``, prefetching ``num_slots - 1`` ahead.  Ignored
+          unless ``pipelined``.
         single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
           post-op operands (SRAM saved vs. prefetch); off => double-buffered.
         flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
@@ -920,10 +917,19 @@ def bufferize_graph(
         bool_mask: Store an ``is_causal`` attention's mask table as int1 codes
           plus a scale, the way the eager path quantizes its mask; off => the
           additive fill at the accumulation dtype.
+        builders: The rules that pick each compute node's builder, tried in
+          order; a node none matches is bufferized whole.
     """
     graph = model.graph
-    num_slots = 2 if pipelined else 1
-    accumulate_fp32 = tiler is not None and tiler.model.accumulate_fp32
+    ctx = BuildContext(
+        tiler=tiler,
+        num_slots=2 if pipelined else 1,
+        async_pipeline=pipelined and async_pipeline,
+        accumulate_fp32=tiler is not None and tiler.model.accumulate_fp32,
+        single_buffer_tail=single_buffer_tail,
+        flash_attention_v3=flash_attention_v3,
+        bool_mask=bool_mask,
+    )
     build_cache = {}
     group_ids = itertools.count()
 
@@ -965,74 +971,8 @@ def bufferize_graph(
         if cached is not None:
             sub_gm, n_out, group, tag_sources = cached
         else:
-            if is_conv2d(anchor):
-                sub_gm = build_conv2d(
-                    node,
-                    num_slots=num_slots,
-                    single_buffer_tail=single_buffer_tail,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif anchor.kwargs.get(
-                "A_indptr"
-            ) is not None or gemm_produces_csr(node):
-                # A GEMM whose activation carries an outlier CSR: same dense
-                # nest, plus the per-step gather of the row tile's blocks.
-                sub_gm = build_sparse_gemm(
-                    node,
-                    num_slots=num_slots,
-                    accumulate_fp32=accumulate_fp32,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif is_gemm_op(anchor):
-                sub_gm = build_gemm(
-                    node,
-                    num_slots=num_slots,
-                    accumulate_fp32=accumulate_fp32,
-                    single_buffer_tail=single_buffer_tail,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif is_pooling(anchor):
-                sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
-            elif anchor.target in (_SDPA, _SDPA_MX):
-                sub_gm = (
-                    build_attention_fa3(node, tiler=tiler, bool_mask=bool_mask)
-                    if flash_attention_v3
-                    else build_attention(
-                        node, num_slots=num_slots, tiler=tiler
-                    )
-                )
-            elif csr_quantize_node(node) is not None:
-                # A row-swept producer: the quantize needs a per-K-slice tiling
-                # its anchor cannot give it, so it gets its own two-loop nest
-                # rather than build_pointwise's single grid.  A GEMM-anchored
-                # epilogue never reaches this arm — the sparse arm above
-                # takes it.
-                sub_gm = build_quantize_mx_outlier(
-                    node, tiler=tiler, num_slots=num_slots
-                )
-                if sub_gm is None:
-                    # No fallback: build_pointwise would hand the quantize a
-                    # full-K tile, whose column indices span all of K and which
-                    # the SpMM engine cannot consume.
-                    raise ValueError(
-                        f"{node.name}: produces an outlier CSR but no "
-                        f"row-swept nest could be built for it"
-                    )
-            elif (
-                is_elementwise_op(anchor)
-                or is_axis_reduction(anchor)
-                or is_full_reduction(anchor)
-                or anchor.target in _REDUCTION_POINTWISE_OPS
-                or anchor.target in _RELAYOUT_POINTWISE_OPS
-            ):
-                sub_gm = build_pointwise(
-                    node, num_slots=num_slots, tiler=tiler
-                )
-            else:
-                sub_gm = None
+            rule = next((r for r in builders if r.matches(node, anchor)), None)
+            sub_gm = rule.build(node, ctx) if rule is not None else None
 
             if sub_gm is not None:
                 val = node.value
@@ -1265,21 +1205,6 @@ def _dedup_regions(gm: GraphModule) -> None:
                 _dedup_regions(sub)
 
 
-_REDUCTION_POINTWISE_OPS = (
-    DYNAMIC_QUANTIZE_OPS
-    | NORM_OPS
-    | SOFTMAX_OPS
-    | {torch.ops.quantized_ops.quantize.default}
-)
-# A standalone transpose / permute relayout — build_pointwise stores each tile
-# identity and loads the input from the transposed source.  (Untiled ones fall
-# to ``_build_for_untiled``; build_pointwise returns ``None`` when untiled.)
-_RELAYOUT_POINTWISE_OPS = {
-    torch.ops.aten.transpose.int,
-    torch.ops.aten.permute.default,
-}
-
-
 def _build_for_untiled(node: Node, tiler):
     """Bufferize an untiled op through the pipeline scheduler with
     *whole-tensor* tiles: a single-step ``PipelinedKernel`` (grid ``(1,)``)
@@ -1336,9 +1261,11 @@ def _build_for_untiled(node: Node, tiler):
     arg_tmpl = [_resolve(a) for a in node.args]
     kw_tmpl = {k: _resolve(v) for k, v in node.kwargs.items()}
     target = node.target
-    # The regions the backend keeps beside the op, handed to it by name.
-    scratch = tiler.model.kernel_scratch(node, node.shape)
-    scratch_names = [name for name, _, _ in scratch]
+    # The regions the backend keeps beside the op, handed to it by name: its
+    # op model's for the whole op, none for an op the model leaves untiled.
+    op_model = tiler.model.prepare(node)
+    scratch = op_model.scratch(node.shape) if op_model is not None else ()
+    scratch_names = [name for name, *_ in scratch]
 
     def _fill(t, tiles):
         if isinstance(t, list):
@@ -1374,7 +1301,7 @@ def _build_for_untiled(node: Node, tiler):
         _OutputSpec(tuple(o.shape), tuple(o.shape), (0,) * o.ndim, o.dtype)
         for o in outputs
     ]
-    scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
+    scratch_specs = [_ScratchSpec(*region[1:]) for region in scratch]
     kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,

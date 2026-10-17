@@ -45,7 +45,7 @@ import torch.nn.functional as F
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
 )
-from test_codegen import MXU_OPS, VECTOR_PIPELINE, _can_fuse  # noqa: E402
+from test_codegen import MXU_OPS, FUSION_PATTERNS, _can_fuse  # noqa: E402
 
 from voyager_compiler import (  # noqa: E402
     OpMatcher,
@@ -69,7 +69,7 @@ DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
 # Voyager's fusion patterns, plus an add then an RMS norm: alone, ahead of a
 # GEMM as its prologue, or after one as its tail.
-PATTERNS = VECTOR_PIPELINE + [
+PATTERNS = FUSION_PATTERNS + [
     [OpMatcher("add"), OpMatcher("rms_norm")],
     [
         OpMatcher("add"),
@@ -210,7 +210,7 @@ def main():
     total = sum(predicted)
     with open(os.path.join(args.out, "predicted.json"), "w") as f:
         json.dump({"total_s": total, "kernels_s": predicted}, f, indent=1)
-    manifest = translate(ir, args.out, values)
+    manifest = translate(ir, args.out, config, values)
     kernels = [s for s in manifest["steps"] if s["kernel"] is not None]
     record(gm, list(example_args), manifest, f"{args.out}/tensors.pt")
     print(

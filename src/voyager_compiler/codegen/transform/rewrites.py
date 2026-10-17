@@ -48,6 +48,7 @@ __all__ = [
     "remove_fp32_casts",
     "remove_prunable_ops",
     "remove_zero_attention_mask",
+    "normalize_attention_operands",
 ]
 
 
@@ -620,6 +621,93 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
     model.graph.eliminate_dead_code()
     model.graph.lint()
     model.recompile()
+    return model
+
+
+_SDPA = torch.ops.aten.scaled_dot_product_attention.default
+
+
+def _repeated_heads(node: Node):
+    """``(x, g)`` when ``node`` is ``repeat_kv`` of ``x`` -- ``unsqueeze(x,
+    2)``, an ``expand`` of the new dim to ``g`` and a ``reshape`` of ``[b,
+    h, s, d]`` to ``[b, h·g, s, d]`` -- else ``None``."""
+    if node.target not in (
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+    ):
+        return None
+    expand = node.args[0]
+    if expand.target is not torch.ops.aten.expand.default:
+        return None
+    unsqueeze = expand.args[0]
+    if (
+        unsqueeze.target is not torch.ops.aten.unsqueeze.default
+        or unsqueeze.args[1] != 2
+    ):
+        return None
+    x = unsqueeze.args[0]
+    if x.value.ndim != 4:
+        return None
+    b, h, s, d = x.value.shape
+    g = expand.value.shape[2]
+    expanded, repeated = tuple(expand.value.shape), tuple(node.value.shape)
+    if expanded != (b, h, g, s, d) or repeated != (b, h * g, s, d):
+        return None
+    return x, g
+
+
+def normalize_attention_operands(model: GraphModule) -> GraphModule:
+    """Hand each ``scaled_dot_product_attention`` its operands as the flash
+    attention kernel takes them.
+
+    A key and value whose heads a GQA repeat (``_repeated_heads``) multiplies
+    by the same group are read unrepeated under ``enable_gqa``, so the kernel
+    folds each group of query heads onto its KV head.  A bool ``attn_mask``
+    becomes the additive one, zero where it keeps and the query dtype's
+    minimum elsewhere.
+
+    Args:
+        model: The graph, rewritten in place.
+
+    Returns:
+        ``model``.
+    """
+    graph = model.graph
+    changed = False
+    for node in [n for n in graph.nodes if n.target is _SDPA]:
+        repeats = [_repeated_heads(a) for a in node.args[1:3]]
+        if (
+            not node.kwargs.get("enable_gqa", False)
+            and None not in repeats
+            and repeats[0][1] == repeats[1][1]
+        ):
+            for position, (x, _) in zip((1, 2), repeats):
+                repeat = node.args[position]
+                node.update_arg(position, x)
+                while not repeat.users and repeat is not x:
+                    source = repeat.args[0]
+                    graph.erase_node(repeat)
+                    repeat = source
+            node.update_kwarg("enable_gqa", True)
+            changed = True
+        mask = get_arg_value(node, 3, "attn_mask", None)
+        if isinstance(mask, Node) and mask.value.dtype == torch.bool:
+            dtype = node.args[0].value.dtype
+            with graph.inserting_before(node):
+                zero = create_getattr_from_value(
+                    model, graph, "attention_zero", torch.tensor(0, dtype=dtype)
+                )
+                additive = graph.call_function(
+                    torch.ops.aten.where.ScalarOther,
+                    (mask, zero, torch.finfo(dtype).min),
+                )
+            propagate_shape(zero, model)
+            propagate_shape(additive, model)
+            node.replace_input_with(mask, additive)
+            changed = True
+    if changed:
+        graph.lint()
+        model.recompile()
     return model
 
 

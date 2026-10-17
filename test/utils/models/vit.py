@@ -91,10 +91,10 @@ def load_model(args):
 
 
 def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
+    model, quantizer, calibration_data, fusion_patterns, args
 ):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    transform_args = get_transform_args(args, vector_stages)
+    transform_args = get_transform_args(args, fusion_patterns)
     compile_args = get_compile_args(args)
 
     modules_to_fuse = get_conv_bn_layers(model)
@@ -165,7 +165,7 @@ def quantize_and_dump_model(
     gm, preprocess_fn = extract_input_preprocessor(gm)
     example_args = (preprocess_fn(example_args[0]),)
 
-    fuse_operator(gm, vector_stages)
+    fuse_operator(gm, fusion_patterns)
     gm.graph.print_tabular()
 
     new_output = get_logits(gm(*example_args)) if args.debug else None

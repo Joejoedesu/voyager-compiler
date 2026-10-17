@@ -24,6 +24,7 @@ DEFAULT_WEIGHT_BUFFER_SIZE = 1024
 DEFAULT_ACCUM_BUFFER_SIZE = 1024
 DEFAULT_SCRATCHPAD_OFFSET = 0
 DEFAULT_DOUBLE_BUFFERED_L2 = True
+DEFAULT_ASYNC_PIPELINE = True
 DEFAULT_DRAM_SIZE_GB = 16.0
 DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
 DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
@@ -68,6 +69,7 @@ class AcceleratorConfig:
     num_banks: Optional[int] = None
     bank_width: Optional[int] = None
     double_buffered_l2: bool = DEFAULT_DOUBLE_BUFFERED_L2
+    async_pipeline: bool = DEFAULT_ASYNC_PIPELINE
     # L3 DRAM
     dram_size: Optional[float] = DEFAULT_DRAM_SIZE_GB
     dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
@@ -183,6 +185,17 @@ class AcceleratorConfig:
         from voyager_compiler.backend.voyager import VoyagerModel
 
         return VoyagerModel(self, accumulate_fp32)
+
+    def backend(self):
+        """This target's hooks into ``compile()``: a ``Backend`` with the
+        shared builders."""
+        # Imported here to keep the config a leaf, as in ``runtime_model``.
+        from voyager_compiler.backend.backend import Backend
+        from voyager_compiler.codegen.transform.bufferize import (
+            SHARED_BUILDERS,
+        )
+
+        return Backend(SHARED_BUILDERS)
 
     @classmethod
     def from_args(cls, args) -> "AcceleratorConfig":

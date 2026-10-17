@@ -47,10 +47,10 @@ import torch
 from voyager_compiler.codegen.node_info import get_arg_value
 from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
-    _DEFAULT_NUM_SLOTS,
     build_pipelined_buffers,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    BuildContext,
     _InputSpec,
     _OutputSpec,
     _ScratchSpec,
@@ -313,21 +313,18 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
 
 
 def build_attention(
-    node,
-    *,
-    num_slots: int = _DEFAULT_NUM_SLOTS,
-    accumulate_fp32: bool = True,
-    tiler=None,
-):
+    node: torch.fx.Node, ctx: BuildContext, *, accumulate_fp32: bool = True
+) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for an ``aten.scaled_dot_product_attention`` node.
 
     Returns the bufferized ``GraphModule`` (a rolled ``while_loop`` over
     ``voyager.*`` primitives) implementing flash attention over a KV reduction
     grid dim, or ``None`` when uncovered (missing tiling, dropout, unsupported
     rank).  GQA is supported by folding the head group into the query rows
-    (:func:`plan_gqa_fold`).  ``tiler`` is accepted for signature parity but
-    unused — attention tiling comes from ``node.meta['l2_tiling']``
-    (``(n_q, n_kv)``).
+    (:func:`plan_gqa_fold`).  ``accumulate_fp32`` runs the softmax and the
+    output accumulator in fp32 instead of the output dtype.  Of ``ctx`` only
+    ``num_slots`` is read: attention tiling comes from
+    ``node.meta['l2_tiling']`` (``(n_q, n_kv)``).
     """
     if (
         node.op != "call_function"
@@ -492,7 +489,7 @@ def build_attention(
         out_specs=[out_spec],
         inputs=tuple(inputs),
         scratch_specs=scratch_specs,
-        num_slots=num_slots,
+        num_slots=ctx.num_slots,
         wrapper=wrap,
     )
     _fuse_passes(gm)

@@ -31,8 +31,8 @@ import torch
 
 # A bfloat16 result rounded once more is off by about 2**-8 of its largest
 # magnitude.  A GEMM whose reduction spans several steps sums its partial
-# results in bfloat16, as Voyager's schedule does, and two such sums rounded
-# in another order differ by up to about 1.5%; more is a lowering error.
+# results in bfloat16 in Voyager's schedule and in float32 PSUM on the core,
+# and the two differ by up to about 1.5%; more is a lowering error.
 MAX_ERROR = 2e-2
 # An FP8 result may round one step the other way, and a step is at most
 # 2**-m of the largest magnitude, m the format's mantissa bits.  An MX output

@@ -153,7 +153,9 @@ def replace_node_with_graph_module(
     return [value_remap[n] for n in output]
 
 
-def create_subgraph(nodes: List[Node]):
+def create_subgraph(nodes: List[Node], results: List[Node]):
+    """``nodes`` as a ``GraphModule`` returning ``results``' values, a tuple
+    of them when there are several, and the values it takes as operands."""
     new_args = []
     new_graph = torch.fx.Graph()
     value_remap = {}
@@ -165,7 +167,10 @@ def create_subgraph(nodes: List[Node]):
                 new_args.append(n)
         value_remap[node] = new_graph.node_copy(node, lambda n: value_remap[n])
 
-    new_graph.output(value_remap[nodes[-1]])
+    if len(results) == 1:
+        new_graph.output(value_remap[results[0]])
+    else:
+        new_graph.output(tuple(value_remap[n] for n in results))
     new_graph.lint()
     gm = torch.fx.GraphModule(torch.nn.Module(), new_graph)
     return gm, tuple(new_args)
@@ -287,11 +292,30 @@ def create_and_insert_subgraph(
     model: torch.nn.Module,
     node_order: Dict[Node, int] = None,
     normalize_iteration_space: bool = False,
+    results: Optional[List[Node]] = None,
 ) -> Optional[Node]:
+    """Outline ``nodes`` into a submodule of ``model`` called where the last
+    of them stands.
+
+    Args:
+        nodes: The nodes to outline; sorted in place into program order.
+        model: The module whose graph holds them.
+        node_order: Each node's position in the graph; computed if ``None``.
+        normalize_iteration_space: Whether to normalize the group to its
+            anchor's iteration space, leaving it unfused if it cannot.
+        results: The nodes whose values the call returns, each read through
+            a ``getitem`` when there are several; ``None`` for the last
+            node's alone.
+
+    Returns:
+        The ``call_module`` node, or ``None`` if normalization failed.
+    """
     if node_order is None:
         node_order = {n: i for i, n in enumerate(model.graph.nodes)}
     nodes.sort(key=lambda n: node_order[n])
-    submodule, new_args = create_subgraph(nodes)
+    if results is None:
+        results = [nodes[-1]]
+    submodule, new_args = create_subgraph(nodes, results)
     node_name = get_submodule_name(model, nodes)
     setattr(model, node_name, submodule)
     with model.graph.inserting_after(nodes[-1]):
@@ -299,9 +323,20 @@ def create_and_insert_subgraph(
             "call_module", node_name, new_args, {}
         )
     new_node.meta["submodule"] = submodule
-    if (dtype := nodes[-1].meta.get("dtype", None)) is not None:
-        new_node.meta["dtype"] = dtype
-    nodes[-1].replace_all_uses_with(new_node)
+    items = []
+    if len(results) == 1:
+        if (dtype := results[0].meta.get("dtype", None)) is not None:
+            new_node.meta["dtype"] = dtype
+        results[0].replace_all_uses_with(new_node, lambda u: u not in nodes)
+    else:
+        for index, node in enumerate(results):
+            with model.graph.inserting_after(items[-1] if items else new_node):
+                items.append(
+                    model.graph.call_function(
+                        operator.getitem, (new_node, index)
+                    )
+                )
+            node.replace_all_uses_with(items[-1], lambda u: u not in nodes)
 
     # An operand is cloned so propagation cannot write through it, but a group
     # may also take a scalar -- an index or a running offset read out of a
@@ -314,6 +349,9 @@ def create_and_insert_subgraph(
     )
     result = ShapeProp(submodule).propagate(*args)
     set_node_value(new_node, result)
+    if items:
+        for item, value in zip(items, result):
+            set_node_value(item, value)
 
     # Normalize the fused submodule to the anchor's iteration space; skip the
     # group (leaving it fused as-is) if it cannot share one iteration space.

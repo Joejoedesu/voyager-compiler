@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "fuse_dequantize_quantize",
     "fuse_quantize_dequantize_with_producer",
+    "quantizes_kv_cache",
     "sink_cache_folds",
     "split_kv_cache",
 ]
@@ -817,6 +818,46 @@ def _shape_device(node: Node):
     if not isinstance(value, torch.Tensor):
         value = node.meta["val"]
     return value.device
+
+
+def quantizes_kv_cache(model: GraphModule, quantizer) -> bool:
+    """Whether ``quantizer`` quantizes the attention's read of a KV cache,
+    the condition for ``split_kv_cache``: only a cache stored quantized
+    needs a full-precision residual.
+
+    Annotates ``model`` and clears the annotations again; a cache is read
+    quantized when an operand that views it -- through its write and
+    single-operand relayouts such as a transpose or the GQA repeat -- takes
+    a spec.
+
+    Args:
+        model: Decode graph from ``convert_and_export_with_cache``, its
+            caches not yet split.
+        quantizer: The quantizer ``prepare_pt2e`` will annotate ``model``
+            with.
+
+    Returns:
+        True when a cache operand of an attention op is quantized.
+    """
+    quantizer.annotate(model)
+    annotations = [
+        n.meta.pop("quantization_annotation")
+        for n in model.graph.nodes
+        if "quantization_annotation" in n.meta
+    ]
+    for annotation in annotations:
+        for operand, qspec in annotation.input_qspec_map.items():
+            if qspec is None:
+                continue
+            # A cache is the first input of its write and of each relayout.
+            while (
+                operand.target is torch.ops.aten.index_copy_.default
+                or len(operand.all_input_nodes) == 1
+            ):
+                operand = operand.all_input_nodes[0]
+            if _KV_CACHE.match(str(operand.target)):
+                return True
+    return False
 
 
 def split_kv_cache(
@@ -2080,6 +2121,11 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
         while q_scale.ndim < nd:
             q_scale = q_scale.unsqueeze(0)
         shape = list(max(a, b) for a, b in zip(q_scale.shape, dq_scale.shape))
+        # A dequantize and a quantize grouping along different axes would
+        # fuse into an outer product: a scale per element, as large as the
+        # tensor itself.  Leave such a pair unfused.
+        if math.prod(shape) > max(q_scale.numel(), dq_scale.numel()):
+            continue
 
         q_scale_expanded = expand(q_scale, shape, block_size)
         dq_scale_expanded = expand(dq_scale, shape, block_size)

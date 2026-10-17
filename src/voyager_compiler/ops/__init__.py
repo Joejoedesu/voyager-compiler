@@ -1,18 +1,19 @@
 """Custom operator registrations and the layouts they work in.
 
 Importing this package defines the ``quantized_ops`` torch.library: the
-decomposed quantize / dequantize / microscaling ops, plus hardware-layout
-twins of the aten operators the data-layout pass retargets.  Import it for
-that side effect before referencing any ``torch.ops.quantized_ops.*`` target —
-the op namespace resolves lazily, so a missing registration surfaces at call
-time, not at import.
+decomposed quantize / dequantize / microscaling ops, plus the
+hardware-layout forms of the aten operators the data-layout passes
+retarget.  Import it for that side effect before referencing any
+``torch.ops.quantized_ops.*`` target — the op namespace resolves lazily, so
+a missing registration surfaces at call time, not at import.
 """
 
 from voyager_compiler.ops.layout import (
-    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
-    GEMM_OP_VARIANTS,
+    GEMM_LAYOUTS,
     GEMM_WEIGHT_LAYOUTS,
+    GEMV_LAYOUTS,
     HWIO_TO_OIHW,
     NCHW_TO_NHWC,
     NHWC_OP_VARIANTS,
@@ -41,10 +42,11 @@ from voyager_compiler.ops.quantized import (
 )
 
 __all__ = [
-    "DEFAULT_GEMM_WEIGHT_LAYOUT",
+    "DEFAULT_GEMM_LAYOUT",
     "DEFAULT_TENSOR_LAYOUT",
-    "GEMM_OP_VARIANTS",
+    "GEMM_LAYOUTS",
     "GEMM_WEIGHT_LAYOUTS",
+    "GEMV_LAYOUTS",
     "HADAMARD_SIZE",
     "HWIO_TO_OIHW",
     "NCHW_TO_NHWC",

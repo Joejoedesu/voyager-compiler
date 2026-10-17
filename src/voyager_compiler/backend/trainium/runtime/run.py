@@ -4,12 +4,16 @@ Runs on a Trainium host in the ``trn`` env, by path:
 
     python run.py <dir> [--iterations N] [--warmup N]
 
-Moves the step's parameters to NeuronCore 0 once, runs the warm-up, then
-times each run with the host clock until the outputs are back.  Writes
-``<dir>/step/run.json``: every run's latency, their percentiles, and how
-each output ``tensors.pt`` holds a reference for compares with it.
-Profiling wraps this script: set ``NEURON_RT_INSPECT_ENABLE=1`` and
-``NEURON_RT_INSPECT_OUTPUT_DIR`` to capture a device profile.
+A step traced with ``--weights-from`` gets its weights back first: each
+from the host's copy of the checkpoint ``weights.json`` names (in the
+Hugging Face cache), transposed where it says, the rest from
+``extra.safetensors``.  Moves the step's parameters to NeuronCore 0 once,
+runs the warm-up, then times each run with the host clock until the outputs
+are back.  Writes ``<dir>/step/run.json``: every run's latency, their
+percentiles, and how each output ``tensors.pt`` holds a reference for
+compares with it.  Profiling wraps this script: set
+``NEURON_RT_INSPECT_ENABLE=1`` and ``NEURON_RT_INSPECT_OUTPUT_DIR`` to
+capture a device profile.
 """
 
 import argparse
@@ -20,6 +24,9 @@ import time
 
 import torch
 import torch_neuronx
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+from safetensors.torch import load_file
 
 
 def compare(got, want):
@@ -40,6 +47,27 @@ def compare(got, want):
     }
 
 
+def restore_weights(step, step_dir):
+    """Give ``step`` back the weights ``weights.json`` names."""
+    with open(os.path.join(step_dir, "weights.json")) as f:
+        recipe = json.load(f)
+    path = snapshot_download(
+        recipe["model"], revision=recipe["revision"], local_files_only=True
+    )
+    with open(os.path.join(path, "model.safetensors.index.json")) as f:
+        files = json.load(f)["weight_map"]
+    extra = load_file(os.path.join(step_dir, "extra.safetensors"))
+    weights = {}
+    for slot, source in recipe["slots"].items():
+        if source.get("extra"):
+            weights[slot] = extra[slot]
+            continue
+        with safe_open(os.path.join(path, files[source["key"]]), "pt") as f:
+            value = f.get_tensor(source["key"])
+        weights[slot] = value.T.contiguous() if source["transposed"] else value
+    torch_neuronx.replace_weights(step, weights)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
@@ -53,6 +81,8 @@ def main():
     inputs = tuple(tensors[name] for name in manifest["inputs"])
     step_dir = os.path.join(args.directory, "step")
     step = torch.jit.load(os.path.join(step_dir, "step.pt"))
+    if os.path.exists(os.path.join(step_dir, "weights.json")):
+        restore_weights(step, step_dir)
     torch_neuronx.move_trace_to_device(step, 0)
 
     for _ in range(args.warmup):

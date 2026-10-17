@@ -45,6 +45,7 @@ from voyager_compiler import (
     fake_like,
     merge_sibling_linears,
     prepare_pt2e,
+    quantizes_kv_cache,
     split_kv_cache,
     transform,
 )
@@ -215,22 +216,14 @@ def build_decode(model, tokenizer, args, config, tokens):
     context_length`` over a static BF16 KV cache of ``max_cache_len`` slots,
     via Hugging Face's ``convert_and_export_with_cache``, then prefill the
     exported cache with the ``context_length`` prompt tokens so calibration
-    and the baked cache see real contents.  The caches are then split into
-    completed chunks and a full-precision residual of ``residual_length(args)``
-    positions.  ``tokens`` is 1 for plain decode; a speculative-decoding
-    verification step writes the draft's tokens at once, and must not cross
-    a residual chunk boundary.  Returns ``(gm, (), example_kwargs)``.
+    and the baked cache see real contents.  ``tokens`` is 1 for plain
+    decode; a speculative-decoding verification step writes the draft's
+    tokens at once.  Returns ``(gm, (), example_kwargs)``.
     """
-    length = residual_length(args)
     if tokens > DECODE_MAX_GEN:
         raise ValueError(
             f"a {tokens}-token step exceeds the {DECODE_MAX_GEN} generation "
             "slots the cache holds past the context"
-        )
-    if args.context_length % length + tokens > length:
-        raise ValueError(
-            f"a {tokens}-token step from position {args.context_length} "
-            f"crosses a {length}-position residual chunk boundary"
         )
     model.generation_config = GenerationConfig(
         use_cache=True,
@@ -270,8 +263,6 @@ def build_decode(model, tokenizer, args, config, tokens):
     for i, layer in enumerate(cache.layers):
         getattr(gm, f"key_cache_{i}").copy_(layer.keys)
         getattr(gm, f"value_cache_{i}").copy_(layer.values)
-
-    split_kv_cache(gm, length, args.context_length)
 
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, (), example_kwargs
@@ -341,7 +332,7 @@ def restore_kv_cache(gm, state):
 
 
 def quantize_model(
-    model, tokenizer, quantizer, vector_stages, args, reference=True
+    model, tokenizer, quantizer, fusion_patterns, args, reference=True
 ):
     """Exports and quantizes the stage ``args.model`` names.
 
@@ -353,7 +344,7 @@ def quantize_model(
         model: The Hugging Face model to export.
         tokenizer: The model's tokenizer, used to build the example prompt.
         quantizer: The PT2E quantizer that annotates the graph.
-        vector_stages: The vector-unit pipeline stages ``transform`` fuses.
+        fusion_patterns: The fusion patterns ``transform`` applies.
         args: The parsed command-line arguments.
         reference: Whether to run the converted graph on the real example
             inputs for a reference output. When False, shapes are propagated
@@ -367,7 +358,7 @@ def quantize_model(
         and the KV-cache state to restore before running the graph again
         (``restore_kv_cache``).
     """
-    transform_args = get_transform_args(args, vector_stages)
+    transform_args = get_transform_args(args, fusion_patterns)
     compile_args = get_compile_args(args)
     config = transform_args["config"]
 
@@ -383,6 +374,27 @@ def quantize_model(
         )
     else:
         gm, example_args, example_kwargs = build_prefill(model, tokenizer, args)
+
+    quantizer.set_module_name_object_type_order(
+        _ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
+    )
+
+    if args.qconfig is not None:
+        set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.qconfig])
+
+    # A cache whose main half is quantized is split into completed chunks
+    # and a full-precision residual of ``residual_length(args)`` positions;
+    # a BF16 cache stays whole.
+    kivi = args.model == "llama_decode_kivi"
+    split = is_decode and (kivi or quantizes_kv_cache(gm, quantizer))
+    if split:
+        length = residual_length(args)
+        if args.context_length % length + tokens > length:
+            raise ValueError(
+                f"a {tokens}-token step from position {args.context_length} "
+                f"crosses a {length}-position residual chunk boundary"
+            )
+        split_kv_cache(gm, length, args.context_length)
     kv_state = kv_cache_state(gm)
 
     # get_decoder() is the text decoder, wherever the model nests it.
@@ -393,20 +405,13 @@ def quantize_model(
     )
     match_and_fuse_rms_norm(gm, layernorm, (example_input,))
 
-    quantizer.set_module_name_object_type_order(
-        _ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
-    )
-
-    if args.qconfig is not None:
-        set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.qconfig])
-
-    if args.model == "llama_decode_kivi":
+    if kivi:
         set_kivi_attention_qconfig(quantizer)
         annotate_kivi_cache(gm)
-    elif is_decode:
+    elif split:
         set_residual_attention_qconfig(quantizer)
 
-    if args.qconfig is not None or args.model == "llama_decode_kivi":
+    if args.qconfig is not None or kivi:
         fp8_qspec = QuantizationSpec.from_str(
             "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
         )
@@ -468,7 +473,7 @@ def quantize_model(
     )
 
 
-def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
+def quantize_and_dump_model(model, tokenizer, quantizer, fusion_patterns, args):
     """Export, quantize, transform and compile the stage ``args.model`` names
     (``llama_prefill`` / ``llama_decode``).  Returns ``(gm, old_output,
     new_output)``; ``new_output`` is ``None`` unless ``--debug`` re-runs the
@@ -481,7 +486,7 @@ def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
         transform_args,
         compile_args,
         _,
-    ) = quantize_model(model, tokenizer, quantizer, vector_stages, args)
+    ) = quantize_model(model, tokenizer, quantizer, fusion_patterns, args)
 
     transform(gm, example_args, example_kwargs, **transform_args)
     compile(gm, example_args, example_kwargs, **compile_args)

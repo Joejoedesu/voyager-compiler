@@ -59,7 +59,8 @@ T_SKIP = 8
 class _PendingCommit:
     """A committed op parked until its dependency semaphores are all posted.
     ``run`` walks its body (and signals its done-sem) once that happens;
-    ``floor`` is the running max of the resolved deps' completion cycles."""
+    ``floor`` is the running max of the cycle the program issued it at and
+    the resolved deps' completion cycles."""
 
     node: object
     deps: list
@@ -289,8 +290,11 @@ class ResourceState:
         thunk that walks its body, then try to resolve it at once.  In the
         common case every dep is already posted (the copy_in that feeds it ran
         just before), so it runs immediately; otherwise it waits for the posts.
+        Either way it starts no earlier than the clock it is issued at.
         """
-        self.pending_commits.append(_PendingCommit(node, list(deps), 0, run))
+        self.pending_commits.append(
+            _PendingCommit(node, list(deps), self.clock(), run)
+        )
         if self.trace is not None:
             self.trace.append((T_COMMIT, id(node), tuple(deps)))
         self._resolve_commits()

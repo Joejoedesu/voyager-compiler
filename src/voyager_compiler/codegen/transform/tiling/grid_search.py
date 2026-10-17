@@ -278,6 +278,10 @@ def _vector_op_tiling_limits(node, vector_unit_width):
     dequantize = node.target == torch.ops.quantized_ops.dequantize.default
     if node.target in SOFTMAX_OPS:
         last_dim = get_arg_value(node, 1, "dim", -1)
+    elif node.target is torch.ops.quantized_ops.rms_norm_kmajor.default:
+        # It normalizes the second-last dim, which a tile holds whole.
+        last_dim = None
+        multiple_of = (node.shape[-2], vector_unit_width)
     elif node.target in NORM_OPS:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
         last_dim = (

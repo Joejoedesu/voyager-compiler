@@ -1,22 +1,25 @@
-"""Auto-generated hardware-layout twins of aten operators.
+"""Hardware-layout forms of aten operators.
 
 The data-layout passes re-store certain operands in hardware-friendly
-layouts: NHWC activations + HWIO conv weights, and CK-ordered
-(transposed) GEMM weights.  Each affected aten operator gets a
+layouts: NHWC activations + HWIO conv weights, and GEMM operands
+contraction-major.  Each affected conv / pool operator gets a
 ``quantized_ops`` twin with the SAME name and the SAME schema (extracted
 verbatim from the aten ``OpOverload``, so the backend keeps seeing the
 familiar targets); the generated eager impl permutes the
 layout-transformed inputs back to aten's native layout, calls the
 original operator, and permutes the result into the hardware layout.
-The op identity therefore carries the layout contract: eager execution
-of a transformed graph is correct with no process-global monkeypatching.
+The GEMMs, ``quantized_ops.linear`` and ``quantized_ops.matmul``, take
+aten's operands plus one ``layout`` argument naming how each is stored
+(``GemmLayout``).  The op and its arguments therefore carry the layout
+contract: eager execution of a transformed graph is correct with no
+process-global monkeypatching.
 
-This module is a leaf (it imports only torch): the twins are registered
+This module is a leaf (it imports only torch): the ops are registered
 the moment ``quantized`` imports it, before any module that references
 ``torch.ops.quantized_ops.conv2d`` etc. at import time can load.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -31,12 +34,54 @@ HWIO_TO_OIHW = (3, 2, 0, 1)
 TENSOR_LAYOUTS = ("nchw", "nhwc")
 DEFAULT_TENSOR_LAYOUT = "nchw"
 
-# The two GEMM weight layouts: ``"kc"`` = [out, contraction] (aten
-# linear's native weight layout), ``"ck"`` = [contraction, out] (aten
-# matmul's native right-operand layout).  The default serves both the
-# matrix-matrix and the matrix-vector weight layout.
+# A GEMM's layout, ``"<activation>,<weight>"`` in C (contraction), K (output
+# features) and X (tokens, the activation's rows): ``"xc,kc"`` is PyTorch's,
+# ``"xc,ck"`` stores the weight [contraction, out], and ``"cx,ck"`` also
+# stores the activations between GEMMs contraction-major, [features, tokens],
+# the order a Trainium TensorE contracts over its partitions.  A
+# contraction-major activation needs the CK weight.  A matrix-vector GEMM's
+# activation is a single row, the same bytes in either order, so its layout
+# is always ``"xc"``.  The default serves both the matrix-matrix and the
+# matrix-vector layout.
+GEMM_LAYOUTS = ("xc,kc", "xc,ck", "cx,ck")
+GEMV_LAYOUTS = ("xc,kc", "xc,ck")
+DEFAULT_GEMM_LAYOUT = "xc,kc"
+
+# A GEMM op's ``layout`` argument, ``"<activation>,<weight>[,<output>]"``,
+# each part a tensor's last two dims in the letters above: the activation
+# ``"xc"`` or ``"cx"``, the weight ``"kc"`` or ``"ck"``, and the output
+# ``"xk"`` [tokens, out] -- the default, left out -- or ``"kx"``.
+GEMM_ACTIVATION_LAYOUTS = ("xc", "cx")
 GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
-DEFAULT_GEMM_WEIGHT_LAYOUT = "kc"
+DEFAULT_GEMM_OUTPUT = "xk"
+GEMM_OUTPUT_LAYOUTS = (DEFAULT_GEMM_OUTPUT, "kx")
+# The layouts ``aten.linear`` and ``aten.matmul`` compute in: the default of
+# each GEMM op.
+LINEAR_LAYOUT = "xc,kc"
+MATMUL_LAYOUT = "xc,ck"
+
+
+class GemmLayout(NamedTuple):
+    """The parts of a GEMM op's ``layout`` argument: how its activation,
+    weight and output are stored."""
+
+    activation: str
+    weight: str
+    output: str = DEFAULT_GEMM_OUTPUT
+
+    @classmethod
+    def parse(cls, layout: str) -> "GemmLayout":
+        """The parts of ``layout``, a GEMM op's ``layout`` argument."""
+        parts = cls(*layout.split(","))
+        assert parts.activation in GEMM_ACTIVATION_LAYOUTS, layout
+        assert parts.weight in GEMM_WEIGHT_LAYOUTS, layout
+        assert parts.output in GEMM_OUTPUT_LAYOUTS, layout
+        return parts
+
+    def __str__(self) -> str:
+        """The ``layout`` argument, its output left out when the default."""
+        parts = self[:2] if self.output == DEFAULT_GEMM_OUTPUT else self
+        return ",".join(parts)
 
 
 def project(per_axis: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
@@ -86,21 +131,7 @@ NHWC_LAYOUT_OPS: List[torch._ops.OpOverload] = [
     torch.ops.aten._adaptive_avg_pool2d.default,
 ]
 
-# GEMM-family operators.  Each gets a twin whose ONLY difference from
-# the aten op is that the second operand (the weight / right matrix)
-# arrives with its last two dims swapped.  The layout pass unifies all
-# GEMM right-operands to one layout by flipping the storage of exactly
-# the family that is not natively in it — and retargeting precisely
-# those nodes to the twin: KC target => flip matmul (CK-native), CK
-# target => flip linear (KC-native).  Untouched nodes keep their aten
-# target, so eager execution is correct either way with no global
-# patching.
-GEMM_OPS: List[torch._ops.OpOverload] = [
-    torch.ops.aten.linear.default,
-    torch.ops.aten.matmul.default,
-]
-
-# The twins join the ``quantized_ops`` namespace ``quantized.py`` owns
+# The layout ops join the ``quantized_ops`` namespace ``quantized.py`` owns
 # (a FRAGMENT extends it; the handle must stay alive for the
 # registrations to persist).
 _QUANTIZED_OPS_FRAGMENT = torch.library.Library("quantized_ops", "FRAGMENT")
@@ -175,22 +206,132 @@ def register_nhwc_operators() -> Dict:
     return variants
 
 
-def register_gemm_operators() -> Dict:
-    """Generate the twin of every ``GEMM_OPS`` entry: identical to the
-    aten op except that the second (weight / right-matrix) argument
-    arrives with its last two dims swapped, un-swapped around the aten
-    call.  Returns ``{aten OpOverload: generated OpOverload}``.
-    """
-
-    def swap_last_two(t, bound):
-        return t.transpose(-2, -1)
-
-    variants = {}
-    for op in GEMM_OPS:
-        second = op._schema.arguments[1].name
-        variants[op] = _define_layout_variant(op, {second: swap_last_two}, None)
-    return variants
-
-
 NHWC_OP_VARIANTS = register_nhwc_operators()
-GEMM_OP_VARIANTS = register_gemm_operators()
+
+
+# The GEMMs in any layout: aten's ``linear`` and ``matmul`` on operands
+# stored as ``layout`` says, their result stored as it says too.
+# ``out_dtype``, when given, is the dtype the product is summed in float32
+# and returned in, as a GEMM writing an accumulator does; unset, the product
+# is the inputs' dtype.
+_QUANTIZED_OPS_FRAGMENT.define(
+    "linear(Tensor input, Tensor weight, Tensor? bias=None, *, "
+    f'str layout="{LINEAR_LAYOUT}", ScalarType? out_dtype=None) -> Tensor'
+)
+_QUANTIZED_OPS_FRAGMENT.define(
+    f'matmul(Tensor self, Tensor other, *, str layout="{MATMUL_LAYOUT}", '
+    "ScalarType? out_dtype=None) -> Tensor"
+)
+
+
+def _gemm_in_layout(
+    aten_op, native, activation, weight, layout, out_dtype, *rest
+):
+    """``aten_op`` on operands stored as ``layout`` says.
+
+    Args:
+        aten_op: ``aten.linear`` or ``aten.matmul``.
+        native: The layout ``aten_op`` computes in.
+        activation: The activation, stored as ``layout`` says.
+        weight: The weight, stored as ``layout`` says.
+        layout: The GEMM's ``layout`` argument.
+        out_dtype: The dtype the product is summed in float32 and returned
+            in, or ``None`` for the inputs' dtype.
+        *rest: ``aten_op``'s other arguments: ``linear``'s bias.
+
+    Returns:
+        The product, stored as ``layout`` says.
+    """
+    stored, native = GemmLayout.parse(layout), GemmLayout.parse(native)
+    if stored.activation != native.activation:
+        activation = activation.mT
+    if stored.weight != native.weight:
+        weight = weight.mT
+    if out_dtype is not None:
+        activation, weight = activation.float(), weight.float()
+        rest = [None if r is None else r.float() for r in rest]
+    out = aten_op(activation, weight, *rest)
+    if out_dtype is not None:
+        out = out.to(out_dtype)
+    return out.mT.contiguous() if stored.output != native.output else out
+
+
+@torch.library.impl(
+    _QUANTIZED_OPS_FRAGMENT, "linear", "CompositeExplicitAutograd"
+)
+def _linear(input, weight, bias=None, *, layout=LINEAR_LAYOUT, out_dtype=None):
+    return _gemm_in_layout(
+        torch.ops.aten.linear,
+        LINEAR_LAYOUT,
+        input,
+        weight,
+        layout,
+        out_dtype,
+        bias,
+    )
+
+
+@torch.library.impl(
+    _QUANTIZED_OPS_FRAGMENT, "matmul", "CompositeExplicitAutograd"
+)
+def _matmul(input, other, *, layout=MATMUL_LAYOUT, out_dtype=None):
+    return _gemm_in_layout(
+        torch.ops.aten.matmul, MATMUL_LAYOUT, input, other, layout, out_dtype
+    )
+
+
+# The K-major twins ``normalize_activation_layout`` retargets to.  The
+# attention twin reads its query and key ``[..., head_dim, tokens]``, its
+# value and mask as aten's, and writes ``[..., tokens, head_dim]``, or
+# ``[..., head_dim, tokens]`` given ``transpose_output``.  The RMS norm twin
+# normalizes ``[..., hidden, tokens]`` over its hidden dim, the second-last,
+# by a ``[hidden, 1]`` weight.
+_QUANTIZED_OPS_FRAGMENT.define(
+    "sdpa_kmajor(Tensor query, Tensor key, Tensor value, "
+    "Tensor? attn_mask=None, float dropout_p=0.0, bool is_causal=False, *, "
+    "float? scale=None, bool enable_gqa=False, bool transpose_output=False) "
+    "-> Tensor"
+)
+_QUANTIZED_OPS_FRAGMENT.define(
+    "rms_norm_kmajor(Tensor input, Tensor? weight=None, float? eps=None) "
+    "-> Tensor"
+)
+
+
+@torch.library.impl(
+    _QUANTIZED_OPS_FRAGMENT, "sdpa_kmajor", "CompositeExplicitAutograd"
+)
+def _sdpa_kmajor(
+    query,
+    key,
+    value,
+    attn_mask=None,
+    dropout_p=0.0,
+    is_causal=False,
+    *,
+    scale=None,
+    enable_gqa=False,
+    transpose_output=False,
+):
+    out = torch.ops.aten.scaled_dot_product_attention(
+        query.mT.contiguous(),
+        key.mT.contiguous(),
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
+    return out.mT.contiguous() if transpose_output else out
+
+
+@torch.library.impl(
+    _QUANTIZED_OPS_FRAGMENT, "rms_norm_kmajor", "CompositeExplicitAutograd"
+)
+def _rms_norm_kmajor(input, weight=None, eps=None):
+    hidden = [input.shape[-2]]
+    if weight is not None:
+        weight = weight.reshape(hidden)
+    out = torch.ops.aten.rms_norm(input.mT, hidden, weight, eps)
+    return out.mT.contiguous()

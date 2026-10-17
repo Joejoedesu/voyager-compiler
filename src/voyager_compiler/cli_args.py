@@ -14,9 +14,10 @@ from voyager_compiler.hardware_config import (
     DEFAULT_WEIGHT_BUFFER_SIZE,
 )
 from voyager_compiler.ops.layout import (
-    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
-    GEMM_WEIGHT_LAYOUTS,
+    GEMM_LAYOUTS,
+    GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
 )
 from voyager_compiler.utils import SLURM_ARGS
@@ -24,6 +25,7 @@ from voyager_compiler.utils import SLURM_ARGS
 __all__ = [
     "add_quantization_args",
     "add_compile_args",
+    "add_layout_args",
     "add_experiment_args",
 ]
 
@@ -270,6 +272,39 @@ def add_experiment_args(parser=None):
     return parser
 
 
+def add_layout_args(parser):
+    """Add the ``transform`` data-layout options to ``parser``.
+
+    Args:
+        parser: The ``argparse.ArgumentParser`` to extend.
+    """
+    parser.add_argument(
+        "--tensor_layout",
+        choices=TENSOR_LAYOUTS,
+        default=DEFAULT_TENSOR_LAYOUT,
+        help="Memory order of the 4-D feature maps of conv2d, the 2-D pools "
+        "and the ops connected to them: nchw (channels first, OIHW conv "
+        "weights) or nhwc (channels last, HWIO conv weights). GEMM operands "
+        "are not affected.",
+    )
+    parser.add_argument(
+        "--gemm_layout",
+        choices=GEMM_LAYOUTS,
+        default=DEFAULT_GEMM_LAYOUT,
+        help="Matrix-matrix GEMM layout, the activation's then the weight's, "
+        "in C (contraction), K (output features) and X (tokens): xc,kc is "
+        "PyTorch's, xc,ck stores the weight [contraction, out], cx,ck also "
+        "stores the activations between GEMMs [features, tokens].",
+    )
+    parser.add_argument(
+        "--gemv_layout",
+        choices=GEMV_LAYOUTS,
+        default=DEFAULT_GEMM_LAYOUT,
+        help="Matrix-vector GEMM layout (a single activation row): xc,kc or "
+        "xc,ck.",
+    )
+
+
 def add_compile_args(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
@@ -363,29 +398,7 @@ def add_compile_args(parser=None):
     )
 
     # -- data layout + hardware unrolling -----------------------------------
-    parser.add_argument(
-        "--tensor_layout",
-        choices=TENSOR_LAYOUTS,
-        default=DEFAULT_TENSOR_LAYOUT,
-        help="Memory order of the 4-D feature maps of conv2d, the 2-D pools "
-        "and the ops connected to them: nchw (channels first, OIHW conv "
-        "weights) or nhwc (channels last, HWIO conv weights). GEMM operands "
-        "are not affected.",
-    )
-    parser.add_argument(
-        "--gemm_weight_layout",
-        choices=GEMM_WEIGHT_LAYOUTS,
-        default=DEFAULT_GEMM_WEIGHT_LAYOUT,
-        help="Matrix-matrix GEMM weight layout: kc is [out, contraction], "
-        "ck is [contraction, out].",
-    )
-    parser.add_argument(
-        "--gemv_weight_layout",
-        choices=GEMM_WEIGHT_LAYOUTS,
-        default=DEFAULT_GEMM_WEIGHT_LAYOUT,
-        help="Matrix-vector GEMM weight layout: kc is [out, contraction], "
-        "ck is [contraction, out].",
-    )
+    add_layout_args(parser)
     parser.add_argument(
         "--pe_array_size",
         type=lambda x: tuple(map(int, x.split(","))),

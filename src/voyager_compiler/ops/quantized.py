@@ -87,10 +87,15 @@ _OPS_DYNAMIC = None
 
 quantized_ops_lib = Library("quantized_ops", "DEF")
 
-# Registers the auto-generated hardware-layout twins (conv2d /
-# max_pool2d / adaptive_avg_pool2d / linear / matmul) into the namespace
-# just created, before any importer references them.
-from voyager_compiler.ops import layout as _register_layout  # noqa: E402,F401
+# Registers the hardware-layout ops (the conv2d / max_pool2d /
+# adaptive_avg_pool2d twins, linear / matmul) into the namespace just
+# created, before any importer references them.
+from voyager_compiler.ops.layout import (  # noqa: E402
+    DEFAULT_GEMM_OUTPUT,
+    LINEAR_LAYOUT,
+    MATMUL_LAYOUT,
+    GemmLayout,
+)
 
 
 def expand(input, shape, block_size):
@@ -582,13 +587,17 @@ def conv2d_mx(
 
 
 # ``alpha`` scales a GEMM's product, as in ``alpha * (A @ B) + bias``: the
-# operands' global scales, which factor out of the contraction.
+# operands' global scales, which factor out of the contraction.  ``layout``
+# says how the operands and the result are stored (``GemmLayout``), and
+# ``out_dtype`` the dtype the product is returned in, as for
+# ``quantized_ops.linear``.
 quantized_ops_lib.define(
     "linear_mx(Tensor input, Tensor weight, Tensor? bias=None, *, "
     "Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, Tensor? weight_code=None, "
     "Tensor? alpha=None, Tensor? A_data=None, Tensor? A_indices=None, "
-    'Tensor? A_indptr=None, str weight_layout="kc") -> Tensor'
+    f'Tensor? A_indptr=None, str layout="{LINEAR_LAYOUT}", '
+    "ScalarType? out_dtype=None) -> Tensor"
 )
 
 
@@ -607,9 +616,10 @@ def linear_mx(
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
-    weight_layout: str = "kc",
+    layout: str = LINEAR_LAYOUT,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    assert weight_layout in ("kc", "ck"), weight_layout
+    stored = GemmLayout.parse(layout)
 
     decoded_input = _dequantize_mx(input, input_scale, input_code, block_size)
     decoded_weight = _dequantize_mx(
@@ -618,32 +628,33 @@ def linear_mx(
 
     # ``alpha`` scales the product alone, so the bias is added after it.  As
     # the hardware's GEMM does, both apply to the product summed in float32
-    # (or the input's dtype, if wider), rounded to the input's dtype once,
-    # after them.
+    # (or the input's dtype, if wider), rounded to ``out_dtype`` (or the
+    # input's dtype) once, after them.
     gemm_bias = bias if alpha is None else None
-    dtype = decoded_input.dtype
+    dtype = decoded_input.dtype if out_dtype is None else out_dtype
     if alpha is not None:
         accumulate = torch.promote_types(dtype, torch.float32)
         decoded_input = decoded_input.to(accumulate)
         decoded_weight = decoded_weight.to(accumulate)
 
-    # The operator matching the weight's storage layout: aten for the
-    # KC-native layout, the layout twin for a CK-stored weight.
-    linear = (
-        torch.ops.aten.linear
-        if weight_layout == "kc"
-        else torch.ops.quantized_ops.linear
+    # The product is computed [tokens, out], the order the bias and the
+    # outlier product add in, and stored as ``layout`` says last.
+    out = torch.ops.quantized_ops.linear(
+        decoded_input,
+        decoded_weight,
+        gemm_bias,
+        layout=str(stored._replace(output=DEFAULT_GEMM_OUTPUT)),
+        out_dtype=out_dtype,
     )
-    dense_out = linear(decoded_input, decoded_weight, gemm_bias)
 
     if alpha is not None:
-        dense_out = dense_out * alpha
+        out = out * alpha
         if bias is not None:
-            dense_out = dense_out + bias
-        dense_out = dense_out.to(dtype)
+            out = out + bias
+        out = out.to(dtype)
 
     if A_data is not None:
-        spmm_out = torch.ops.quantized_ops.spmm_csr(
+        out = out + torch.ops.quantized_ops.spmm_csr(
             A_data,
             A_indices,
             A_indptr,
@@ -651,11 +662,10 @@ def linear_mx(
             weight_scale,
             weight_code,
             block_size,
-            weight_layout,
+            stored.weight,
         )
-        return dense_out + spmm_out
 
-    return dense_out
+    return out.mT.contiguous() if stored.output != DEFAULT_GEMM_OUTPUT else out
 
 
 @torch.library.register_fake("quantized_ops::linear_mx")
@@ -665,9 +675,13 @@ def _(
     bias: torch.Tensor = None,
     **kwargs,
 ):
-    if kwargs.get("weight_layout", "kc") == "ck":
-        return torch.ops.quantized_ops.linear(input, weight, bias)
-    return torch.ops.aten.linear(input, weight, bias)
+    return torch.ops.quantized_ops.linear(
+        input,
+        weight,
+        bias,
+        layout=kwargs.get("layout", LINEAR_LAYOUT),
+        out_dtype=kwargs.get("out_dtype"),
+    )
 
 
 quantized_ops_lib.define(
@@ -675,7 +689,7 @@ quantized_ops_lib.define(
     "Tensor? weight_scale=None, int? block_size=None, Tensor? input_code=None, "
     "Tensor? weight_code=None, Tensor? alpha=None, Tensor? A_data=None, "
     "Tensor? A_indices=None, Tensor? A_indptr=None, "
-    'str weight_layout="ck") -> Tensor'
+    f'str layout="{MATMUL_LAYOUT}", ScalarType? out_dtype=None) -> Tensor'
 )
 
 
@@ -693,36 +707,37 @@ def matmul_mx(
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
-    weight_layout: str = "ck",
+    layout: str = MATMUL_LAYOUT,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    assert weight_layout in ("kc", "ck"), weight_layout
+    stored = GemmLayout.parse(layout)
 
     decoded_self = _dequantize_mx(self, input_scale, input_code, block_size)
     decoded_other = _dequantize_mx(other, weight_scale, weight_code, block_size)
 
     # As in ``linear_mx``: ``alpha`` scales the product summed in float32
-    # (or the input's dtype, if wider), rounded to the input's dtype once,
-    # after it.
-    dtype = decoded_self.dtype
+    # (or the input's dtype, if wider), rounded to ``out_dtype`` (or the
+    # input's dtype) once, after it.
+    dtype = decoded_self.dtype if out_dtype is None else out_dtype
     if alpha is not None:
         accumulate = torch.promote_types(dtype, torch.float32)
         decoded_self = decoded_self.to(accumulate)
         decoded_other = decoded_other.to(accumulate)
 
-    # The operator matching the right operand's storage layout: aten for
-    # the CK-native layout, the layout twin for KC storage.
-    matmul = (
-        torch.ops.aten.matmul
-        if weight_layout == "ck"
-        else torch.ops.quantized_ops.matmul
+    # As in ``linear_mx``: computed [tokens, out], stored as ``layout`` says
+    # last.
+    out = torch.ops.quantized_ops.matmul(
+        decoded_self,
+        decoded_other,
+        layout=str(stored._replace(output=DEFAULT_GEMM_OUTPUT)),
+        out_dtype=out_dtype,
     )
-    dense_out = matmul(decoded_self, decoded_other)
 
     if alpha is not None:
-        dense_out = (dense_out * alpha).to(dtype)
+        out = (out * alpha).to(dtype)
 
     if A_data is not None:
-        spmm_out = torch.ops.quantized_ops.spmm_csr(
+        out = out + torch.ops.quantized_ops.spmm_csr(
             A_data,
             A_indices,
             A_indptr,
@@ -730,11 +745,10 @@ def matmul_mx(
             weight_scale,
             weight_code,
             block_size,
-            weight_layout,
+            stored.weight,
         )
-        return dense_out + spmm_out
 
-    return dense_out
+    return out.mT.contiguous() if stored.output != DEFAULT_GEMM_OUTPUT else out
 
 
 @torch.library.register_fake("quantized_ops::matmul_mx")
@@ -743,9 +757,12 @@ def _(
     other: torch.Tensor,
     **kwargs,
 ):
-    if kwargs.get("weight_layout", "ck") == "kc":
-        return torch.ops.quantized_ops.matmul(self, other)
-    return torch.ops.aten.matmul(self, other)
+    return torch.ops.quantized_ops.matmul(
+        self,
+        other,
+        layout=kwargs.get("layout", MATMUL_LAYOUT),
+        out_dtype=kwargs.get("out_dtype"),
+    )
 
 
 quantized_ops_lib.define(

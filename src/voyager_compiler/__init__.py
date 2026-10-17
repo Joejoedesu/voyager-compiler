@@ -34,11 +34,14 @@ from voyager_compiler.codegen import (
     gen_compute_graph,
     inline_autocast_modules,
     match_and_fuse_rms_norm,
+    normalize_activation_layout,
+    normalize_attention_operands,
     normalize_conv2d_layout,
     normalize_gemm_weight_layout,
     pad_matrix_op_dimensions,
     pad_vector_op_dimensions,
     pad_vit_embeddings_output,
+    quantizes_kv_cache,
     remove_fp32_casts,
     remove_prunable_ops,
     remove_zero_attention_mask,
@@ -76,8 +79,10 @@ from voyager_compiler.modeling import (
     insert_align_device_nodes,
 )
 from voyager_compiler.ops.layout import (
-    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
+    GEMM_LAYOUTS,
+    GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
 )
 from voyager_compiler.quantization import (
@@ -129,6 +134,7 @@ __all__ = [
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
     "OpMatcher",
+    "Pattern",
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
@@ -161,6 +167,7 @@ __all__ = [
     "insert_align_device_nodes",
     "match_and_fuse_rms_norm",
     "merge_sibling_linears",
+    "normalize_attention_operands",
     "pad_vit_embeddings_output",
     "prepare_from_args",
     "prepare_pt2e",
@@ -170,6 +177,7 @@ __all__ = [
     "propagate_shape",
     "quantize_to_nf",
     "quantize_to_posit",
+    "quantizes_kv_cache",
     "remove_fp32_casts",
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
@@ -210,11 +218,26 @@ def _get_op_overload(op_name: str):
 
 
 class OpMatcher:
+    """One op of a fusion pattern: its targets and a check of its operands.
+
+    Args:
+        *ops: The op names it matches, every overload of each, in
+            ``aten`` and ``quantized_ops``.
+        predicate: A check of the op node, e.g. of its operands; ``None``
+            for none.
+        keeps_input: Whether the op's input, the op before it in the
+            chain, is read outside the group too: the instruction-level
+            fusion (``fuse_patterns``) fuses the chain only then, returning
+            it as a result of the group -- a reduction an instruction makes
+            of the tile it stores.
+    """
+
     targets: Tuple[torch._ops.OpOverload]
     predicate: Optional[Callable[[Node], bool]] = None
 
-    def __init__(self, *ops, predicate=None):
+    def __init__(self, *ops, predicate=None, keeps_input=False):
         self.predicate = predicate
+        self.keeps_input = keeps_input
 
         # Resolve symbolic ops
         targets = []
@@ -231,6 +254,25 @@ class OpMatcher:
         return self.predicate(node) if self.predicate else True
 
 
+class Pattern(list):
+    """A fusion pattern: the ``OpMatcher`` of each op along a producer ->
+    consumer chain, in order, and an optional name.
+
+    ``transform()`` fuses the model's own ops by unnamed patterns (a plain
+    list is one too).  A named pattern is an instruction a backend's builder
+    fuses the ops it built into (``fuse_patterns``); the fused node records
+    the name as ``meta['pattern']``, and ``model.txt`` carries it.
+
+    Args:
+        *ops: The ops' matchers, in chain order.
+        name: The instruction form the pattern is; ``None`` for none.
+    """
+
+    def __init__(self, *ops, name=None):
+        super().__init__(ops)
+        self.name = name
+
+
 def transform(
     model: torch.fx.GraphModule,
     example_args,
@@ -238,8 +280,8 @@ def transform(
     patterns=None,
     config=None,
     tensor_layout=DEFAULT_TENSOR_LAYOUT,
-    gemm_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
-    gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
+    gemm_layout=DEFAULT_GEMM_LAYOUT,
+    gemv_layout=DEFAULT_GEMM_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
     keep_fp32=True,
@@ -261,12 +303,15 @@ def transform(
             the 2-D pools and the ops connected to them read and write:
             ``"nchw"`` (channels first, PyTorch's order) or ``"nhwc"``
             (channels last, with HWIO conv weights). GEMM operands are not
-            affected; their weights follow ``gemm_weight_layout`` and
-            ``gemv_weight_layout``.
-        gemm_weight_layout: The weight layout of a matrix-matrix GEMM:
-            ``"kc"`` ([out, contraction]) or ``"ck"`` ([contraction, out]).
-        gemv_weight_layout: The weight layout of a matrix-vector GEMM (a
-            single activation row), ``"kc"`` or ``"ck"``.
+            affected; they follow ``gemm_layout`` and ``gemv_layout``.
+        gemm_layout: The layout of a matrix-matrix GEMM's activation, then
+            its weight, in C (contraction), K (output features) and X
+            (tokens): ``"xc,kc"`` (PyTorch's), ``"xc,ck"`` (the weight
+            [contraction, out]) or ``"cx,ck"`` (also the activations between
+            GEMMs [features, tokens] wherever that transposes less, for a
+            Trainium TensorE; see ``normalize_activation_layout``).
+        gemv_layout: The layout of a matrix-vector GEMM (a single activation
+            row): ``"xc,kc"`` or ``"xc,ck"``.
         skip_op_fusion: Skip operator fusion.
         fuse_reshape: Let fusion fold a trailing reshape or permute into
             its producer's output.
@@ -292,6 +337,7 @@ def transform(
     fold_constant_generators(model)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
+    normalize_attention_operands(model)
     scalarize_index_arithmetic(model)
     fuse_quantize_dequantize_with_producer(model)
 
@@ -302,7 +348,13 @@ def transform(
     if tensor_layout == "nhwc":
         normalize_conv2d_layout(model)
 
-    normalize_gemm_weight_layout(model, gemm_weight_layout, gemv_weight_layout)
+    assert gemm_layout in GEMM_LAYOUTS, gemm_layout
+    assert gemv_layout in GEMV_LAYOUTS, gemv_layout
+    gemm_activation, gemm_weight = gemm_layout.split(",")
+    gemv_weight = gemv_layout.split(",")[1]
+    normalize_gemm_weight_layout(model, gemm_weight, gemv_weight)
+    if gemm_activation == "cx":
+        normalize_activation_layout(model)
 
     if config.pe_array_size is not None:
         pad_vector_op_dimensions(model, config.vector_lanes)
@@ -327,6 +379,7 @@ def compile(
     runtime_tolerance=None,
     dram_layout=None,
     accumulate_fp32=False,
+    bool_mask=True,
 ):
     """Bufferize ``model``, plan its memory and write its ``voyager`` IR.
 
@@ -354,6 +407,9 @@ def compile(
             input freely.
         accumulate_fp32: Accumulate a GEMM split along K in float32 rather
             than its output dtype.
+        bool_mask: Store an ``is_causal`` flash attention's mask table as
+            int1 codes plus a scale; off, as the additive fill at the
+            accumulation dtype.
 
     Returns:
         The ``voyager`` IR ``Model`` written to ``model.txt``.
@@ -376,7 +432,15 @@ def compile(
     tiler = build_tiler(
         config, runtime_tolerance=tolerance, accumulate_fp32=accumulate_fp32
     )
-    bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
+    backend = config.backend()
+    bufferize_graph(
+        model,
+        pipelined=config.double_buffered_l2,
+        tiler=tiler,
+        async_pipeline=config.async_pipeline,
+        bool_mask=bool_mask,
+        builders=backend.builders,
+    )
     plan_memory(model, config, dram_layout)
     print_bufferized_graph(model)
 

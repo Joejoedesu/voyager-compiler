@@ -1401,6 +1401,8 @@ _QUANTIZED_COMPUTE_OPS = (
     "quantize_affine",
     "quantize_mx",
     "quantize_mx_outlier",
+    "rms_norm_kmajor",
+    "sdpa_kmajor",
     "sdpa_mx",
     "spmm_csr",
     "vmap",

@@ -27,6 +27,8 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
 )
 from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
+from voyager_compiler.codegen.transform.bufferize.ops import MemoryLevel
+from voyager_compiler.codegen.transform.tiling import Tiler
 
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -37,6 +39,35 @@ _WITH_SCRATCH = torch.ops.higher_order.with_scratch
 # moving ``count`` entries at run time -- as the budget's mean occupancy over
 # the example input, so the reporting model prices the bytes actually moved.
 CSR_FILL_META = "csr_fill"
+
+
+@dataclass(frozen=True)
+class BuildContext:
+    """The settings every builder may read; one per ``bufferize_graph``.
+
+    Attributes:
+        tiler: The ``Tiler`` supplying per-node tile factors, or ``None``.
+        num_slots: Buffer slots per pipelined operand (1: single-buffered).
+        async_pipeline: A pipelined GEMM (dense and sparse) / conv dispatches
+            each tile's compute asynchronously; off => the synchronous
+            ``PipelinedKernel``.
+        accumulate_fp32: A GEMM (dense and sparse) split along K accumulates
+            in float32 rather than its output dtype.
+        single_buffer_tail: Single-buffer a >1-tile reduction's output and
+            fused post-op operands.
+        flash_attention_v3: Lower attention with the FA3 pipeline; off => the
+            baseline flash-attention builder.
+        bool_mask: Store an ``is_causal`` attention's mask table as int1
+            codes plus a scale; off => the additive fill.
+    """
+
+    tiler: Optional[Tiler]
+    num_slots: int
+    async_pipeline: bool
+    accumulate_fp32: bool
+    single_buffer_tail: bool
+    flash_attention_v3: bool
+    bool_mask: bool
 
 
 def effect_cond(
@@ -169,6 +200,12 @@ class _InputSpec:
                        sweep with a single buffer).  Builder-set only where
                        exit-only use is provable; default ``False`` =
                        wait-at-entry.
+      ``load``         issues the tile's copy in place of ``voyager.async_copy``
+                       (``_BufferedRef._load_tile``): called with what
+                       ``load_buffers`` returned, the slot, then
+                       ``async_copy``'s arguments; ``None`` => the DMA.
+      ``load_buffers`` ``() -> buffers`` of ``load``, called once before
+                       the loop.
     """
 
     tile_sizes: Tuple[int, ...]
@@ -181,6 +218,8 @@ class _InputSpec:
     transposed: bool = False
     num_slots: Optional[int] = None
     first_use_at_exit: bool = False
+    load: Optional[Callable] = None
+    load_buffers: Optional[Callable] = None
 
 
 @dataclass
@@ -221,12 +260,12 @@ class _OutputSpec:
 
 @dataclass(frozen=True)
 class _ScratchSpec:
-    """A persistent on-chip SRAM scratch ref — a third class of SRAM object
-    next to input / output slots.  Unlike them it is *local state*: allocated
-    once and reused every grid step, not DMA-managed, and not carried in the
-    loop state.  The kernel mutates it in place (e.g. a tiled-reduction
-    accumulator).  Mirrors Pallas's ``scratch_shapes`` appended after the
-    normal input/output refs.
+    """A persistent on-chip scratch ref — a third class of on-chip object
+    next to the SRAM input / output slots.  Unlike them it is *local state*:
+    allocated once and reused every grid step, not DMA-managed, and not
+    carried in the loop state.  The kernel mutates it in place (e.g. a
+    tiled-reduction accumulator).  Mirrors Pallas's ``scratch_shapes``
+    appended after the normal input/output refs.
 
     ``num_slots == 2`` double-buffers the scratch in the async pipeline: its
     lifetime is one output tile, so the scheduler hands the kernel the slot
@@ -234,12 +273,18 @@ class _ScratchSpec:
     the out slots rotate.  No synchronization is added — the lagged retire
     already orders a slot's reuse (tile ``t + 2``) behind the finalize that
     last read it (tile ``t``), because a commit is dispatched only after
-    every commit two steps back has been observed complete.
+    every commit two steps back has been observed complete.  The synchronous
+    pipeline hands the kernel all ``num_slots`` slots, and the kernel picks
+    the one each of its ops uses.
+
+    ``space`` is the ``MemoryLevel`` the scratch is allocated in: the SRAM
+    scratchpad, or a ``LOCAL`` buffer beside the array.
     """
 
     shape: Tuple[int, ...]
     dtype: torch.dtype
     num_slots: int = 1
+    space: int = MemoryLevel.SRAM
 
 
 def _compute_input_spec(
@@ -511,20 +556,20 @@ def _unpack_scratch_results(gm: torch.fx.GraphModule) -> None:
     """Make each ``with_scratch`` returning one value return it bare rather
     than as the one-element tuple export traces, recursing into every
     subgraph, so the op it wraps is stored straight from the region with no
-    ``getitem`` between."""
+    ``getitem`` between.  A region body several ``with_scratch`` share is
+    unpacked once."""
     for n in list(gm.graph.nodes):
         if n.op == "get_attr":
             sub = getattr(gm, str(n.target), None)
             if isinstance(sub, torch.fx.GraphModule):
                 _unpack_scratch_results(sub)
-        if n.target is not _WITH_SCRATCH:
+        if n.target is not _WITH_SCRATCH or len(n.meta["val"]) != 1:
             continue
         sub = getattr(gm, str(n.args[0].target))
         output = next(x for x in sub.graph.nodes if x.op == "output")
-        if len(output.args[0]) != 1:
-            continue
-        output.args = (output.args[0][0],)
-        sub.recompile()
+        if isinstance(output.args[0], (tuple, list)):
+            output.args = (output.args[0][0],)
+            sub.recompile()
         n.meta["val"] = n.meta["val"][0]
         for user in list(n.users):
             user.replace_all_uses_with(n)

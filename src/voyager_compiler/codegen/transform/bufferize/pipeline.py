@@ -10,6 +10,7 @@ slot, calls ``kernel(grid_index, *in_slots, *out_slots)`` which writes each
 output SRAM slot, then stores each out slot to DRAM.
 """
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -24,6 +25,8 @@ from voyager_compiler.codegen.node_info import (
     ancestors,
     bound_operands,
     compute_output_tiled_shapes,
+    gemm_input_shape,
+    gemm_output_shape,
     get_anchor_node,
     get_arg_value,
     is_bmm,
@@ -32,6 +35,7 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_reshape_op,
     quant_param_arg_nodes,
+    reads_kmajor,
     reduced_input_grid,
     reduced_input_tiling,
     relayout_view_shape,
@@ -39,6 +43,7 @@ from voyager_compiler.codegen.node_info import (
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
+    writes_transposed,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
@@ -47,6 +52,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     with_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    BuildContext,
     _build_fused_gm,
     _compute_input_spec,
     _finalize_exported_gm,
@@ -192,7 +198,14 @@ class _BufferedRef:
     _OUT = "out"
 
     def __init__(
-        self, kind, spec, grid, num_slots, slots, async_pipeline=False
+        self,
+        kind,
+        spec,
+        grid,
+        num_slots,
+        slots,
+        async_pipeline=False,
+        load_buffers=None,
     ):
         self.kind = kind
         self.spec = spec
@@ -203,6 +216,8 @@ class _BufferedRef:
         # Prefetch distance (blocks ahead).
         self.D = max(0, num_slots - 2) if async_pipeline else num_slots - 1
         self.slots = slots  # SRAM window: [num_slots, *tile_sizes]
+        # What ``spec.load_buffers`` made for ``spec.load``, if anything.
+        self.load_buffers = load_buffers
         # Per-slot async-DMA semaphore ([num_slots] int64).  An async
         # output store-sem starts with one credit per slot (``fill(1)``) so each
         # slot's first use has a token to consume — the commit always waits the
@@ -293,12 +308,16 @@ class _BufferedRef:
 
     # --- DMA (input loads / output stores) ----------------------------------
 
-    def _load_tile(self, src, dst, grid_idx, sem, post_count=1):
-        """Async-DMA ``src``'s tile at ``grid_idx`` into SRAM ``dst``, carrying
-        the input halo (``strides`` / ``pad`` / ``pad_value``) and signaling the
-        load semaphore ``sem`` ``post_count`` times (a reused block posts once
-        per per-step consumer — see ``AsyncPipelinedKernel``).
+    def _load_tile(self, src, slot, grid_idx, post_count=1):
+        """Async-DMA ``src``'s tile at ``grid_idx`` into SRAM slot ``slot``,
+        carrying the input halo (``strides`` / ``pad`` / ``pad_value``) and
+        signaling the slot's load semaphore ``post_count`` times (a reused
+        block posts once per per-step consumer — see
+        ``AsyncPipelinedKernel``).  A spec with a ``load`` issues the copy
+        itself.
         """
+        dst = get_slot(self.slots, slot)
+        sem = get_slot(self.sem, slot)
         spec = self.spec
         dims, indices = self._block_address(grid_idx)
         sizes, strides = spec.tile_sizes, spec.strides
@@ -319,7 +338,10 @@ class _BufferedRef:
             else:
                 a, b = len(spec.index_map) - 2, len(spec.index_map) - 1
                 dims = [b if d == a else a if d == b else d for d in dims]
-        voyager.async_copy(
+        copy = voyager.async_copy
+        if spec.load is not None:
+            copy = functools.partial(spec.load, self.load_buffers, slot)
+        copy(
             src,
             dst,
             indices,
@@ -382,13 +404,7 @@ class _BufferedRef:
             idx = self._unravel(p)
             if p == 0 or self._indices_differ(prev_idx, idx):
                 slot = num_copies % self.num_slots
-                self._load_tile(
-                    src,
-                    get_slot(self.slots, slot),
-                    idx,
-                    get_slot(self.sem, slot),
-                    post_count,
-                )
+                self._load_tile(src, slot, idx, post_count)
                 num_copies += 1
             prev_idx = idx
         if self._advances_every_step():
@@ -429,13 +445,7 @@ class _BufferedRef:
         torch._check(copy_slot < self.slots.size(0))
         effect_cond(
             should_copy,
-            lambda: self._load_tile(
-                src,
-                get_slot(self.slots, copy_slot),
-                w.fetch_idx,
-                get_slot(self.sem, copy_slot),
-                post_count,
-            ),
+            lambda: self._load_tile(src, copy_slot, w.fetch_idx, post_count),
         )
         return next_count
 
@@ -675,6 +685,11 @@ class PipelinedKernel(torch.nn.Module):
             voyager.alloc(s.tile_sizes, s.dtype, _SRAM, num_slots=c)
             for s, c in zip(self.out_specs, out_counts)
         ]
+        # What a spec's own ``load`` copies through, made before the loop.
+        load_buffers = [
+            s.load_buffers() if s.load_buffers is not None else None
+            for _, s in tiled
+        ]
         # Per-operand schedulers: each owns its SRAM window (slot) and
         # allocates its own per-slot semaphore.
         in_refs = [
@@ -685,8 +700,11 @@ class PipelinedKernel(torch.nn.Module):
                 c,
                 slots,
                 async_pipeline=self._async_pipeline,
+                load_buffers=buffers,
             )
-            for (inp, s), c, slots in zip(tiled, in_counts, in_slots)
+            for (inp, s), c, slots, buffers in zip(
+                tiled, in_counts, in_slots, load_buffers
+            )
         ]
         out_refs = [
             _BufferedRef(
@@ -699,15 +717,15 @@ class PipelinedKernel(torch.nn.Module):
             )
             for s, c, slots in zip(self.out_specs, out_counts, out_slots)
         ]
-        # Scratch refs, captured like ``out_slots``.  A double-buffered
-        # scratch (``_ScratchSpec.num_slots``, async only) allocates slotted
-        # like any pipelined buffer; the plain accumulator keeps the
-        # unslotted alloc, reused immediately for the next tile's reduction.
+        # Scratch refs, captured like ``out_slots``.  A scratch of several
+        # slots (``_ScratchSpec.num_slots``) allocates slotted like any
+        # pipelined buffer; the plain accumulator keeps the unslotted alloc,
+        # reused immediately for the next tile's reduction.
         scratch_bufs = tuple(
             (
-                voyager.alloc(s.shape, s.dtype, _SRAM, num_slots=s.num_slots)
-                if self._async_pipeline and s.num_slots > 1
-                else voyager.alloc(s.shape, s.dtype, _SRAM)
+                voyager.alloc(s.shape, s.dtype, s.space, num_slots=s.num_slots)
+                if s.num_slots > 1
+                else voyager.alloc(s.shape, s.dtype, s.space)
             )
             for s in self.scratch_specs
         )
@@ -1301,9 +1319,13 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         nb = anchor.value.ndim - 2
         order = l3_order or GEMM_L3_ORDER
         grid_m, grid_n = (nb + order.index(d) for d in GEMM_L3_ORDER)
-        out_index_map = tuple(range(nb)) + (grid_m, grid_n)
-        # gemm (batch.., n_m, n_n, n_k) -> drop K
-        out_tiling = tiling[:-1] if tiling is not None else None
+        # gemm (batch.., n_m, n_n, n_k) -> drop K; a transposed output
+        # stores N before M.
+        odims = None
+        if writes_transposed(anchor):
+            odims = tuple(range(nb)) + (nb + 1, nb)
+        out_index_map = project(tuple(range(nb)) + (grid_m, grid_n), odims)
+        out_tiling = project(tiling[:-1], odims) if tiling is not None else None
 
     anchor_prelude = ancestors(anchor)
     fused_ops = []
@@ -1994,25 +2016,27 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
             (``None`` for a whole-loaded operand, dropped exactly as
             ``_allocate`` drops it).
         out_specs: The nest's output specs — the partition's output member.
-        scratch_specs: The nest's scratch specs — they all share the
-            partition's scratch group.
+        scratch_specs: The nest's scratch specs — the SRAM ones all share
+            the partition's scratch group; any other has no SRAM alloc.
 
     Returns:
         One group index (or ``None`` = loose) per SRAM slot alloc — the
-        non-``None`` ``in_specs`` entries, the outputs, then the scratch —
-        i.e. ``build_pipelined_buffers``'s ``bank_groups`` argument.
+        non-``None`` ``in_specs`` entries, the outputs, then the SRAM
+        scratch — i.e. ``build_pipelined_buffers``'s ``bank_groups``
+        argument.
     """
     ordered = [s for s in in_specs if s is not None] + list(out_specs)
     index_of = {id(s): i for i, s in enumerate(ordered)}
     assigned = [None] * len(ordered)
     scratch_group = None
+    num_sram_scratch = sum(s.space == _SRAM for s in scratch_specs)
 
     anchor = get_anchor_node(node)
     result = node.meta.get("tile_result")
     if result is None:
         result = anchor.meta.get("tile_result")
     if result is None or result.placement.groups is None:
-        return assigned + [None] * len(scratch_specs)
+        return assigned + [None] * num_sram_scratch
 
     node_specs = {n: spec for n, spec in zip(node.all_input_nodes, in_specs)}
 
@@ -2029,7 +2053,7 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
                     tag(spec, group)
             else:
                 tag(node_specs.get(resolve(member, node, anchor)), group)
-    return assigned + [scratch_group] * len(scratch_specs)
+    return assigned + [scratch_group] * num_sram_scratch
 
 
 # Sentinel for ``_gemm_scratch_and_kernel``'s ``split``: classify the tail
@@ -2169,14 +2193,20 @@ def _gemm_scratch_and_kernel(
             # A single round stages its finished tile, not a running
             # partial: the scratch holds the output's own dtype.
             acc_dtype = out_dtype
-        # Only a tail that reads scratch after the streamed pass gains a
-        # second slot; a chained-whole tail never races and keeps one.  The
-        # count is the search's placement (the scratch ladder winner) unless
-        # the caller holds the scratch to one slot.
-        sync = not split_k_tail_fusible or split is not None
+        # Only an async tail that reads scratch after the streamed pass gains
+        # a second slot, which the scheduler rotates per tile; a
+        # chained-whole tail never races and keeps one.  The count is the
+        # search's placement (the scratch ladder winner) unless the caller
+        # holds the scratch to one slot.
+        reads_scratch = not split_k_tail_fusible or split is not None
         tile_result = anchor.meta.get("tile_result")
         slots = 1
-        if sync and not single_scratch_slot and tile_result is not None:
+        if (
+            async_pipeline
+            and reads_scratch
+            and not single_scratch_slot
+            and tile_result is not None
+        ):
             slots = tile_result.placement.scratch_slots
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(
@@ -2218,14 +2248,8 @@ def _stamp_anchor_meta(gm, anchor) -> None:
 
 
 def build_conv2d(
-    node,
-    *,
-    num_slots: int = _DEFAULT_NUM_SLOTS,
-    accumulate_fp32: bool = False,
-    single_buffer_tail: bool = False,
-    async_pipeline: bool = True,
-    tiler=None,
-):
+    node: torch.fx.Node, ctx: BuildContext, *, accumulate_fp32: bool = False
+) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for a conv2d (groups=1) node — incl. the microscaling /
     codebook (``conv2d_mx``) variant, a fused bias, and the systolic NHWC layout
     — over the input-channel (C) cross-tile reduction.  A map over the (N, K,
@@ -2236,11 +2260,11 @@ def build_conv2d(
     projected onto each operand's physical order (``meta["transposed"]`` selects
     NHWC + HWIO).  Returns the gm or ``None``.
     """
-    info = parse_fused_submodule(node, tiler)
+    info = parse_fused_submodule(node, ctx.tiler)
     if info is not None:
         tiling, l3_order = info.tiling, info.l3_order
     else:
-        tiling, l3_order = get_tiling(node, tiler)
+        tiling, l3_order = get_tiling(node, ctx.tiler)
     if info is None and tiling is None:
         return None
     anchor = info.anchor if info is not None else node
@@ -2420,7 +2444,7 @@ def build_conv2d(
         in_tile = in_tiles[in_idx]
         w_tile = in_tiles[w_idx]
         kw = {name: in_tiles[i] for name, i in kw_idx.items()}
-        kw.update(scalar_kwargs)  # block_size / weight_layout / ...
+        kw.update(scalar_kwargs)  # block_size / layout / ...
         bias = in_tiles[bias_idx] if (bias_idx is not None and first) else None
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
@@ -2435,8 +2459,8 @@ def build_conv2d(
         fused_idx=fused_idx,
         anchor=anchor,
         accumulate_fp32=accumulate_fp32,
-        async_pipeline=async_pipeline,
-        single_buffer_tail=single_buffer_tail,
+        async_pipeline=ctx.async_pipeline,
+        single_buffer_tail=ctx.single_buffer_tail,
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
         split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
@@ -2447,8 +2471,8 @@ def build_conv2d(
         out_specs,
         tuple(inputs),
         scratch_specs=scratch_specs,
-        num_slots=num_slots,
-        async_pipeline=async_pipeline,
+        num_slots=ctx.num_slots,
+        async_pipeline=ctx.async_pipeline,
         bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
     )
     if num_k > 1 or info is not None:
@@ -2468,11 +2492,22 @@ class _GemmPlan:
         grid: Tile counts, batch dims then M/N in ``l3_order`` then K.
         grid_dims: Grid dims the row / column / reduction tiles run along.
         tile_k: Columns one reduction step spans.
-        acc_shape: The accumulator tile, batch dims then ``(tile_m, tile_n)``.
+        acc_shape: The accumulator tile, batch dims then ``(tile_m, tile_n)``,
+            or ``(tile_n, tile_m)`` when ``out_transposed``.
+        out_transposed: Whether the anchor ``writes_transposed``, kept here
+            for the kernels traced from the plan, which cannot read the
+            anchor's arguments.
         inputs: Operand values in ``node.all_input_nodes`` order.
         in_specs: One block spec per operand, ``None`` for a whole-tensor one.
         out_specs: The group's outputs.
         kw_idx: Operand index of each tensor kwarg the op takes.
+        activation_idx: Operand indices of the tiles the activation is
+            computed from: its own, or the prologue's operands.
+        bias_idx: Operand index of the bias, or ``None``.
+        activation: ``(in_tiles) -> tile``, the activation of one step: its
+            operand's tile, or the prologue run on its operands' tiles.
+        weight: ``(in_tiles) -> tile``, the weight of one step, decoded
+            when it is packed.
         gemm_kernel: ``(in_tiles, first) -> tile``, the GEMM (plus any
             activation prologue and weight decode) on one step; ``first``
             says whether the bias folds in.
@@ -2486,10 +2521,15 @@ class _GemmPlan:
     grid_dims: Tuple[int, int, int]
     tile_k: int
     acc_shape: Tuple[int, ...]
+    out_transposed: bool
     inputs: Tuple[torch.Tensor, ...]
     in_specs: List[Optional[_InputSpec]]
     out_specs: List[_OutputSpec]
     kw_idx: dict
+    activation_idx: List[int]
+    bias_idx: Optional[int]
+    activation: Callable
+    weight: Callable
     gemm_kernel: Callable
     fused_gm: Optional[torch.nn.Module]
     fused_idx: List[int]
@@ -2498,12 +2538,12 @@ class _GemmPlan:
     @property
     def tile_m(self) -> int:
         """Rows one output tile spans."""
-        return self.acc_shape[-2]
+        return self.acc_shape[-1 if self.out_transposed else -2]
 
     @property
     def tile_n(self) -> int:
         """Columns one output tile spans."""
-        return self.acc_shape[-1]
+        return self.acc_shape[-2 if self.out_transposed else -1]
 
     @property
     def num_k(self) -> int:
@@ -2556,17 +2596,23 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     if not isinstance(out, torch.Tensor) or act.ndim < 2 or weight.ndim < 2:
         return None
 
-    M, K, N = act.shape[-2], act.shape[-1], out.shape[-1]
+    # The grid is in logical M / N / K; a GEMM of layout "cx,ck" stores its
+    # activation [K, M], and of "cx,ck,kx" its output [N, M] too, so the
+    # specs swap those dims.
+    kmajor, out_transposed = reads_kmajor(anchor), writes_transposed(anchor)
+    out_shape = gemm_output_shape(anchor)
+    M, K = gemm_input_shape(anchor)[-2:]
+    N = out_shape[-1]
     if tiling is None:
         # A BMM keeps its batch dims as per-element tiles (size 1)
         if is_bmm(anchor):
-            out_ts = (1,) * (out.ndim - 2) + tuple(out.shape[-2:])
+            out_ts = (1,) * (out.ndim - 2) + tuple(out_shape[-2:])
         else:
-            out_ts = tuple(out.shape)
+            out_ts = tuple(out_shape)
         nk = 1
     else:
         out_tiling, nk = tiling[:-1], tiling[-1]  # batch.. + (n_m, n_n) , n_k
-        out_ts = tuple(s // t for s, t in zip(out.shape, out_tiling))
+        out_ts = tuple(s // t for s, t in zip(out_shape, out_tiling))
     # A sparse GEMM must split K exactly as its CSR was produced -- column
     # indices are local to a slice and the engine cannot rebase them -- so it
     # overrides the tile search along that one dim.
@@ -2619,7 +2665,11 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
             tuple(bb) + (False, False),
         )
 
-    act_spec = _spec(act.shape, (tm, tk), (gm, gk))
+    # The activation's trailing (M, K) block, stored (K, M) when K-major.
+    act_block, act_dims = (
+        ((tk, tm), (gk, gm)) if kmajor else ((tm, tk), (gm, gk))
+    )
+    act_spec = _spec(act.shape, act_block, act_dims)
     act_spec.transposed = act_transposed
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
     weight_spec.transposed = weight_transposed
@@ -2627,11 +2677,14 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     bias_spec = _InputSpec((tn,), (gn,), (False,))
     # The output(s) tile onto the M/N grid dims (K reduction ``gk`` dropped); a
     # fused op may produce several (``quantize_mx``).
-    out_index_map = tuple(range(nb)) + (gm, gn)
+    out_mn, tile_mn = (
+        ((gn, gm), (tn, tm)) if out_transposed else ((gm, gn), (tm, tn))
+    )
+    out_index_map = tuple(range(nb)) + out_mn
     if info is None:
         out_specs = [
             _OutputSpec(
-                tuple(out.shape), tuple(tb) + (tm, tn), out_index_map, out.dtype
+                tuple(out.shape), tuple(tb) + tile_mn, out_index_map, out.dtype
             )
         ]
     else:
@@ -2655,8 +2708,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
             and any(n in op.all_input_nodes for op in prologue)
         ]
         act_counts = tuple(b // t for b, t in zip(out_batch, tb))
-        act_counts += (M // tm, K // tk)
-        act_map = tuple(range(nb)) + (gm, gk)
+        act_counts += tuple(s // t for s, t in zip(act.shape[-2:], act_block))
+        act_map = tuple(range(nb)) + act_dims
         for p in pro_phs:
             spec = _compute_input_spec(act_counts, tuple(p.shape), act_map)
             node_to_spec[src(p)] = (p.value.clone(), spec)
@@ -2803,35 +2856,42 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     op = anchor.target
     num_k = K // tk  # reduction tiles (grid extent along ``gk``)
 
+    def activation(in_tiles):
+        """The activation tile: its operand's, or the prologue's result."""
+        if pro_gm is None:
+            return in_tiles[act_idx]
+        # Compute the activation tile from its operands' tiles -- the graph's
+        # own ops, on tiles, like the weight decode below.
+        return pro_gm(*(in_tiles[i] for i in pro_idx))
+
+    def weight(in_tiles):
+        """The weight tile, decoded when it is packed."""
+        weight_tile = in_tiles[weight_idx]
+        if dq_target is None:
+            return weight_tile
+        # Decode the packed tile in place of the weight -- the same call the
+        # graph made, on tiles.  The group fuses it into the GEMM's kernel, so
+        # it stores nothing of its own.
+        args = list(dq_args)
+        args[0] = weight_tile
+        for i, j in dq_idx.items():
+            args[i] = in_tiles[j]
+        return dq_target(*args)
+
     def gemm_kernel(in_tiles, first):
         """The bare GEMM op on the current tiles, by canonical index.  On the
         ``first`` reduction step the bias folds straight in; later steps only
         accumulate partials, which must not re-add it.
         """
-        if pro_gm is None:
-            act_tile = in_tiles[act_idx]
-        else:
-            # Compute the activation tile from its operands' tiles -- the
-            # graph's own ops, on tiles, like the weight decode below.
-            act_tile = pro_gm(*(in_tiles[i] for i in pro_idx))
-        weight_tile = in_tiles[weight_idx]
-        if dq_target is not None:
-            # Decode the packed tile in place of the weight -- the same call the
-            # graph made, on tiles.  The group fuses it into the GEMM's kernel,
-            # so it stores nothing of its own.
-            args = list(dq_args)
-            args[0] = weight_tile
-            for i, j in dq_idx.items():
-                args[i] = in_tiles[j]
-            weight_tile = dq_target(*args)
+        act_tile, weight_tile = activation(in_tiles), weight(in_tiles)
         kw = {name: in_tiles[i] for name, i in kw_idx.items()}
-        kw.update(scalar_kwargs)  # block_size / weight_layout / ...
+        kw.update(scalar_kwargs)  # block_size / layout / ...
         if bias_idx is None:
             return op(act_tile, weight_tile, **kw)
         bias = in_tiles[bias_idx] if first else None
         return op(act_tile, weight_tile, bias, **kw)
 
-    acc_shape = tuple(tb) + (tm, tn)
+    acc_shape = tuple(tb) + tile_mn
     _stamp_tail_shapes(
         fused_gm, acc_shape, anchor.value.dtype, inputs, in_specs, fused_idx
     )
@@ -2842,10 +2902,15 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         grid_dims=(gm, gn, gk),
         tile_k=tk,
         acc_shape=acc_shape,
+        out_transposed=out_transposed,
         inputs=tuple(inputs),
         in_specs=in_specs,
         out_specs=out_specs,
         kw_idx=kw_idx,
+        activation_idx=[act_idx] if pro_gm is None else pro_idx,
+        bias_idx=bias_idx,
+        activation=activation,
+        weight=weight,
         gemm_kernel=gemm_kernel,
         fused_gm=fused_gm,
         fused_idx=fused_idx,
@@ -2854,21 +2919,15 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
 
 
 def build_gemm(
-    node,
-    *,
-    num_slots: int = _DEFAULT_NUM_SLOTS,
-    accumulate_fp32: bool = False,
-    single_buffer_tail: bool = False,
-    async_pipeline: bool = True,
-    tiler=None,
-):
+    node: torch.fx.Node, ctx: BuildContext
+) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for a linear / matmul / batched-matmul node — incl. the
     microscaling / codebook (``*_mx``) variants and a fused bias — over the
     cross-tile K reduction.  Grid ``(M, N, K)`` (or ``(B, M, N, K)``) tiles with
     K innermost; the kernel accumulates ``act_tile @ weight_tile`` into the
     output slot.  Returns the gm, or ``None``.
     """
-    plan = _gemm_plan(node, tiler)
+    plan = _gemm_plan(node, ctx.tiler)
     if plan is None:
         return None
 
@@ -2882,9 +2941,9 @@ def build_gemm(
         out_specs=plan.out_specs,
         fused_idx=plan.fused_idx,
         anchor=plan.anchor,
-        accumulate_fp32=accumulate_fp32,
-        async_pipeline=async_pipeline,
-        single_buffer_tail=single_buffer_tail,
+        accumulate_fp32=ctx.accumulate_fp32,
+        async_pipeline=ctx.async_pipeline,
+        single_buffer_tail=ctx.single_buffer_tail,
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
         split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
@@ -2895,8 +2954,8 @@ def build_gemm(
         plan.out_specs,
         plan.inputs,
         scratch_specs=scratch_specs,
-        num_slots=num_slots,
-        async_pipeline=async_pipeline,
+        num_slots=ctx.num_slots,
+        async_pipeline=ctx.async_pipeline,
         bank_groups=_bank_group_list(
             node, plan.in_specs, plan.out_specs, scratch_specs
         ),
@@ -2933,7 +2992,9 @@ def _apply_relayout(node, *seqs, invert=False):
     return tuple(tuple(s[p] for p in perm) for s in seqs)
 
 
-def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
+def build_pointwise(
+    node: torch.fx.Node, ctx: BuildContext
+) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·rmsnorm·softmax whose reduction dim is kept whole in the
     tile, and a standalone ``transpose`` / ``permute`` relayout).  Tiles the
@@ -2947,7 +3008,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     declaration.  Returns the gm, or ``None``.
     """
     anchor = get_anchor_node(node)
-    tiling = vector_op_tiling(node, tiler)
+    tiling = vector_op_tiling(node, ctx.tiler)
 
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
@@ -2965,9 +3026,10 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         if isinstance(node.value, (list, tuple))
         else [tiled_shape]
     )
-    # The regions the backend keeps beside the op, handed to it by name.
-    scratch = tiler.model.kernel_scratch(node, tiled_shape)
-    scratch_names = [name for name, _, _ in scratch]
+    # The regions the backend keeps beside the op, as its search placed
+    # them, handed to it by name.
+    scratch = node.meta["tile_result"].placement.scratch
+    scratch_names = [name for name, *_ in scratch]
 
     if node.op == "call_module":
         submod = node.meta.get("submodule")
@@ -3048,7 +3110,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
+    scratch_specs = [_ScratchSpec(*region[1:]) for region in scratch]
     if is_full_reduction(anchor):
         # Each tile's max, beside the running one.
         scratch_specs.append(_ScratchSpec((), outputs[-1].dtype))
@@ -3062,7 +3124,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         out_specs,
         tuple(inputs),
         scratch_specs=scratch_specs,
-        num_slots=num_slots,
+        num_slots=ctx.num_slots,
         bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
     )
 
@@ -3078,7 +3140,9 @@ _POOL2D_SUPPORTED = {
 }
 
 
-def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
+def build_pool(
+    node: torch.fx.Node, ctx: BuildContext
+) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for a 2-D max/avg pool node, bare or fused with post-op
     pointwise ops: a map over the (N, C, oH, oW) output grid whose input tile is
     a strided receptive-field halo (boundary padding folded into the load), so
@@ -3094,7 +3158,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
 
-    tiling = pool_op_tiling(node, tiler)
+    tiling = pool_op_tiling(node, ctx.tiler)
     if node.op != "call_module" and tiling is None:
         return None
 
@@ -3127,6 +3191,12 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
 
     kH, kW = _pair(kernel_size)
     sh, sw = _pair(stride) if stride else (kH, kW)
+    # The regions the backend keeps beside the pool, as its search placed
+    # them, handed to it by name.
+    result = node.meta.get("tile_result")
+    scratch = result.placement.scratch if result is not None else ()
+    scratch_names = [name for name, *_ in scratch]
+    scratch_specs = [_ScratchSpec(*region[1:]) for region in scratch]
     ph, pw = _pair(padding)
     dh, dw = _pair(dilation)
 
@@ -3155,19 +3225,27 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         # ``compute`` — dynamo can't trace an FX-node attribute read.
         extra = tuple(anchor.args[4:])
 
-        def compute(tile):
+        def pool(tile):
             # Padding zeroed (folded into the halo load).
             return anchor.target(tile, [kH, kW], [sh, sw], [0, 0], *extra)
 
-        kernel = _single_pass_kernel(compute, 1)
+        def compute(tile, *regions):
+            if not regions:
+                return pool(tile)
+            return with_scratch(pool, [tile], dict(zip(scratch_names, regions)))
+
+        kernel = _single_pass_kernel(compute, 1, len(scratch_specs))
         return build_pipelined_buffers(
             kernel,
             grid,
             [in_spec],
             out_specs,
             (input_t,),
-            num_slots=num_slots,
-            bank_groups=_bank_group_list(node, [in_spec], out_specs),
+            scratch_specs=scratch_specs,
+            num_slots=ctx.num_slots,
+            bank_groups=_bank_group_list(
+                node, [in_spec], out_specs, scratch_specs
+            ),
         )
 
     # Fused: run the whole submodule per tile.  The pool's input loads the halo;
@@ -3209,7 +3287,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         in_specs,
         out_specs,
         tuple(inputs),
-        num_slots=num_slots,
+        num_slots=ctx.num_slots,
         bank_groups=_bank_group_list(node, in_specs, out_specs),
     )
     outline_dps_ops(gm)

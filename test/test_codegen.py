@@ -53,7 +53,14 @@ def model_input_name(gm):
     return next(n.name for n in gm.graph.nodes if n.op == "placeholder")
 
 
-MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
+MXU_OPS = [
+    "conv2d",
+    "linear",
+    "matmul",
+    "conv2d_mx",
+    "linear_mx",
+    "matmul_mx",
+]
 QUANT_OPS = [
     "quantize",
     "quantize_mx",
@@ -76,7 +83,7 @@ GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 OUTPUT_RTOL = 5e-2
 OUTPUT_ATOL = 1e-4
 
-VECTOR_PIPELINE = [
+FUSION_PATTERNS = [
     [
         OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
@@ -92,7 +99,7 @@ VECTOR_PIPELINE = [
         OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
-        OpMatcher("layer_norm", "rms_norm", "softmax"),
+        OpMatcher("layer_norm", "rms_norm", "rms_norm_kmajor", "softmax"),
         OpMatcher(*QUANT_OPS),
     ],
 ]
@@ -301,7 +308,7 @@ def main():
                 model=model,
                 quantizer=quantizer,
                 calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
+                fusion_patterns=FUSION_PATTERNS,
                 args=args,
             )
         )
@@ -336,7 +343,7 @@ def main():
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=VECTOR_PIPELINE,
+            fusion_patterns=FUSION_PATTERNS,
             args=args,
         )
 
@@ -361,14 +368,14 @@ def main():
         if args.training:
             inputs = {k: torch.tensor([v]) for k, v in train_dataset[0].items()}
             gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args, quantizer
+                model, inputs, FUSION_PATTERNS, args, quantizer
             )
         else:
             gm, old_output, new_output = bert.quantize_and_dump_model(
                 model=model,
                 quantizer=quantizer,
                 calibration_data=train_dataset,
-                vector_stages=VECTOR_PIPELINE,
+                fusion_patterns=FUSION_PATTERNS,
                 args=args,
             )
 
@@ -391,14 +398,14 @@ def main():
                 llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
             )
             gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args, quantizer
+                model, inputs, FUSION_PATTERNS, args, quantizer
             )
         else:
             gm, old_output, new_output = llama.quantize_and_dump_model(
                 model=model,
                 tokenizer=tokenizer,
                 quantizer=quantizer,
-                vector_stages=VECTOR_PIPELINE,
+                fusion_patterns=FUSION_PATTERNS,
                 args=args,
             )
     elif args.model == "vit":
@@ -416,7 +423,7 @@ def main():
                 model=model,
                 quantizer=quantizer,
                 calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
+                fusion_patterns=FUSION_PATTERNS,
                 args=args,
             )
         )

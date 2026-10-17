@@ -2,10 +2,15 @@
 
 Runs in the ``trn`` env, by path, on a CPU-only machine:
 
-    python trace.py <dir> --phase {prefill,decode} [--target trn2]
+    python trace.py <dir> --phase {prefill,decode} [--target trn2] \
+        [--weights-from <HF model>]
 
 Writes ``<dir>/step/``: ``step.pt``, the traced module a NeuronCore runs
-(``run.py``), and its NEFF.  The kernels become NKI custom calls and the
+(``run.py``), and its NEFF.  With ``--weights-from <HF model>``, every
+weight that is a tensor of that checkpoint, as stored or transposed, is left
+out of ``step.pt``: ``weights.json`` names its source for ``run.py`` to
+rebuild it from the host's copy, and the other weights go to
+``extra.safetensors``.  The kernels become NKI custom calls and the
 host ops XLA ops of the same graph, so one launch runs the whole step, as
 NxD Inference runs a prefill or a decode step, with its compiler flags and
 decoder-layer markers.  Weights are the module's parameters, kept out of the
@@ -19,10 +24,13 @@ import os
 
 import torch
 import torch_neuronx
+from huggingface_hub import snapshot_download
 from neuronx_distributed_inference.models.layer_boundary_marker import (
     ModuleMarkerEndWrapper,
     ModuleMarkerStartWrapper,
 )
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 MARKERS = {"start": ModuleMarkerStartWrapper(), "end": ModuleMarkerEndWrapper()}
 
@@ -110,7 +118,71 @@ class Step(torch.nn.Module):
         return (marked,) if isinstance(marked, torch.Tensor) else tuple(marked)
 
 
-def main(directory, phase, target):
+def checkpoint_sources(params, model):
+    """Each of ``params`` that is a tensor of HF checkpoint ``model``, as
+    ``{name: (key, transposed)}``, checked bit for bit: same shape, dtype
+    and values.
+
+    A parameter's name is the checkpoint key with ``.`` as ``_``, behind any
+    number of ``model_`` scopes, and a ``_t`` suffix when it is that tensor
+    transposed (``model_layers_0_self_attn_q_proj_weight_t`` is
+    ``model.layers.0.self_attn.q_proj.weight``, transposed).
+    """
+    path = snapshot_download(model, allow_patterns=["*.json"])
+    with open(os.path.join(path, "model.safetensors.index.json")) as f:
+        files = json.load(f)["weight_map"]
+    keys = {key.replace(".", "_"): key for key in files}
+    sources = {}
+    for name, tensor in params.items():
+        transposed = name.endswith("_t")
+        stem = name[:-2] if transposed else name
+        while stem not in keys and stem.startswith("model_"):
+            stem = stem[len("model_") :]
+        if stem not in keys:
+            continue
+        key = keys[stem]
+        file = snapshot_download(model, allow_patterns=[files[key]])
+        with safe_open(os.path.join(file, files[key]), "pt") as f:
+            value = f.get_tensor(key)
+        if transposed:
+            value = value.T
+        if value.dtype == tensor.dtype and torch.equal(value, tensor):
+            sources[name] = (key, transposed)
+    return sources
+
+
+def strip_weights(traced, step, params, model, step_dir):
+    """Leave out of ``traced`` every weight of checkpoint ``model``.
+
+    Writes ``weights.json`` -- each weight slot's parameter, and its
+    checkpoint key and orientation or else ``extra`` -- and
+    ``extra.safetensors``, the slots ``model`` does not hold.  The slots
+    keep zero-strided placeholders, so ``step.pt`` holds no weight bytes.
+    """
+    sources = checkpoint_sources(params, model)
+    slots, extra, placeholders = {}, {}, {}
+    for slot, value in traced.weights._parameters.items():
+        name = step.param_names[int(slot[len("param") :])]
+        if name in sources:
+            key, transposed = sources[name]
+            slots[slot] = {"name": name, "key": key, "transposed": transposed}
+        else:
+            slots[slot] = {"name": name, "extra": True}
+            extra[slot] = value.contiguous()
+        placeholders[slot] = torch.zeros(1, dtype=value.dtype).expand(
+            value.shape
+        )
+    torch_neuronx.replace_weights(traced, placeholders)
+    revision = os.path.basename(snapshot_download(model, allow_patterns=[]))
+    with open(os.path.join(step_dir, "weights.json"), "w") as f:
+        json.dump(
+            {"model": model, "revision": revision, "slots": slots}, f, indent=1
+        )
+    save_file(extra, os.path.join(step_dir, "extra.safetensors"))
+    print(f"{len(sources)} weights from {model}, {len(extra)} in extra")
+
+
+def main(directory, phase, target, weights_from):
     with open(os.path.join(directory, "manifest.json")) as f:
         manifest = json.load(f)
     tensors = torch.load(os.path.join(directory, "tensors.pt"))
@@ -154,6 +226,8 @@ def main(directory, phase, target):
         enable_aliasing=True,
         compiler_args=compiler_args,
     )
+    if weights_from is not None:
+        strip_weights(traced, step, params, weights_from, step_dir)
     torch.jit.save(traced, os.path.join(step_dir, "step.pt"))
     print(f"traced -> {step_dir}")
 
@@ -163,5 +237,6 @@ if __name__ == "__main__":
     parser.add_argument("directory")
     parser.add_argument("--phase", choices=tuple(PHASE_FLAGS), required=True)
     parser.add_argument("--target", default="trn2")
+    parser.add_argument("--weights-from", default=None)
     args = parser.parse_args()
-    main(args.directory, args.phase, args.target)
+    main(args.directory, args.phase, args.target, args.weights_from)

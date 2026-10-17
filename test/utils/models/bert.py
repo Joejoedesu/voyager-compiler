@@ -36,14 +36,14 @@ def load_model(args):
 
 
 def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
+    model, quantizer, calibration_data, fusion_patterns, args
 ):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
 
     compile_args = get_compile_args(args)
-    transform_args = get_transform_args(args, vector_stages)
+    transform_args = get_transform_args(args, fusion_patterns)
 
     batch = next(iter(calibration_dataloader))
     input_ids = batch["input_ids"]

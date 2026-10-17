@@ -8,10 +8,14 @@ from voyager_compiler.codegen.subgraph import rename_nodes_with_param_names
 from voyager_compiler.codegen.transform.bufferize import gen_compute_graph
 from voyager_compiler.codegen.transform.data_layout import (
     eliminate_reshape_with_no_effect,
+    normalize_activation_layout,
     normalize_conv2d_layout,
     normalize_gemm_weight_layout,
 )
-from voyager_compiler.codegen.transform.operator_fusion import fuse_operator
+from voyager_compiler.codegen.transform.operator_fusion import (
+    fuse_operator,
+    fuse_patterns,
+)
 from voyager_compiler.codegen.transform.padding import (
     pad_matrix_op_dimensions,
     pad_vector_op_dimensions,
@@ -20,6 +24,7 @@ from voyager_compiler.codegen.transform.padding import (
 from voyager_compiler.codegen.transform.quant_folding import (
     fuse_dequantize_quantize,
     fuse_quantize_dequantize_with_producer,
+    quantizes_kv_cache,
     sink_cache_folds,
     split_kv_cache,
 )
@@ -29,6 +34,7 @@ from voyager_compiler.codegen.transform.rewrites import (
     fold_constant_generators,
     inline_autocast_modules,
     match_and_fuse_rms_norm,
+    normalize_attention_operands,
     remove_fp32_casts,
     remove_prunable_ops,
     remove_zero_attention_mask,
@@ -51,15 +57,19 @@ __all__ = [
     "fold_constant_generators",
     "fuse_dequantize_quantize",
     "fuse_operator",
+    "fuse_patterns",
     "fuse_quantize_dequantize_with_producer",
     "gen_compute_graph",
     "inline_autocast_modules",
     "match_and_fuse_rms_norm",
+    "normalize_activation_layout",
+    "normalize_attention_operands",
     "normalize_conv2d_layout",
     "normalize_gemm_weight_layout",
     "pad_matrix_op_dimensions",
     "pad_vector_op_dimensions",
     "pad_vit_embeddings_output",
+    "quantizes_kv_cache",
     "remove_fp32_casts",
     "remove_prunable_ops",
     "remove_zero_attention_mask",

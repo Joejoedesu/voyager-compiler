@@ -14,13 +14,13 @@ from voyager_compiler.hardware_config import AcceleratorConfig
 from voyager_compiler.shape_prop import ShapeProp
 
 
-def get_transform_args(args, vector_stages):
+def get_transform_args(args, fusion_patterns):
     return {
-        "patterns": vector_stages,
+        "patterns": fusion_patterns,
         "config": AcceleratorConfig.from_args(args),
         "tensor_layout": args.tensor_layout,
-        "gemm_weight_layout": args.gemm_weight_layout,
-        "gemv_weight_layout": args.gemv_weight_layout,
+        "gemm_layout": args.gemm_layout,
+        "gemv_layout": args.gemv_layout,
         "fuse_reshape": not args.disable_reshape_fusion,
         "keep_fp32": not args.remove_fp32_casts,
     }
@@ -48,7 +48,7 @@ class Loss(torch.nn.Module):
         return self.model(**inputs).loss
 
 
-def compile_training_step(model, inputs, vector_stages, args, quantizer):
+def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
     """Compile one AdamW step of training ``model`` on the batch ``inputs``.
 
     The step is two programs sharing one DRAM layout: the gradient program
@@ -65,7 +65,7 @@ def compile_training_step(model, inputs, vector_stages, args, quantizer):
     Args:
         model: A Hugging Face model that returns its loss given labels.
         inputs: One batch, labels included.
-        vector_stages: The fusion patterns ``transform`` applies.
+        fusion_patterns: The fusion patterns ``transform`` applies.
         args: The command line.
         quantizer: Picks the GEMM operands to quantize, with ``--error``.
 
@@ -122,7 +122,7 @@ def compile_training_step(model, inputs, vector_stages, args, quantizer):
                 values.append(torch.zeros(val.shape, dtype=val.dtype))
         example[kind] = values
 
-    transform_args = get_transform_args(args, vector_stages)
+    transform_args = get_transform_args(args, fusion_patterns)
     for kind, program in programs.items():
         transform(program, example[kind], **transform_args)
     layout = shared_dram_layout(

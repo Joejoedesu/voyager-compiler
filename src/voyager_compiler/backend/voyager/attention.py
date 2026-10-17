@@ -24,38 +24,60 @@ from voyager_compiler.codegen.transform.tiling.runtime_model import (
 )
 from voyager_compiler.codegen.transform.tiling.traversal import (
     attention_kv_last,
+    attention_mask_dyn,
     sweep_cycles,
 )
 
-from .vector import KERNEL_LAUNCH_OVERHEAD, tensor_bytes, transfer_cost
+from .vector import (
+    KERNEL_LAUNCH_OVERHEAD,
+    record_writes,
+    tensor_bytes,
+    transfer_cost,
+)
+
+
+def _mask_once(node, grid):
+    """Whether the FA3 kernel loads ``node``'s explicit mask once under
+    ``grid``: the walk moves through none of its dims
+    (``attention_mask_dyn``)."""
+    mask = get_arg_value(node, 3, "attn_mask", None)
+    if not isinstance(mask, Node):
+        return False
+    return not attention_mask_dyn(mask.value.shape[:-2], grid)
 
 
 def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     """Latency and DRAM traffic of a flash-attention node under a tiling.
 
-    Prices the FA3 schedule (``bufferize/attention_v3.py``) a step at a
-    time.  The scores product runs first; the context product then runs on
-    the matrix unit while the vector unit runs the softmax chain, which had
-    to wait for the scores -- so a step costs the scores plus the busier of
-    the two, then the rescale that folds the context in.  A one-row query
-    tile makes the products matrix-vector, run on the vector unit like any
-    (``gemv_compute_cycles``), so its step is the plain sum.  A query block's
-    first step is a boundary: the vector unit resets its state, runs the
-    softmax, then finalizes the previous block once that block's context has
-    landed, so the finalize takes the rescale's place beside the context.
+    Prices the FA3 schedule (``bufferize/attention_v3.py``) a step at a time.
+    The scores product runs first; the context product then runs on the matrix
+    unit while the vector unit runs the softmax chain, which had to wait for the
+    scores -- so a step costs the scores plus the busier of the two, then the
+    rescale that folds the context in.  A one-row query tile makes the products
+    matrix-vector, run on the vector unit like any (``gemv_compute_cycles``), so
+    its step is the plain sum.  A query block's first step is a boundary: beside
+    the context the vector unit resets its state and runs the softmax, and once
+    that context has landed it finishes the previous block in the rescale's
+    place -- the accumulate, a split cache's residual, the finalize and the
+    zeroing.  A sweep whose every step is a boundary prices each step as one.
     The products are priced by their searches (``matrix``, at the head
     ``pad_head`` pads to); each vector pass at the bandwidth-bound rate
-    ``vector_op_utilization`` charges, plus its launch.  Query and output
-    move once per query block, while key, value, mask and every block scale
-    reload on each step, and the DMAs overlap compute the way
-    ``sweep_cycles`` prices a double-buffered sweep.
-    Under ``is_causal`` only the live pairs are steps
-    (``attention_kv_last``) and the mask tiles stream from the kernel's
-    table, one per step, as int1 codes under ``bool_mask`` and else at the
-    scores' width.  A split cache's residual
-    (``bufferize/attention_v3.py``) runs serially at each boundary -- its
-    two products around a softmax over its R positions, then the rescale
-    of the output -- and its operands move once per boundary.
+    ``vector_op_utilization`` charges, plus its launch, P's quantize bound by
+    the writes of its codes and scales.  Query and output move once per query
+    block, while key, value, mask and every block scale reload on each step --
+    but a mask of which every step reads the same tile (``_mask_once``) loads
+    once -- and the DMAs overlap compute the way ``sweep_cycles`` prices a
+    double-buffered sweep.  The grid is the GQA fold's, so key and value move
+    once per KV head; a mask broadcast over the heads is first expanded across
+    each head group in DRAM, read once and written ``g_head`` times its size,
+    before the sweep.  Under ``is_causal`` only the live pairs are steps
+    (``attention_kv_last``) and the mask tiles stream from the kernel's table,
+    one per step, as int1 codes under ``bool_mask`` and else at the scores'
+    width.  The mask add rides in the scores product's pass, so a pair below the
+    diagonal, which skips it, costs the same.  A split cache's residual runs
+    serially in the finalize -- its two products around a softmax over its R
+    positions, then the rescale of the output -- and its operands move once per
+    boundary.
 
     Args:
         node: The attention node being tiled.
@@ -85,59 +107,69 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     else:
         steps = math.prod(grid)
 
-    # The vector unit's passes, at the softmax's width (the output's): one
-    # lane group per cycle, bound by the beats its bytes take.
-    group_bytes = config.vector_lanes * node_dtype_bits(node) / 8
-    util = min(1.0, 1.0 / math.ceil(group_bytes / config.bytes_per_cycle))
+    # The vector unit's passes, at the softmax's width (the output's): a lane
+    # group per ``per_group`` cycles, by default the beats its bytes take.
+    lanes, bpc = config.vector_lanes, config.bytes_per_cycle
+    read = math.ceil(lanes * node_dtype_bits(node) / 8 / bpc)
 
-    def passes(count, elems):
-        cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
+    def passes(count, elems, per_group=read):
+        cycles = math.ceil(math.ceil(elems / lanes) * per_group)
         return count * (cycles + KERNEL_LAUNCH_OVERHEAD)
 
     rows, tile, out = tq, tq * tkv, tq * head_dim
-    # The softmax chain: rowmax, exponentials and rowsum over the score tile
-    # (and P's quantize under MX); the running max, the rescale factor, its
-    # copy and the running sum over a column.  Then the fused
-    # rescale-accumulate over the output tile, or at a boundary the reset of
-    # the two columns before the softmax and, after it, the accumulate, the
+    # The softmax chain: rowmax, exponentials and rowsum over the score tile;
+    # the running max, the rescale factor, its copy and the running sum over
+    # a column.  Under MX, P's quantize writes its codes and a block scale
+    # per lane group.  Then the fused rescale-accumulate over the output
+    # tile, or at a boundary the reset of the two columns (and the residual's
+    # max snapshot) before the softmax and, after it, the accumulate, the
     # finalize and the zeroing of the output tile.
-    softmax = passes(4 if node.kwargs.get("block_size") else 3, tile)
-    softmax += passes(4, rows)
+    softmax = passes(3, tile) + passes(4, rows)
+    if node.kwargs.get("block_size"):
+        beat = max(1, round(bpc))
+        codes = record_writes(lanes * node_dtype_bits(query), beat)
+        softmax += passes(1, tile, max(read, codes + 1))
     rescale = passes(1, out)
-    boundary = passes(3, out) + passes(2, rows)
+    reset = passes(2, rows)
+    finish = passes(3, out)
     residual = get_arg_value(node, 7, "key_residual", None)
     if residual is not None:
         length = tiles[residual][-1]
-        boundary += matrix["residual_scores"] + matrix["residual_context"]
-        boundary += passes(3, tq * length) + passes(4, rows) + rescale
+        reset += passes(1, rows)
+        finish += matrix["residual_scores"] + matrix["residual_context"]
+        finish += passes(3, tq * length) + passes(4, rows) + rescale
     scores, context = matrix["scores"], matrix["context"]
     if tq == 1:
         # One query row: the products are matrix-vector and run on the
         # vector unit beside the softmax, so nothing overlaps.
         interior = scores + context + softmax + rescale
-        boundary_step = scores + context + softmax + boundary
+        boundary_step = scores + context + reset + softmax + finish
     else:
         interior = scores + max(context, softmax) + rescale
-        boundary_step = scores + max(context, softmax + boundary)
+        boundary_step = scores + max(context, reset + softmax) + finish
+    if steps == boundaries:
+        # Every step starts a query block, so the sweep runs boundaries only.
+        interior = boundary_step
 
     lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
     # ``sweep_cycles`` reads the store off the front.
     out_bytes = operand_bytes(tiles[node], node)
     dmas = [(transfer_cost(tiles[node], out_bytes, lat, bpc), boundaries)]
     traffic = boundaries * out_bytes
+    mask = get_arg_value(node, 3, "attn_mask", None)
+    residual_mask = get_arg_value(node, 9, "residual_mask", None)
     for operand, transfers in (
         (query, boundaries),
         (key, steps),
         (value, steps),
-        (get_arg_value(node, 3, "attn_mask", None), steps),
+        (mask, 1 if _mask_once(node, grid) else steps),
         (node.kwargs.get("query_scale"), boundaries),
         (node.kwargs.get("key_scale"), steps),
         (node.kwargs.get("value_scale"), steps),
         (get_arg_value(node, 6, "query_residual", None), boundaries),
         (residual, boundaries),
         (get_arg_value(node, 8, "value_residual", None), boundaries),
-        (get_arg_value(node, 9, "residual_mask", None), boundaries),
+        (residual_mask, boundaries),
     ):
         if not isinstance(operand, Node):
             continue
@@ -157,6 +189,19 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
         latency = sum(count * cycles for cycles, count in dmas)
         latency += steps * interior
     latency += boundaries * (boundary_step - interior)
+
+    batch = query.value.shape[:-2]
+    g_head = batch[-1] // key.value.shape[-3] if batch else 1
+    for operand in (mask, residual_mask):
+        if g_head == 1 or not isinstance(operand, Node):
+            continue
+        shape = tuple(operand.value.shape)
+        if len(shape) > 2 and shape[-3] != 1:
+            continue  # one mask per query head: the fold is a view
+        n_bytes = operand_bytes(shape, operand)
+        latency += transfer_cost(shape, n_bytes, lat, bpc)
+        latency += transfer_cost(shape, g_head * n_bytes, lat, bpc)
+        traffic += (1 + g_head) * n_bytes
     return latency, traffic
 
 
@@ -188,16 +233,17 @@ class VoyagerAttention(OpModel):
         ``tiling`` fit the usable scratchpad, else ``None``.
 
         The allocations are ``_FA3Pipeline.forward``'s: two slots of every
-        operand tile but the output's one, the running softmax state and the
-        score tile at ``acc_dtype``, and the probabilities -- under MX their
-        codes at the query's dtype plus their block scales, else a buffer at
-        V's dtype when the softmax runs at a dtype other than the operands'
-        -- each sized the way ``plan_memory`` will place it.  The operand
+        operand tile but the output's one and a mask's loaded once
+        (``_mask_once``) one, the running softmax state and the score tile
+        at ``acc_dtype``, and the probabilities -- under MX their codes at
+        the query's dtype plus their block scales, else a buffer at V's
+        dtype when the softmax runs at a dtype other than the operands' --
+        each sized the way ``plan_memory`` will place it.  The operand
         tiles and the P@V product hold the head at ``pad_head``: the query's,
         value's and their scales' last dim, the transposed key's and its
         scales' first.  A split cache's residual adds its own score tile,
-        product, max snapshot and, at a dtype the matrix unit cannot take,
-        probabilities.
+        product, max snapshot, query slots even when it shares the main
+        query and, at a dtype the matrix unit cannot take, probabilities.
         """
         node, config, acc_dtype = self.node, self.config, self.acc_dtype
         tiles = attention_operand_shapes(node, tiling)
@@ -228,10 +274,18 @@ class VoyagerAttention(OpModel):
             shape[dim] = size
             padded[operand] = tuple(shape)
 
+        single = {node}
+        if _mask_once(node, tiling.grid):
+            single.add(get_arg_value(node, 3, "attn_mask"))
         total = sum(
-            (1 if operand is node else 2) * tensor_bytes(operand, shape, config)
+            (1 if operand in single else 2)
+            * tensor_bytes(operand, shape, config)
             for operand, shape in padded.items()
         )
+        if query is get_arg_value(node, 6, "query_residual"):
+            # One query serving both names still streams through two slots
+            # of its own for the residual.
+            total += 2 * tensor_bytes(query, padded[query], config)
 
         def acc_bytes(shape):
             return tensor_alloc_bytes(

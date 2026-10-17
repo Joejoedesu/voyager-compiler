@@ -42,6 +42,7 @@ from voyager_compiler.codegen.node_info import (
     tensor_alloc_bytes,
     weight_transforms,
 )
+from voyager_compiler.codegen.transform.bufferize.ops import MemoryLevel
 from voyager_compiler.codegen.transform.tiling.lowering import (
     gemv_operand_shapes,
     node_dtype_bits,
@@ -101,7 +102,7 @@ KERNEL_LAUNCH_OVERHEAD = 96
 BANK_SWITCH_CYCLES = 8
 
 
-def _record_writes(record_bits: int, beat: int) -> float:
+def record_writes(record_bits: int, beat: int) -> float:
     """Write cycles per record of ``record_bits`` on a ``beat``-byte bus,
     averaged over the alignment cycle: one per beat-sized word, two where
     the record starts mid-beat and the bus splits the word."""
@@ -132,12 +133,12 @@ def _output_writes(node, lanes: int, beat: int) -> float:
     it."""
     widths = node_dtype_bits(node)
     if not isinstance(widths, list):
-        return _record_writes(lanes * widths, beat)
+        return record_writes(lanes * widths, beat)
     values = getattr(node, "value", None)
     if values is None:
         values = node.meta.get("val")
     data = max(range(len(widths)), key=lambda i: values[i].numel())
-    return _record_writes(lanes * widths[data], beat) + len(widths) - 1
+    return record_writes(lanes * widths[data], beat) + len(widths) - 1
 
 
 def pool_taps(anchor) -> int:
@@ -441,7 +442,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
         if write is None:
             write_cycles = 0.0
         elif write is MID:
-            write_cycles = _record_writes(lanes * reads[MID], beat)
+            write_cycles = record_writes(lanes * reads[MID], beat)
         else:
             write_cycles = _output_writes(node, lanes, beat)
         cycles_per_group += max(read_cycles, write_cycles)
@@ -646,6 +647,25 @@ def tensor_bytes(node, shape, config):
     return None
 
 
+# The regions the vector unit keeps beside a batched reduction's tile between
+# its passes: its statistics (one value per row), then its tile-sized
+# regions.  A softmax holds a max and a sum, a layer_norm a mean and a
+# variance plus the normalized tile, an rms_norm a mean square.
+_SCRATCH_REGIONS = {
+    torch.ops.aten.softmax.int: (("max", "sum"), ()),
+    torch.ops.aten.layer_norm.default: (("mean", "variance"), ("normalized",)),
+    torch.ops.aten.rms_norm.default: (("mean_square",), ()),
+}
+
+
+def _reduced_dims(node, ndim: int) -> set:
+    """The dims ``node`` reduces over, as non-negative indices."""
+    if node.target is torch.ops.aten.softmax.int:
+        return {get_arg_value(node, 1, "dim", -1) % ndim}
+    normalized_shape = get_arg_value(node, 1, "normalized_shape") or ()
+    return set(range(ndim - len(normalized_shape), ndim))
+
+
 class VoyagerVector(OpModel):
     """A vector op on Voyager's vector unit -- elementwise, a reduction, a
     relayout -- bare or a fused ``call_module``: its operand tiles packed
@@ -715,11 +735,13 @@ class VoyagerVector(OpModel):
             fits, with no groups without banks; ``None`` when no tier fits.
         """
         config = self.config
-        sized = self._bank_groups(self.operand_shapes(tiling))
+        shapes = self.operand_shapes(tiling)
+        scratch = self.scratch(shapes[self.node])
+        sized = self._bank_groups(shapes, scratch)
         budget = config.usable_scratchpad_size // config.num_slots
         if not config.bank_size:
             needed = sum(size for size, _ in sized)
-            return Placement() if needed <= budget else None
+            return Placement(scratch=scratch) if needed <= budget else None
         target = config.usable_banks // config.num_slots
         for tier in range(len(GEMV_BANK_GROUPS)):
             while len(sized) > max(1, target - tier):
@@ -732,10 +754,10 @@ class VoyagerVector(OpModel):
             )
             if needed <= budget:
                 groups = tuple(frozenset(members) for _, members in sized)
-                return Placement(groups, tier=tier)
+                return Placement(groups, tier=tier, scratch=scratch)
         return None
 
-    def _bank_groups(self, shapes):
+    def _bank_groups(self, shapes, scratch):
         """The banks one candidate tile takes before any merge: ``(bytes,
         members)`` per bank.
 
@@ -751,6 +773,7 @@ class VoyagerVector(OpModel):
         Args:
             shapes: Each buffer's tile (``operand_shapes``), ``self.node``
                 standing for the output.
+            scratch: The tile's scratch regions (``scratch``).
         """
         node, config = self.node, self.config
         groups = [
@@ -776,25 +799,63 @@ class VoyagerVector(OpModel):
 
         # No DMA moves the reserved regions, so they share one bank rather
         # than taking one apiece.
-        reserved = self._reserved_bytes(shapes)
+        reserved = self._reserved_bytes(shapes, scratch)
         if reserved:
             sized.append((reserved, [Role.SCRATCH]))
         return sized
 
-    def _reserved_bytes(self, shapes):
+    def _reserved_bytes(self, shapes, scratch):
         """Bytes of the regions the kernel keeps beside its buffers that no
-        FX node names: the model's scratch regions for the op and a
-        reduction to one value's running result."""
+        FX node names: the op's ``scratch`` regions and a reduction to one
+        value's running result."""
         config = self.config
         reserved = sum(
             tensor_alloc_bytes(
                 math.prod(shape), dtype, config.bank_width, config.vector_lanes
             )
-            for _, shape, dtype in self.model.kernel_scratch(
-                self.node, shapes[self.node]
-            )
+            for _, shape, dtype, *_ in scratch
         )
         return reserved + self._running_bytes
+
+    def scratch(self, out_tile):
+        """The regions the vector unit keeps beside an op's tiles that no FX
+        node names, for an output tile ``out_tile`` (one per output, the
+        last naming the iteration space): a batched reduction's (a norm's, a
+        softmax's) between its passes, and none for any other op.
+
+        A statistic is one value per row, held across a lane group; a
+        tile-sized region (layer_norm's normalized output) is the whole tile.
+        A fused group is scanned whole: its reduction need not be its anchor.
+        Each is one slot of the scratchpad, in the physical dtype of the
+        op's input.
+        """
+        if not out_tile:
+            return ()
+        if isinstance(out_tile[0], (tuple, list)):
+            out_tile = out_tile[-1]
+        tile = tuple(out_tile)
+
+        submod = self.node.meta.get("submodule")
+        ops = submod.graph.nodes if submod is not None else [self.node]
+        scratch = []
+        for op in ops:
+            if op.target not in _SCRATCH_REGIONS:
+                continue
+            stat_names, tile_names = _SCRATCH_REGIONS[op.target]
+            reduced = _reduced_dims(op, len(tile))
+            stat = list(tile)
+            for i in reduced:
+                stat[i] = 1
+            stat[max(reduced)] = self.config.vector_lanes
+            dtype = get_arg_value(op, 0, "input").value.dtype
+            scratch += [
+                (name, tuple(stat), dtype, 1, MemoryLevel.SRAM)
+                for name in stat_names
+            ]
+            scratch += [
+                (name, tile, dtype, 1, MemoryLevel.SRAM) for name in tile_names
+            ]
+        return tuple(scratch)
 
     def cost(self, tiling, placement):
         """``vector_tile_latency`` of ``tiling``; ``placement`` is the
@@ -833,7 +894,7 @@ class VoyagerGemv(VoyagerVector):
         fusible = node.meta.get("single_k_tail_fusible", True)
         self._staged = breaks_stream or not fusible
 
-    def _reserved_bytes(self, shapes):
+    def _reserved_bytes(self, shapes, scratch):
         """``VoyagerVector._reserved_bytes`` plus the accumulator a fused
         tail reduces into, the one ``_ScratchSpec`` the builder allocates for
         the whole kernel when the reduction is split across K, and when a
@@ -841,7 +902,7 @@ class VoyagerGemv(VoyagerVector):
         (``_gemm_scratch_and_kernel``).  It is sized off the shape-preserving
         output tile -- a ``quantize_mx`` tail returns ``(scale, value)`` --
         in the anchor's own dtype, the partial sum it holds."""
-        reserved = super()._reserved_bytes(shapes)
+        reserved = super()._reserved_bytes(shapes, scratch)
         if not self._has_tail:
             return reserved
         split_k = any(

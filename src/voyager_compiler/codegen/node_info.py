@@ -4,7 +4,7 @@ import math
 import operator
 import re
 from itertools import repeat
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule, Node
@@ -16,6 +16,7 @@ from voyager_compiler.codegen.aten_classifier import (  # noqa: F401
     is_compute_op,
     is_elementwise_op,
 )
+from voyager_compiler.ops.layout import LINEAR_LAYOUT, MATMUL_LAYOUT, GemmLayout
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,71 @@ def is_matmul(node: Node) -> bool:
     ]
 
 
+def gemm_layout(node: Node) -> GemmLayout:
+    """How GEMM ``node`` stores its operands and result: its ``layout``
+    argument, or, for an aten op, which takes none, the layout it computes
+    in."""
+    native = MATMUL_LAYOUT if is_matmul(node) else LINEAR_LAYOUT
+    return GemmLayout.parse(node.kwargs.get("layout", native))
+
+
+def reads_kmajor(node: Node) -> bool:
+    """Whether GEMM ``node`` stores its activation K-major, ``[..., K, M]``
+    (``gemm_layout``), or attention ``node`` its query and key ``[...,
+    head_dim, tokens]`` (``sdpa_kmajor``)."""
+    if node.target is torch.ops.quantized_ops.sdpa_kmajor.default:
+        return True
+    gemm = is_linear(node) or is_matmul(node)
+    return gemm and gemm_layout(node).activation == "cx"
+
+
+def query_kmajor(node: Node) -> bool:
+    """Whether attention ``node`` stores its query K-major over more than
+    one token: a K-major query of one token holds a row-major one's bytes,
+    and is read as one."""
+    return reads_kmajor(node) and node.args[0].shape[-1] > 1
+
+
+def writes_transposed(node: Node) -> bool:
+    """Whether GEMM or attention ``node`` stores its output with its last two
+    dims swapped, ``[..., N, M]`` (a GEMM's ``gemm_layout``, an
+    ``sdpa_kmajor``'s ``transpose_output``)."""
+    if node.target is torch.ops.quantized_ops.sdpa_kmajor.default:
+        return node.kwargs.get("transpose_output", False)
+    gemm = is_linear(node) or is_matmul(node)
+    return gemm and gemm_layout(node).output == "kx"
+
+
+def _logical(shape, swapped: bool) -> tuple:
+    """``shape`` with its last two dims swapped back when ``swapped``."""
+    shape = tuple(shape)
+    return shape[:-2] + shape[:-3:-1] if swapped else shape
+
+
+def gemm_input_shape(node: Node) -> tuple:
+    """GEMM ``node``'s activation shape in logical ``[..., M, K]`` order,
+    however it is stored (``reads_kmajor``)."""
+    return _logical(node.args[0].shape, reads_kmajor(node))
+
+
+def gemm_output_shape(node: Node) -> tuple:
+    """GEMM ``node``'s output shape in logical ``[..., M, N]`` order,
+    however it is stored (``writes_transposed``)."""
+    return _logical(node.shape, writes_transposed(node))
+
+
+def attention_shapes(node: Node) -> Tuple[tuple, tuple, tuple]:
+    """Attention ``node``'s query, key and output shapes in logical
+    ``[..., tokens, head_dim]`` order, however they are stored
+    (``reads_kmajor``, ``writes_transposed``)."""
+    kmajor = reads_kmajor(node)
+    return (
+        _logical(node.args[0].shape, kmajor),
+        _logical(node.args[1].shape, kmajor),
+        _logical(node.shape, writes_transposed(node)),
+    )
+
+
 def is_bmm(node: Node) -> bool:
     if is_matmul(node):
         input_shape = node.args[0].shape
@@ -245,11 +311,11 @@ def is_bmm(node: Node) -> bool:
 
 def is_fully_connected(node: Node) -> bool:
     if is_linear(node):
-        input_shape = node.args[0].shape
+        input_shape = gemm_input_shape(node)
         return all(s == 1 for s in input_shape[:-1])
 
     if is_matmul(node):
-        input_shape = node.args[0].shape
+        input_shape = gemm_input_shape(node)
         if is_bmm(node):
             return input_shape[-2] == 1
         else:
@@ -593,15 +659,9 @@ def trailing_mha_perm(fused_ops):
 
 
 def weight_is_ck(node: Node) -> bool:
-    """Whether ``node``'s right operand is physically stored ``[contraction,
-    out]``.
-
-    ``is_matmul`` gives the op's native layout (matmul CK, linear KC) and
-    ``meta['transposed']`` says the layout transform flipped it, so the two
-    compose by XOR.  The twins the flip retargets to keep answering
-    ``is_linear`` / ``is_matmul``, which makes the meta the only signal.
-    """
-    return is_matmul(node) != bool(node.meta.get("transposed", False))
+    """Whether GEMM ``node``'s right operand is physically stored
+    ``[contraction, out]`` (``gemm_layout``)."""
+    return gemm_layout(node).weight == "ck"
 
 
 def weight_transforms(node: Node):

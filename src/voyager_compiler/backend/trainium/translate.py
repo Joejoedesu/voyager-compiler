@@ -17,18 +17,44 @@ logical coordinates to its offset and factoring the offsets into one nesting
 per instruction (``fit``), so views and relayouts fused into a kernel need
 no case of their own.
 
-A GEMM step transposes its activation on TensorE one 128 x 128 block at a
-time, multiplies it into PSUM one 512-column slice at a time and evicts each
-slice through the ops fused after the GEMM; a vector op runs on 128-row
-chunks; a transposing load lands on TensorE as well.  This is the step
-``TrainiumModel`` prices.
+A dense GEMM and a flash attention reach the translator as their builders
+(``gemm.py``, ``attention.py``) wrote them: transposes and matmuls into
+PSUM boxes, the copies and the ops out of them, a split reduction's sum and
+an attention's scores held in PSUM, each one IR op.  A vector op runs on
+128-row chunks -- reading a PSUM tile of whole 128-row blocks, on all its
+blocks at once.  The translator makes no buffer of its own: an op computes
+its intermediates -- a chain's results before its last, a norm's
+statistics, a ``quantize_mx``'s rearranged input and its transposes in
+PSUM -- in the scratch regions the IR hands it (``with_scratch``), which
+the tile search placed.  An operand the DMA would load transposed reaches it
+as a load of its tile as stored and TensorE transposes; one it still loads
+transposed (of several elements whose rows are not whole 128-row runs) the
+DMA moves element by element.
+
+A box the IR places in PSUM (``MEMORY_LEVEL_LOCAL_BUFFER``) is declared
+there and laid out as an SBUF tile is, an 8-bit element two bytes apart.  A
+transpose, a K-major GEMM or an MX one alone writing such a box is one
+``nc_transpose``, ``nc_matmul`` or ``nc_matmul_mx``, and a fused group a
+builder formed as a fused pattern (``patterns.py``) is the instruction the
+pattern names (``PATTERN_HANDLERS``); an ``eye`` is a ``memset`` and an
+``affine_select``.  Each is emitted per 128 rows -- a matmul also per 512
+columns of its result and per 128-deep (512-deep MX) chunk of its
+contraction, a transpose per 128 x 128 block.
+
+A GEMM on a K-major activation (its ``layout`` ``"cx,ck"``, ``[..., K, M]``)
+reads it as stored, its contraction already on the partitions: the
+activation is the stationary operand, or the moving one and the weight the
+stationary when the GEMM writes its output transposed (``"cx,ck,kx"``,
+``[..., N, M]``), and nothing is transposed.  Across the partitions of a
+K-major tile, an RMS norm sums the squares by a ones-matmul on TensorE;
+RoPE's rotate-half arrives as a K-major ``matmul`` by a signed permutation
+constant, an ordinary GEMM.
 
 An MX (microscaling) array -- the codes or the block scales a ``linear_mx``
 multiplies -- is stored contraction-major, the way Trn3's ``nc_matmul_mx``
-reads it (``Mx``).  A ``linear_mx`` step runs one ``nc_matmul_mx`` per
-512-element chunk of its contraction, and an op ending in ``quantize_mx``
-transposes its result onto the partitions 4 columns apart and quantizes it
-there with ``quantize_mx``.
+reads it (``Mx``), and a ``linear_mx`` reads part of such a tile.  An op
+ending in ``quantize_mx`` transposes its result onto the partitions 4
+columns apart and quantizes it there with ``quantize_mx``.
 
 ``translate`` writes ``kernels.py`` (one ``@nki.jit`` function per distinct
 kernel), ``program.py`` (the host program: the DRAM-only ops as torch ops,
@@ -48,23 +74,26 @@ import torch
 from google.protobuf import text_format
 
 from voyager_compiler.codegen import voyager_ir_pb2 as ir
+from voyager_compiler.ops.layout import MATMUL_LAYOUT, GemmLayout
 from voyager_compiler.quantization.qspec import float_format
 from voyager_compiler.shape_prop import fetch_attr
 
-PARTITIONS = 128
-# Columns of one matmul's moving operand: a 2 KiB PSUM bank of float32.
-MOVING_FREE = 512
-# Elements per partition one ``bn_stats`` takes.
-STATS_FREE = 512
-# Columns of one vector instruction's chunk.
-CHUNK_FREE = 2048
-# Rotating PSUM accumulators and transposition tiles.
-ACCUMULATORS = 4
-TRANSPOSES = 4
+from .model import stream_blocks
+from .patterns import (
+    ACTIVATION_REDUCE,
+    MATMUL_ACCUMULATE,
+    SCALED_IDENTITY,
+    TENSOR_SCALAR,
+    TENSOR_SCALAR_REDUCE,
+)
+from .utils import CHUNK_FREE, PARTITIONS, STATS_FREE, scratch_name
+from .vector import SQUARE_BLOCKS
 
 IMMEDIATE = ir.MEMORY_LEVEL_IMMEDIATE
 SCRATCHPAD = ir.MEMORY_LEVEL_SCRATCHPAD
+LOCAL = ir.MEMORY_LEVEL_LOCAL_BUFFER  # PSUM
 DRAM = ir.MEMORY_LEVEL_DRAM
+ON_CHIP = (SCRATCHPAD, LOCAL)
 
 # A boolean is a byte, 0 or 1; an int64 (a position) is carried as int32,
 # which is as wide as NKI computes.
@@ -75,6 +104,15 @@ NL_DTYPES = {
     "int32": "nl.int32",
     "int64": "nl.int32",
     "bool": "nl.uint8",
+}
+# Bytes of each type's element on chip (an 8-bit float's is 1).
+NL_BYTES = {
+    "bfloat16": 2,
+    "float16": 2,
+    "float32": 4,
+    "int32": 4,
+    "int64": 4,
+    "bool": 1,
 }
 # NKI's 8-bit floats, by exponent bits and ``FloatFormat.ieee``: Trn2
 # computes in the IEEE formats, Trn3 also in OCP's E4M3FN.
@@ -113,7 +151,12 @@ BINARY_OPS = {
     "aten::gt": "nl.greater",
     "aten::eq": "nl.equal",
     "aten::ne": "nl.not_equal",
+    "aten::maximum": "nl.maximum",
 }
+# Reductions over a tile's last dim: target -> NKI ALU op.
+REDUCTIONS = {"aten::amax": "nl.maximum", "aten::sum": "nl.add"}
+# Fills: target -> the kwarg giving the value, ``None`` for zero.
+FILLS = {"aten::full_like": "fill_value", "aten::zeros_like": None}
 ACTIVATIONS = {
     "aten::silu": "nl.silu",
     "aten::exp": "nl.exp",
@@ -132,7 +175,12 @@ DEQUANTIZE = "quantized_ops::dequantize"
 # the shift taking each to a sine.
 SINES = {"aten::sin": 0.0, "aten::cos": 0.5 * math.pi}
 RELAYOUTS = ("aten::transpose", "aten::view", "aten::reshape")
-GEMMS = ("quantized_ops::linear", "aten::matmul")
+# The GEMMs on a CK weight, each storing its operands as its ``layout``
+# says (``_gemm_layout``).
+GEMMS = ("quantized_ops::linear", "quantized_ops::matmul", "aten::matmul")
+# An RMS norm of a K-major ``[..., H, T]`` tile over ``H``, across the
+# partitions.
+RMS_NORM_KMAJOR = "quantized_ops::rms_norm_kmajor"
 MAX_POOL2D = "aten::max_pool2d"
 LINEAR_MX = "quantized_ops::linear_mx"
 QUANTIZE_MX = "quantized_ops::quantize_mx"
@@ -141,6 +189,15 @@ ROWWISE = {
     "aten::layer_norm": "_layer_norm",
     "aten::rms_norm": "_rms_norm",
     "aten::softmax": "_softmax",
+}
+# The ``Kernel`` method emitting a fused group of each fused pattern
+# (``patterns.py``), by the pattern's name.
+PATTERN_HANDLERS = {
+    TENSOR_SCALAR: "_tensor_scalar",
+    TENSOR_SCALAR_REDUCE: "_tensor_scalar_reduce",
+    ACTIVATION_REDUCE: "_activation_reduce",
+    MATMUL_ACCUMULATE: "_matmul_accumulate",
+    SCALED_IDENTITY: "_scaled_identity",
 }
 
 # MX arrays as ``nc_matmul_mx`` reads them: a 32-bit word packs 4
@@ -201,26 +258,28 @@ class Box:
 
 @dataclass
 class Layout:
-    """A box's SBUF slot: ``parts`` partitions by ``blocks`` row blocks of
+    """A box's slot on chip: ``parts`` partitions by ``blocks`` row blocks of
     ``cols`` columns, row ``r`` on partition ``r % span`` of block ``r //
-    span``; a ``replicated`` one-row box on every partition.  A box with
-    ``span`` 1 is all on one partition."""
+    span``, its elements ``spacing`` apart; a ``replicated`` one-row box on
+    every partition.  A box with ``span`` 1 is all on one partition."""
 
     parts: int
     blocks: int
     cols: int
     replicated: bool
     span: int = PARTITIONS
+    spacing: int = 1
 
     @property
     def free(self):
-        return self.blocks * self.cols
+        return self.blocks * self.cols * self.spacing
 
 
 @dataclass
 class View:
     """A reference resolved: the box and slot it reads, the window of the
-    slot it covers (from ``start``, ``step`` apart) and the shape it is seen
+    slot it covers (from ``start``, ``step`` apart) in the slot's dims
+    ``dims`` -- the box's, or a reshape of them -- and the shape it is seen
     as."""
 
     box: Box
@@ -229,6 +288,7 @@ class View:
     step: tuple
     window: tuple
     shape: tuple
+    dims: tuple
 
     def covers_box(self):
         """Whether the view is its whole slot, in order."""
@@ -238,11 +298,12 @@ class View:
             and all(t == 1 for t in self.step)
         )
 
-    def box_coords(self, linear):
-        """Slot coordinates of the elements at row-major positions
-        ``linear`` of ``shape``."""
+    def positions(self, linear):
+        """Row-major positions in the slot of the elements at row-major
+        positions ``linear`` of ``shape``."""
         window = np.unravel_index(linear, self.window)
-        return [s + w * t for s, w, t in zip(self.start, window, self.step)]
+        coords = [s + w * t for s, w, t in zip(self.start, window, self.step)]
+        return np.ravel_multi_index(coords, self.dims)
 
     def key(self):
         """The view as a hashable tuple."""
@@ -262,7 +323,7 @@ class Chunk:
     elements per partition, its logical shape and each element's
     coordinates in it (``[ndim, r, w]``); ``flat`` gives the offsets and
     ``dtype`` the element type when it is written into a tile -- box
-    ``box`` -- rather than a float32 temporary."""
+    ``box`` -- rather than a float32 scratch tile."""
 
     var: str
     free: int
@@ -434,6 +495,11 @@ def _fp8(dtype):
     return fmt if fmt is not None and fmt.bits == 8 else None
 
 
+def _element_bytes(dtype):
+    """Bytes of one element of IR ``dtype`` on chip."""
+    return 1 if _fp8(dtype) else NL_BYTES[dtype]
+
+
 def nl_dtype(dtype):
     """The NKI type of IR ``dtype``."""
     fmt = _fp8(dtype)
@@ -529,6 +595,20 @@ def _runs(n, size):
     return [(s, min(n, s + size)) for s in range(0, n, size)]
 
 
+def _gemm_layout(gemm):
+    """How GEMM prim ``gemm`` stores its operands and result: its ``layout``
+    argument, or ``aten::matmul``'s, which takes none."""
+    layout = gemm.kwargs.get("layout")
+    return GemmLayout.parse(
+        MATMUL_LAYOUT if layout is None else layout.str_value
+    )
+
+
+def _output_transposed(gemm):
+    """Whether GEMM prim ``gemm`` writes its result ``[..., N, M]``."""
+    return _gemm_layout(gemm).output == "kx"
+
+
 def _delinearize(linear, basis):
     """``voyager::delinearize_index``: every coordinate wraps."""
     out = [0] * len(basis)
@@ -542,9 +622,14 @@ class Kernel:
     """One kernel's translation: two walks of its IR, the first recording
     what each box is used for and the second emitting NKI.
 
+    It declares the boxes the IR names and makes none of its own: an op
+    computes its intermediates in the scratch regions the IR hands it
+    (``temp``).
+
     Attributes:
         immediates: The value of each immediate box, by name.
         mx: The ``Mx`` of each HBM box holding an MX array, by name.
+        config: The ``TrainiumConfig`` it runs on.
         boxes: Every box the kernel touches, by name.
         reads: The HBM boxes it reads, its arguments, in order.
         writes: The HBM boxes it writes, its results, in order.
@@ -554,9 +639,10 @@ class Kernel:
         lines: The body, statement by statement.
     """
 
-    def __init__(self, ops, immediates, mx):
+    def __init__(self, ops, immediates, mx, config):
         self.immediates = immediates
         self.mx = mx
+        self.config = config
         # Boxes held on one partition: a result laid out across partitions
         # that no instruction writes within them (a relayout of one row).
         self.one_partition = set()
@@ -582,12 +668,17 @@ class Kernel:
         self.windows = {}
         self.uses = {}
         self.lines = []
-        self.pools = {}
+        # How many times each scratch region has been taken (``temp``).
+        self.turns = {}
         # Emit-pass results by their inputs: transfers replayed shifted
         # (``_shifted_transfer``) and GEMM operand access patterns.
         self.memo = {}
-        # The patterns ``_try_dma`` emits, while a transfer is recorded.
+        # The patterns ``_pattern_dma`` emits, while a transfer is recorded.
         self.dma_log = None
+        # The kernel runs exponentials with their sums on ScalarE
+        # (``ACTIVATION_REDUCE``), so its other ALU passes run on VectorE
+        # and its fills on GpSimd.
+        self.scalar_exps = False
         for analyze in (True, False):
             self.analyze = analyze
             self.env = {}
@@ -690,43 +781,57 @@ class Kernel:
             self.uses.setdefault(box.name, set()).add(role)
 
     def _lay_out(self):
-        """Every SBUF box's layout: rows on the partitions, a one-row box
+        """Every on-chip box's layout: rows on the partitions, a one-row box
         only ever read as an elementwise operand replicated, and a pool
-        input as its windows (``windows``)."""
+        input as its windows (``windows``).  PSUM holds an 8-bit element in
+        two bytes, the way TensorE writes an FP8 transpose."""
         for box in self.boxes.values():
-            if box.level != SCRATCHPAD or box.name in self.mx_tiles:
-                continue
-            if box.name in self.one_partition:
-                layout = Layout(1, box.rows, box.cols, False, span=1)
-                self.layouts[box.name] = layout
+            if box.level not in ON_CHIP or box.name in self.mx_tiles:
                 continue
             uses = self.uses.get(box.name, set())
+            spacing = 2 if box.level == LOCAL and _fp8(box.dtype) else 1
+            if box.name in self.one_partition:
+                self.layouts[box.name] = Layout(
+                    1, box.rows, box.cols, False, span=1, spacing=spacing
+                )
+                continue
             replicated = (
                 box.rows == 1 and "operand" in uses and "dst" not in uses
             )
             parts = PARTITIONS if replicated else min(box.rows, PARTITIONS)
             blocks = math.ceil(box.rows / PARTITIONS)
-            self.layouts[box.name] = Layout(parts, blocks, box.cols, replicated)
+            self.layouts[box.name] = Layout(
+                parts, blocks, box.cols, replicated, spacing=spacing
+            )
         # A pool input holds output row p's kH input rows on partition p.
         for name, (kh, _, _, out_rows, _) in self.windows.items():
             cols = kh * self.boxes[name].cols
             self.layouts[name] = Layout(out_rows, 1, cols, False)
 
     def _view(self, ref):
-        """``View`` of a ``TensorBoxRef``."""
+        """``View`` of a ``TensorBoxRef``; a window of a pipelined box leads
+        with its slot, unless the box has one slot."""
         box = self._box(ref.box)
         offsets = [self._scalar(o) for o in ref.offsets]
         sizes, steps = list(ref.sizes), list(ref.strides)
         slot = 0
-        if box.pipelined and offsets:
+        if box.pipelined and len(offsets) > len(ref.box.shape):
             slot = offsets.pop(0)
             sizes, steps = sizes[1:], steps[1:]
+        dims = tuple(ref.box.shape)
         if not offsets:
             offsets, sizes = [0] * len(box.shape), list(box.shape)
             steps = [1] * len(box.shape)
+            dims = box.shape
         shape = tuple(ref.output_shape) or tuple(sizes) or (1,)
         return View(
-            box, slot, tuple(offsets), tuple(steps), tuple(sizes) or (1,), shape
+            box,
+            slot,
+            tuple(offsets),
+            tuple(steps),
+            tuple(sizes) or (1,),
+            shape,
+            dims,
         )
 
     def var(self, box, slot=0):
@@ -746,55 +851,58 @@ class Kernel:
             return mx.tile(padded)[1]
         return self.layouts[box.name].free
 
-    def _mx_tile(self, view, scales, k_major):
-        """Record ``view``'s box as an on-chip MX tile, contracting along
-        the view's last dim, or its first if ``k_major``."""
-        *lead, last = view.shape
+    def _mx_tile(self, box, scales, k_major):
+        """Record on-chip ``box`` as an MX tile, contracting along its last
+        dim, or its first if ``k_major``; an op may read or write part of
+        it."""
+        *lead, last = box.shape
         if k_major:
-            depth, other = view.shape[0], math.prod(view.shape[1:])
+            depth, other = box.shape[0], math.prod(box.shape[1:])
         else:
             depth, other = last, math.prod(lead)
         mx = Mx(scales, depth * MX_BLOCK if scales else depth, other, k_major)
         padded = other if k_major else other + other % 2
-        if self.mx_tiles.setdefault(view.box.name, (mx, padded)) != (
-            mx,
-            padded,
-        ):
-            raise NotImplementedError(f"{view.box.name}: two MX views")
+        if self.mx_tiles.setdefault(box.name, (mx, padded)) != (mx, padded):
+            raise NotImplementedError(f"{box.name}: two MX layouts")
 
     def flat(self, view, linear, partitions=None):
         """Flat offsets in its tensor of ``view``'s elements at positions
         ``linear``; a replicated box is read on ``partitions``."""
         box = view.box
-        if view.covers_box():
-            # The view is the box reshaped: position is the box's own.
-            if box.level == DRAM:
-                return linear
-            row, col = np.divmod(linear, box.cols)
-        else:
-            coords = view.box_coords(linear)
-            if box.level == DRAM:
-                return np.ravel_multi_index(coords, box.shape)
-            col = coords[-1]
-            row = np.ravel_multi_index(coords[:-1], box.shape[:-1])
+        # The view is the box reshaped when it covers it: position is the
+        # box's own.
+        position = linear if view.covers_box() else view.positions(linear)
+        if box.level == DRAM:
+            return position
+        row, col = np.divmod(position, box.cols)
         layout = self.layouts[box.name]
         if layout.replicated:
             return partitions * layout.free + col
         part, block = row % layout.span, row // layout.span
-        return part * layout.free + block * layout.cols + col
+        return part * layout.free + (block * layout.cols + col) * layout.spacing
 
     def emit(self, line):
         self.lines.append(line)
 
-    def pool(self, kind, shape, dtype, count):
-        """The next of ``count`` rotating temporaries of ``kind``."""
-        key = (kind, shape, dtype)
-        if key not in self.pools:
-            names = [f"{kind}{len(self.pools)}_{i}" for i in range(count)]
-            self.pools[key] = [names, 0]
-        entry = self.pools[key]
-        entry[1] += 1
-        return entry[0][(entry[1] - 1) % count]
+    def temp(self, kind, cols):
+        """The next slot of the op's scratch tile of ``kind``, ``[128,
+        cols]``: the region the IR hands the op under that name
+        (``scratch_name``), its slots taken in turn across the kernel.
+
+        Raises:
+            NotImplementedError: The op has no such region.
+        """
+        suffix = "." + scratch_name(kind, cols)
+        for prim in self.prims:
+            for key, arg in prim.kwargs.items():
+                if key.endswith(suffix):
+                    box = self._view(arg.tensor_box).box
+                    turn = self.turns.get(box.name, 0)
+                    self.turns[box.name] = turn + 1
+                    return self.var(box, turn % box.slots)
+        raise NotImplementedError(
+            f"{self.prims[0].name}: no {kind} scratch of {cols} columns"
+        )
 
     # Transfers.
 
@@ -835,7 +943,11 @@ class Kernel:
                 raise NotImplementedError("a transposing MX transfer")
             self._mx_transfer(hbm, hbm_linear, sbuf, load)
         elif kw.get("transposed"):
-            self._transposed_load(hbm, hbm_linear, sizes, sbuf)
+            # The DMA transposes element by element: a builder lands a tile
+            # it can transpose on TensorE as stored (``_BufferedRef.landing``).
+            a, b = sizes[-2:]
+            linear = hbm_linear.reshape(-1, a, b).swapaxes(1, 2).reshape(-1)
+            self._transfer(hbm, linear, sbuf, True)
         elif sbuf.box.name in self.windows:
             self._window_load(hbm, hbm_linear, sizes, sbuf)
         else:
@@ -906,7 +1018,8 @@ class Kernel:
     def _transfer(self, hbm, hbm_linear, sbuf, load):
         """Copy between the HBM elements ``hbm_linear`` of ``hbm`` and
         ``sbuf``'s, in ``sbuf``'s row-major order: the whole tile in one
-        ``dma_copy`` when a pattern walks it, else 128 rows at a time."""
+        ``dma_copy`` when a pattern walks it -- a load in one per piece of
+        its 128-row blocks (``stream_blocks``) -- else 128 rows at a time."""
         layout = self.layouts[sbuf.box.name]
         rows, cols = _rows_cols(sbuf.shape)
         sbuf_var, hbm_var = self.var(sbuf.box, sbuf.slot), self.var(hbm.box)
@@ -924,11 +1037,21 @@ class Kernel:
             return
         parts, blocks = layout.parts, layout.blocks
         if parts * blocks == rows:
-            # Partition ``p`` holds row ``b * span + p`` of each block ``b``.
-            row = np.arange(parts)[:, None] + np.arange(blocks) * layout.span
-            linear = row[:, :, None] * cols + np.arange(cols)
-            s, h = offsets(linear.reshape(parts, -1))
-            if self._try_dma(sbuf_var, layout.free, s, hbm_var, h, load):
+            block = parts * cols * _element_bytes(sbuf.box.dtype)
+            group = (
+                stream_blocks(blocks, block) if load and parts > 1 else blocks
+            )
+            pieces = []
+            for first in range(0, blocks, group):
+                # Partition ``p`` holds row ``b * span + p`` of block ``b``.
+                piece = np.arange(first, min(first + group, blocks))
+                row = np.arange(parts)[:, None] + piece * layout.span
+                linear = row[:, :, None] * cols + np.arange(cols)
+                s, h = offsets(linear.reshape(parts, -1))
+                pieces.append(fit([(layout.free, s), (None, h)], parts))
+            if None not in pieces:
+                for aps in pieces:
+                    self._pattern_dma(sbuf_var, aps, hbm_var, load)
                 return
         for a, b in _runs(rows, PARTITIONS):
             linear = np.arange(a * cols, b * cols).reshape(b - a, cols)
@@ -958,11 +1081,17 @@ class Kernel:
         aps = fit([(free, s), (None, h)], s.shape[0])
         if aps is None:
             return False
+        self._pattern_dma(sbuf_var, aps, hbm_var, load, dtype)
+        return True
+
+    def _pattern_dma(self, sbuf_var, aps, hbm_var, load, dtype=None):
+        """``dma_copy`` along the SBUF and HBM patterns ``aps``, the HBM
+        tensor seen as ``dtype`` when given; logged in ``dma_log`` while a
+        transfer is recorded."""
         on_chip = _ap(sbuf_var, aps[0])
         if self.dma_log is not None:
             self.dma_log.append((on_chip, aps[1]))
         self._emit_dma(on_chip, _ap(hbm_var, aps[1], dtype), load)
-        return True
 
     def _emit_dma(self, on_chip, hbm, load):
         """``dma_copy`` between access patterns ``on_chip`` and ``hbm``."""
@@ -988,104 +1117,76 @@ class Kernel:
                 sbuf_var, free, s[:, one], hbm_var, h[:, one], load, dtype
             )
 
-    def _transposed_load(self, hbm, hbm_linear, sizes, sbuf):
-        """Load an HBM block transposed into ``sbuf``: as stored into a
-        temporary, then each 128 x 128 block transposed on TensorE."""
-        *lead, a, b = sizes
-        dtype = sbuf.box.dtype
-        rows = math.prod(lead) * a
-        temp_free = math.ceil(rows / PARTITIONS) * b
-        temp = self.pool("tl", (PARTITIONS, temp_free), dtype, 2)
-        for start, stop in _runs(rows, PARTITIONS):
-            r = stop - start
-            linear = np.arange(start * b, stop * b).reshape(r, b)
-            t = np.arange(r)[:, None] * temp_free + np.arange(b)[None, :]
-            t += (start // PARTITIONS) * b
-            h = self.flat(hbm, hbm_linear[linear])
-            self._dma(temp, temp_free, t, self.var(hbm.box), h, True)
-        sbuf_var = self.var(sbuf.box, sbuf.slot)
-        free = self.free(sbuf.box)
-        for e in range(math.prod(lead)):
-            for i, i_end in _runs(a, PARTITIONS):
-                for j, j_end in _runs(b, PARTITIONS):
-                    r, c = i_end - i, j_end - j
-                    row = e * a + i
-                    if row % PARTITIONS + r > PARTITIONS:
-                        raise NotImplementedError("a block across partitions")
-                    offset = (row % PARTITIONS) * temp_free
-                    offset += (row // PARTITIONS) * b + j
-                    block = (
-                        f"{temp}.ap(pattern=[[{temp_free}, {r}], [1, {c}]], "
-                        f"offset={offset})"
-                    )
-                    transposed = self._transpose(block, r, c, dtype)
-                    # Transposed element (y, x) is block element (x, y).
-                    y, x = np.arange(c)[:, None], np.arange(r)[None, :]
-                    linear = (e * b + j + y) * a + i + x
-                    aps = fit([(free, self.flat(sbuf, linear))], c)
-                    if aps is None:
-                        raise NotImplementedError("transposed tile layout")
-                    self.emit(
-                        f"nisa.tensor_copy(dst={_ap(sbuf_var, aps[0])}, "
-                        f"src={transposed})"
-                    )
-
     # Compute.
 
     def _compute(self, op):
+        """A compute op: a prim, or a fused group, emitted as the instruction
+        its fused pattern names (``PATTERN_HANDLERS``) when it has one.
+
+        Raises:
+            NotImplementedError: The group's pattern is not one of
+                Trainium's, or a GEMM writes no PSUM box alone.
+        """
+        pattern = None
         if op.WhichOneof("op_type") == "prim":
             prims = [op.prim]
         else:
             prims = list(op.fused.op_list)
-        # A GEMM's prims are the prologue computing its activation, then the
-        # GEMM and its tail.
-        g = next(
-            (
-                i
-                for i, p in enumerate(prims)
-                if p.target in GEMMS or p.target == LINEAR_MX
-            ),
-            0,
-        )
-        prologue, prims = prims[:g], prims[g:]
+            if op.fused.HasField("pattern"):
+                pattern = op.fused.pattern
+                if pattern not in PATTERN_HANDLERS:
+                    raise NotImplementedError(f"{op.name}: pattern {pattern}")
+        # The op's prims, whose scratch regions ``temp`` reads.
+        self.prims = prims
         anchor = prims[0]
         if prims[-1].target == QUANTIZE_MX:
             # Its results are the scales, then the codes.
             dst = tuple(self._view(o.destination) for o in op.outputs[:2])
             for view, scales in zip(dst, (True, False)):
                 self._use(view.box, "dst")
-                self._mx_tile(view, scales, False)
+                self._mx_tile(view.box, scales, False)
+        elif pattern is not None:
+            # A group's results, in the order it gives them.
+            dst = tuple(self._view(o.destination) for o in op.outputs)
+            for view in dst:
+                self._use(view.box, "dst")
         else:
             dst = self._view(op.outputs[0].destination)
             self._use(dst.box, "dst")
         if anchor.target == MAX_POOL2D:
             self._max_pool(prims, dst)
             return
-        gemm = anchor.target in GEMMS or anchor.target == LINEAR_MX
+        # A lone op writing PSUM, which TensorE's transpose or matmul does.
+        into_psum = (
+            len(prims) == 1 and isinstance(dst, View) and dst.box.level == LOCAL
+        )
+        psum_transpose = into_psum and anchor.target == "aten::transpose"
+        # A fused pattern's GEMM is the pattern's instruction, not a step.
+        gemm = pattern is None and anchor.target in (*GEMMS, LINEAR_MX)
+        kmajor_gemm = (
+            anchor.target in GEMMS and _gemm_layout(anchor).activation == "cx"
+        )
+        # TensorE reads its operands as stored (``_lay_out``).
+        on_tensor_engine = (
+            gemm or pattern == MATMUL_ACCUMULATE or psum_transpose
+        )
         gemm_operands = []
         if anchor.target == LINEAR_MX:
-            if prologue:
-                raise NotImplementedError(f"{anchor.name}: an MX prologue")
             for key, (scales, k_major) in MX_OPERANDS.items():
                 view = self._view(anchor.kwargs[key].tensor_box)
-                self._mx_tile(view, scales, k_major)
+                self._mx_tile(view.box, scales, k_major)
                 gemm_operands.append(view)
-        elif gemm:
-            # After a prologue the GEMM's input is the prologue's result,
-            # which no box holds: ``None`` stands for it.
+        elif on_tensor_engine:
             gemm_operands = [
-                (
-                    None
-                    if prologue and k == "input"
-                    else self._view(anchor.kwargs[k].tensor_box)
-                )
+                self._view(anchor.kwargs[k].tensor_box)
                 for k in ("input", "weight", "other")
                 if k in anchor.kwargs
             ]
-        for view in filter(None, gemm_operands):
+        for view in gemm_operands:
             self._use(view.box, "gemm")
         if self.analyze:
-            for prim in prologue + (prims[1:] if gemm else prims):
+            self.scalar_exps |= pattern == ACTIVATION_REDUCE
+            for prim in prims[1:] if on_tensor_engine else prims:
                 for arg in prim.kwargs.values():
                     if arg.WhichOneof("arg_type") != "tensor_box":
                         continue
@@ -1096,197 +1197,59 @@ class Kernel:
                     if box.level == DRAM and box.name not in self.reads:
                         self.reads.append(box.name)
             return
-        if anchor.target == LINEAR_MX:
-            self._gemm_mx(prims, *gemm_operands, dst)
+        if pattern is not None:
+            getattr(self, PATTERN_HANDLERS[pattern])(prims, dst)
+        elif gemm and into_psum and anchor.target == LINEAR_MX:
+            self._nc_matmul_mx(anchor, dst, accumulate=False)
+        elif gemm and into_psum and kmajor_gemm:
+            self._nc_matmul(anchor, dst, accumulate=False)
         elif gemm:
-            self._gemm(prologue, prims, *gemm_operands, dst)
+            raise NotImplementedError(
+                f"{anchor.name}: a GEMM other than a K-major or MX one alone "
+                "into PSUM"
+            )
+        elif anchor.target == RMS_NORM_KMAJOR:
+            self._rms_norm_kmajor(prims, dst)
+        elif anchor.target in REDUCTIONS:
+            self._reduce(prims, dst)
+        elif psum_transpose:
+            self._psum_transpose(anchor, dst)
+        elif anchor.target == "aten::eye":
+            self._eye(dst, 1.0)
         elif any(p.target in ROWWISE for p in prims):
             self._rowwise(prims, dst)
         else:
             self._elementwise(prims, dst)
 
-    def _gemm(self, prologue, prims, act, weight, dst):
-        """A GEMM step and the ops fused around it: per batch element and
-        128-row chunk, the activation transposed block by block, then per
-        512-column slice its matmuls into PSUM and the eviction through the
-        tail.
-
-        A ``prologue`` (``act`` is then ``None``) first computes the chunk's
-        activation rows into a temporary, each op in place there: a
-        pointwise op in column runs, a row op over whole rows.  A tail
-        ending in a row op evicts the chunk's slices through the ops before
-        it into ``dst``, then runs the row op there in place."""
-        gemm, tail = prims[0], prims[1:]
-        if prologue:
-            ref = gemm.kwargs["input"].tensor_box
-            act_shape, dtype = tuple(ref.output_shape), ref.box.dtype
+    def _gemm_extents(self, gemm, act, weight):
+        """``(batch, batch_a, batch_w, m, k, n)`` of a GEMM step: its result's
+        batch and its operands', the rows, the contraction and the columns;
+        a K-major activation is ``[..., K, M]``."""
+        if _gemm_layout(gemm).activation == "cx":
+            *batch_a, k, m = act.shape
         else:
-            act_shape, dtype = act.shape, act.box.dtype
-            act_var = self.var(act.box, act.slot)
-        *batch_a, m, k = act_shape
+            *batch_a, m, k = act.shape
         *batch_w, k_w, n = weight.shape
         if k != k_w:
             raise NotImplementedError("a GEMM weight not [K, N]")
-        row_op = next(
-            (i for i, p in enumerate(tail) if p.target in ROWWISE), len(tail)
-        )
-        if tail[row_op + 1 :]:
-            raise NotImplementedError(
-                f"{tail[row_op + 1].name}: an op after a GEMM tail's row op"
-            )
         batch = tuple(np.broadcast_shapes(tuple(batch_a), tuple(batch_w)))
-        out_shape = batch + (m, n)
-        depth = _runs(k, PARTITIONS)
-        weight_var = self.var(weight.box, weight.slot)
-        for e in range(math.prod(batch)):
-            e_coords = [int(c) for c in np.unravel_index(e, batch)]
-            ea = _batch_index(e_coords, batch_a)
-            ew = _batch_index(e_coords, batch_w)
-            for i, i_end in _runs(m, PARTITIONS):
-                r = i_end - i
-                act_row = ea * m + i
-                if prologue:
-                    pa = self.pool("pa", (PARTITIONS, k), dtype, 2)
-                for prim in prologue:
-                    if prim.target in ROWWISE:
-                        x = prim.kwargs["input"].tensor_box
-                        if x.box.HasField("memory"):
-                            view = self._view(x)
-                            data = lambda lo, hi: self._rows_ap(
-                                view, act_row, r, lo, hi
-                            )
-                        else:
-                            data = lambda lo, hi: f"{pa}[0:{r}, {lo}:{hi}]"
-                        getattr(self, ROWWISE[prim.target])(
-                            prim, data, r, f"{pa}[0:{r}, 0:{k}]"
-                        )
-                        continue
-                    for lo, hi in _runs(k, CHUNK_FREE):
-                        cols = np.arange(lo, hi)[None, :]
-                        linear = (act_row + np.arange(r))[:, None] * k + cols
-                        coords = np.stack(np.unravel_index(linear, act_shape))
-                        flat = np.arange(r)[:, None] * k + cols
-                        out = Chunk(pa, k, act_shape, coords, flat, dtype)
-                        values = {p.name: out for p in prologue}
-                        self._apply(prim, out, values, out)
-                act_t = self.pool(
-                    "at", (PARTITIONS, len(depth) * PARTITIONS), dtype, 2
-                )
-                for c, (lo, hi) in enumerate(depth):
-                    if prologue:
-                        block = f"{pa}[0:{r}, {lo}:{hi}]"
-                    else:
-                        key = ("act", act.key(), act_row, r, lo, hi)
-                        if key not in self.memo:
-                            rows = (act_row + np.arange(r))[:, None]
-                            linear = rows * k + lo + np.arange(hi - lo)[None, :]
-                            a = self.flat(act, linear)
-                            aps = fit([(self.free(act.box), a)], r)
-                            self.memo[key] = _ap(act_var, aps[0])
-                        block = self.memo[key]
-                    transposed = self._transpose(block, r, hi - lo, dtype)
-                    at = c * PARTITIONS
-                    self.emit(
-                        f"nisa.tensor_copy(dst={act_t}[0:{hi - lo}, "
-                        f"{at}:{at + r}], src={transposed})"
-                    )
-                for j, j_end in _runs(n, MOVING_FREE):
-                    w = j_end - j
-                    acc = self.pool(
-                        "acc",
-                        (PARTITIONS, MOVING_FREE),
-                        "float32",
-                        ACCUMULATORS,
-                    )
-                    for c, (lo, hi) in enumerate(depth):
-                        key = ("moving", weight.key(), ew, lo, hi, j, w)
-                        if key not in self.memo:
-                            rows = (ew * k + lo + np.arange(hi - lo))[:, None]
-                            linear = rows * n + j + np.arange(w)[None, :]
-                            b = self.flat(weight, linear)
-                            aps = fit([(self.free(weight.box), b)], hi - lo)
-                            self.memo[key] = _ap(weight_var, aps[0])
-                        at = c * PARTITIONS
-                        self.emit(
-                            f"nisa.nc_matmul(dst={acc}[0:{r}, 0:{w}], "
-                            f"stationary={act_t}[0:{hi - lo}, {at}:{at + r}], "
-                            f"moving={self.memo[key]}, "
-                            f"accumulate={c > 0})"
-                        )
-                    grid = np.stack(
-                        np.broadcast_arrays(
-                            *[np.full((r, w), x) for x in e_coords],
-                            (i + np.arange(r))[:, None],
-                            (j + np.arange(w))[None, :],
-                        )
-                    )
-                    chunk = Chunk(acc, MOVING_FREE, out_shape, grid)
-                    self._chain(tail[:row_op], {gemm.name: chunk}, dst)
-                if row_op < len(tail):
-                    out_row = e * m + i
-                    getattr(self, ROWWISE[tail[row_op].target])(
-                        tail[row_op],
-                        lambda lo, hi: self._rows_ap(dst, out_row, r, lo, hi),
-                        r,
-                        self._rows_ap(dst, out_row, r, 0, n),
-                    )
+        return batch, tuple(batch_a), tuple(batch_w), m, k, n
 
-    def _gemm_mx(self, prims, act, act_scale, weight, weight_scale, dst):
-        """An MX GEMM step and the ops fused after it: per 128-row chunk and
-        512-column slice, one ``nc_matmul_mx`` per 512-element chunk of the
-        contraction into PSUM, then the eviction.  The operands are on chip
-        in the ``Mx`` layout, so nothing is transposed; a stationary chunk of
-        odd width takes the tile's zeroed pad column with it."""
-        anchor = prims[0]
-        kw = self._kwargs(anchor)
-        extra = [
-            k
-            for k in ("bias", "input_code", "weight_code")
-            if kw.get(k) is not None
-        ]
-        if extra or kw.get("block_size") != MX_BLOCK:
-            raise NotImplementedError(f"{anchor.name}: {extra or kw}")
-        *lead, k = act.shape
-        k_w, n = weight.shape
-        if k != k_w or k % MX_CHUNK:
-            raise NotImplementedError(f"{anchor.name}: contraction {k}")
-        m = math.prod(lead)
-        rows_padded = self.mx_tiles[act.box.name][1]
-        cols_padded = self.mx_tiles[weight.box.name][1]
-        names = [
-            self.var(v.box, v.slot)
-            for v in (act, act_scale, weight, weight_scale)
-        ]
-        out_shape = (*lead, n)
-        for i, i_end in _runs(m, PARTITIONS):
-            r = i_end - i
-            width = r + r % 2
-            lead_coords = np.unravel_index(i + np.arange(r), tuple(lead))
-            for j, j_end in _runs(n, MOVING_FREE):
-                w = j_end - j
-                acc = self.pool(
-                    "acc", (PARTITIONS, MOVING_FREE), "float32", ACCUMULATORS
-                )
-                for c in range(k // MX_CHUNK):
-                    a, b = c * rows_padded + i, c * cols_padded + j
-                    stationary = f"[0:{PARTITIONS}, {a}:{a + width}]"
-                    moving = f"[0:{PARTITIONS}, {b}:{b + w}]"
-                    self.emit(
-                        f"nisa.nc_matmul_mx(dst={acc}[0:{width}, 0:{w}], "
-                        f"stationary={names[0]}{stationary}, "
-                        f"moving={names[2]}{moving}, "
-                        f"stationary_scale={names[1]}{stationary}, "
-                        f"moving_scale={names[3]}{moving}, "
-                        f"accumulate={c > 0})"
-                    )
-                grid = np.stack(
-                    np.broadcast_arrays(
-                        *[c[:, None] for c in lead_coords],
-                        (j + np.arange(w))[None, :],
-                    )
-                )
-                chunk = Chunk(acc, MOVING_FREE, out_shape, grid)
-                self._chain(prims[1:], {anchor.name: chunk}, dst)
+    def _block(self, view, index, lo, hi, x, width):
+        """The access to a GEMM operand ``[..., K, X]`` held contraction on
+        the partitions: rows ``lo .. hi`` of the contraction and columns
+        ``x .. x + width`` of its batch element ``index``."""
+        key = ("block", view.key(), index, lo, hi, x, width)
+        if key not in self.memo:
+            k, cols = view.shape[-2:]
+            rows = (index * k + lo + np.arange(hi - lo))[:, None]
+            linear = rows * cols + x + np.arange(width)[None, :]
+            offsets = self.flat(view, linear)
+            aps = fit([(self.free(view.box), offsets)], hi - lo)
+            if aps is None:
+                raise NotImplementedError(f"{view.box.name}: a GEMM block")
+            self.memo[key] = _ap(self.var(view.box, view.slot), aps[0])
+        return self.memo[key]
 
     def _quantize_mx(self, prim, source, dst):
         """``quantize_mx`` of the stored chunk ``source`` into ``dst``, its
@@ -1309,15 +1272,17 @@ class Kernel:
             raise NotImplementedError(f"{prim.name}: not Trn3's MX rule")
         r, w = source.coords.shape[1:]
         if source.dtype != "bfloat16" or source.flat is not None:
-            temp = self.pool("q", (PARTITIONS, w), "bfloat16", 2)
+            temp = self.temp("q", w)
             out = Chunk(temp, w, source.shape, source.coords, dtype="bfloat16")
             self._copy_chunk(out, source)
             source = out
         # Where the chunk's rows and columns land in the codes tile.
-        if not codes_view.covers_box() or codes_view.shape != source.shape:
-            raise NotImplementedError(f"{prim.name}: into part of a tile")
-        mx, padded = self.mx_tiles[codes_view.box.name]
-        x, k = mx.coords(np.ravel_multi_index(source.coords, source.shape))
+        if math.prod(codes_view.shape) != math.prod(source.shape):
+            raise NotImplementedError(f"{prim.name}: into another shape")
+        box = codes_view.box
+        mx, padded = self.mx_tiles[box.name]
+        linear = np.ravel_multi_index(source.coords, source.shape)
+        x, k = mx.coords(codes_view.positions(linear))
         x0, k0 = int(x[0, 0]), int(k[0, 0])
         if not (
             np.all(x == x0 + np.arange(r)[:, None])
@@ -1336,13 +1301,13 @@ class Kernel:
             parts = (hi - lo) // MX_PACK
             if (hi - lo) % (QUADRANT * MX_PACK) or kk % (QUADRANT * MX_PACK):
                 raise NotImplementedError(f"{prim.name}: columns {kk}+")
-            staging = self.pool("qs", (PARTITIONS, stage_free), "bfloat16", 2)
+            staging = self.temp("qs", stage_free)
             for j in range(MX_PACK):
                 data = (
                     f"{source.var}.ap(pattern=[[{source.free}, {r}], "
                     f"[{MX_PACK}, {parts}]], offset={lo + j})"
                 )
-                transposed = self._transpose(data, r, parts, "bfloat16")
+                transposed = self._transpose(data, r, parts)
                 self.emit(
                     f"nisa.tensor_copy(dst={staging}.ap(pattern="
                     f"[[{stage_free}, {parts}], [{MX_PACK}, {r}]], "
@@ -1358,9 +1323,31 @@ class Kernel:
             )
 
     def _elementwise(self, prims, dst):
-        """Elementwise ops, chunk by chunk of the first op's result."""
+        """Elementwise ops, chunk by chunk of the first op's result: 128 rows
+        and up to ``CHUNK_FREE`` columns at a time, or, reading a tile from
+        PSUM in whole 128-row blocks, every block at once -- PSUM holds a
+        tile's blocks side by side within a bank."""
         shape = self._result_shape(prims[0], {})
         rows, cols = _rows_cols(shape)
+        # A scratch region (``temp``), named ``<group>.<kind>_<cols>``, is
+        # not an operand.
+        reads_psum = any(
+            arg.tensor_box.box.memory.level == LOCAL
+            for prim in prims
+            for key, arg in prim.kwargs.items()
+            if arg.WhichOneof("arg_type") == "tensor_box" and "." not in key
+        )
+        if reads_psum and rows > PARTITIONS and rows % PARTITIONS == 0:
+            # Partition ``p`` holds row ``b * 128 + p`` of each block ``b``.
+            row = np.arange(PARTITIONS)[:, None] + np.arange(
+                0, rows, PARTITIONS
+            )
+            linear = (row[:, :, None] * cols + np.arange(cols)).reshape(
+                PARTITIONS, -1
+            )
+            coords = np.stack(np.unravel_index(linear, shape))
+            self._chain(prims, {}, dst, Chunk(None, None, shape, coords))
+            return
         for a, b in _runs(rows, PARTITIONS):
             for lo, hi in _runs(cols, CHUNK_FREE):
                 linear = np.arange(a, b)[:, None] * cols
@@ -1390,8 +1377,9 @@ class Kernel:
         ``values`` holds the chunk's results so far, by name; ``grid`` is the
         chunk of the first op's result when no result exists yet.  A
         relayout only re-maps the coordinates of what it reads; the last
-        computing op writes ``dst`` directly unless a relayout follows it,
-        and then the relayout's result is copied there.
+        computing op writes ``dst`` directly, through the relayouts after
+        it, and with no computing op the last relayout's result is copied
+        there.
         """
         computing = [
             i for i, p in enumerate(prims) if p.target not in RELAYOUTS
@@ -1400,18 +1388,13 @@ class Kernel:
         result = next(iter(values.values()), grid)
         for index, prim in enumerate(prims):
             if prim.target in RELAYOUTS:
-                arg = prim.kwargs["input"].tensor_box
-                result = self._read(arg, values)
-                if prim.target == "aten::transpose":
-                    result = result.transposed(
-                        prim.kwargs["dim0"].scalar.int_value,
-                        prim.kwargs["dim1"].scalar.int_value,
-                    )
-                values[prim.name] = result
+                values[prim.name] = result = self._relayout(prim, values)
                 continue
             if prim.target == QUANTIZE_MX:
                 if index != len(prims) - 1:
-                    raise NotImplementedError(f"{prim.name}: placement")
+                    raise NotImplementedError(
+                        f"{prim.name}: a quantize_mx before the last op"
+                    )
                 arg = prim.kwargs["input"].tensor_box
                 if not arg.box.HasField("memory"):
                     source = self._read(arg, values)
@@ -1441,21 +1424,44 @@ class Kernel:
                 raise NotImplementedError(f"{prim.name}: broadcasts a result")
             following = [p.target for p in prims[index + 1 :]]
             following = [t for t in following if t not in RELAYOUTS]
-            if index == last and last == len(prims) - 1:
-                out = self._destination(dst, source)
+            if index == last:
+                # Where each element lands in ``dst``, past the relayouts.
+                landing = {
+                    **values,
+                    prim.name: Chunk(None, None, shape, source.coords),
+                }
+                moved = landing[prim.name]
+                for after in prims[index + 1 :]:
+                    moved = landing[after.name] = self._relayout(after, landing)
+                out = replace(
+                    self._destination(dst, moved),
+                    shape=shape,
+                    coords=source.coords,
+                )
             elif following[:1] == [QUANTIZE_MX]:
                 # What ``quantize_mx`` reads, in its own type.
                 r, w = source.coords.shape[1:]
-                temp = self.pool("q", (PARTITIONS, w), "bfloat16", 2)
+                temp = self.temp("q", w)
                 out = Chunk(temp, w, shape, source.coords, dtype="bfloat16")
             else:
                 r, w = source.coords.shape[1:]
-                temp = self.pool("t", (PARTITIONS, w), "float32", 2)
+                temp = self.temp("t", w)
                 out = Chunk(temp, w, shape, source.coords)
             self._apply(prim, out, values, source)
             values[prim.name] = result = out
-        if not computing or last != len(prims) - 1:
+        if not computing:
             self._copy_chunk(self._destination(dst, result), result)
+
+    def _relayout(self, prim, values):
+        """The result relayout ``prim`` reads (``values``, by name), its
+        coordinates re-mapped as ``prim`` moves its elements."""
+        result = self._read(prim.kwargs["input"].tensor_box, values)
+        if prim.target != "aten::transpose":
+            return result
+        return result.transposed(
+            prim.kwargs["dim0"].scalar.int_value,
+            prim.kwargs["dim1"].scalar.int_value,
+        )
 
     def _read(self, ref, values):
         """The stored result a memoryless reference names, seen as its
@@ -1492,7 +1498,7 @@ class Kernel:
             return "tile", (chunk.var, chunk.free, chunk.offsets())
         view = self._view(ref)
         coords = source.coords
-        r, w = coords.shape[1:]
+        r = coords.shape[1]
         if view.box.level == IMMEDIATE:
             return "scalar", repr(self.immediates[view.box.name])
         if view.box.level == DRAM:
@@ -1500,7 +1506,7 @@ class Kernel:
             # every partition, one value per row.
             if math.prod(view.shape) != 1:
                 raise NotImplementedError("an elementwise operand in HBM")
-            column = self.pool("sc", (PARTITIONS, 1), "float32", 2)
+            column = self.temp("sc", 1)
             offset = int(self.flat(view, np.zeros(1, dtype=int))[0])
             self.emit(
                 f"nisa.dma_copy(dst={column}, src={self.var(view.box)}.ap("
@@ -1514,16 +1520,18 @@ class Kernel:
             for d, size in enumerate(view.shape)
         ]
         linear = np.ravel_multi_index(own, view.shape)
+        # One value per row of a result wider than one column.
+        per_row = view.shape[-1] == 1 and source.shape[-1] > 1
         flat = self.flat(view, linear, np.arange(r)[:, None])
         var, free = self.var(view.box, view.slot), self.free(view.box)
-        if view.shape[-1] == 1 and w > 1:
+        if per_row:
             aps = fit([(free, flat[:, :1])], r)
             if aps is None:
                 raise NotImplementedError("a column no pattern walks")
             column = _ap(var, aps[0])
             if view.box.dtype != "float32":
                 # A per-row scalar operand is float32 to the engines.
-                temp = self.pool("sc", (PARTITIONS, 1), "float32", 2)
+                temp = self.temp("sc", 1)
                 self.emit(
                     f"nisa.tensor_copy(dst={temp}[0:{r}, 0:1], src={column})"
                 )
@@ -1534,6 +1542,20 @@ class Kernel:
     def _apply(self, prim, out, values, source):
         """Emit the instruction computing ``prim`` into ``out``."""
         target = prim.target
+        if target in FILLS:
+            aps = fit([(out.free, out.offsets())], source.coords.shape[1])
+            if aps is None:
+                raise CrossesPartitions(out.box or prim.name)
+            key = FILLS[target]
+            value = float(self._scalar(prim.kwargs[key].scalar)) if key else 0.0
+            # Beside exponentials on ScalarE (``scalar_exps``), which keep
+            # VectorE busy too, a fill runs on GpSimd.
+            on = ", engine=nisa.gpsimd_engine" if self.scalar_exps else ""
+            self.emit(
+                f"nisa.memset(dst={_ap(out.var, aps[0])}, value={value!r}"
+                f"{on})"
+            )
+            return
         keys = ("condition", "input", "other")
         if target in (QUANTIZE, DEQUANTIZE):
             keys = ("input", "scale")
@@ -1550,6 +1572,9 @@ class Kernel:
             if key in prim.kwargs
         ]
         tiles = [value for kind, value in operands if kind == "tile"]
+        # Beside exponentials on ScalarE (``scalar_exps``), a
+        # ``tensor_scalar`` runs on VectorE.
+        engine = ", engine=nisa.vector_engine" if self.scalar_exps else ""
         aps = fit(
             [(out.free, out.offsets())] + [(f, o) for _, f, o in tiles],
             source.coords.shape[1],
@@ -1573,12 +1598,12 @@ class Kernel:
             elif kinds[0] == "tile":
                 self.emit(
                     f"nisa.tensor_scalar(dst={dst}, data={args[0]}, "
-                    f"op0={op}, operand0={args[1]})"
+                    f"op0={op}, operand0={args[1]}{engine})"
                 )
             elif kinds[1] == "tile":
                 self.emit(
                     f"nisa.tensor_scalar(dst={dst}, data={args[1]}, "
-                    f"op0={op}, operand0={args[0]}, reverse0=True)"
+                    f"op0={op}, operand0={args[0]}, reverse0=True{engine})"
                 )
             else:
                 raise NotImplementedError(f"{prim.name}: no tile operand")
@@ -1592,7 +1617,7 @@ class Kernel:
             else:
                 self.emit(
                     f"nisa.tensor_scalar(dst={dst}, data={args[0]}, "
-                    f"op0=nl.multiply, operand0={inverse})"
+                    f"op0=nl.multiply, operand0={inverse}{engine})"
                 )
         elif target == "aten::where":
             self._where(dst, args, kinds, source.coords.shape[1:])
@@ -1604,7 +1629,7 @@ class Kernel:
             # rounds input / scale, then saturated and cast to FP8.
             inverse = self._reciprocal(args[1], kinds[1], source)
             r, w = source.coords.shape[1:]
-            temp = self.pool("t", (PARTITIONS, w), "bfloat16", 2)
+            temp = self.temp("qt", w)
             quotient = f"{temp}[0:{r}, 0:{w}]"
             self.emit(
                 f"nisa.tensor_scalar(dst={quotient}, data={args[0]}, "
@@ -1620,6 +1645,8 @@ class Kernel:
                 f"nisa.tensor_scalar(dst={dst}, data={args[0]}, "
                 f"op0=nl.multiply, operand0={args[1]})"
             )
+        elif target == "aten::clone":
+            self.emit(f"nisa.tensor_copy(dst={dst}, src={args[0]})")
         elif target == "aten::neg":
             self.emit(
                 f"nisa.tensor_scalar(dst={dst}, data={args[0]}, "
@@ -1635,32 +1662,26 @@ class Kernel:
         else:
             raise NotImplementedError(f"{prim.name}: {target}")
 
-    def _transpose(self, data, r, c, dtype):
-        """Transpose ``data``, an ``[r, c]`` access, on TensorE into PSUM;
-        the access to the ``[c, r]`` result there.  An FP8 transpose writes
-        every other element."""
-        step = 2 if _fp8(dtype) is not None else 1
-        psum = self.pool(
-            "tp", (PARTITIONS, step * PARTITIONS), dtype, TRANSPOSES
-        )
-        result = (
-            f"{psum}.ap(pattern=[[{step * PARTITIONS}, {c}], [{step}, {r}]], "
-            f"offset=0)"
-        )
+    def _transpose(self, data, r, c):
+        """Transpose ``data``, an ``[r, c]`` bfloat16 access, on TensorE into
+        the next of a ``quantize_mx``'s PSUM scratch tiles (``temp``); the
+        access to the ``[c, r]`` result there."""
+        psum = self.temp("tp", PARTITIONS)
+        result = f"{psum}.ap(pattern=[[{PARTITIONS}, {c}], [1, {r}]], offset=0)"
         self.emit(f"nisa.nc_transpose(dst={result}, data={data})")
         return result
 
     def _reciprocal(self, value, kind, source):
         """``1 / value`` as an operand: a literal for a scalar, else computed
-        into a temporary of the same kind (there is no ALU divide)."""
+        into a scratch tile of the same kind (there is no ALU divide)."""
         if kind == "scalar":
             return repr(1.0 / float(value))
         r, w = source.coords.shape[1:]
         if kind == "column":
-            temp = self.pool("sc", (PARTITIONS, 1), "float32", 2)
+            temp = self.temp("sc", 1)
             inverse = f"{temp}[0:{r}, 0:1]"
         else:
-            temp = self.pool("t", (PARTITIONS, w), "float32", 2)
+            temp = self.temp("t", w)
             inverse = f"{temp}[0:{r}, 0:{w}]"
         self.emit(f"nisa.reciprocal(dst={inverse}, data={value})")
         return inverse
@@ -1671,10 +1692,9 @@ class Kernel:
         rounds), and one more if that leaves it above pi."""
         r, w = chunk
         shifted, reduced = (
-            self.pool("t", (PARTITIONS, w), "float32", 2) + f"[0:{r}, 0:{w}]"
-            for _ in range(2)
+            self.temp("t", w) + f"[0:{r}, 0:{w}]" for _ in range(2)
         )
-        turns = self.pool("k", (PARTITIONS, w), "int32", 2) + f"[0:{r}, 0:{w}]"
+        turns = self.temp("k", w) + f"[0:{r}, 0:{w}]"
         turn = 2 * math.pi
         self.emit(
             f"nisa.tensor_scalar(dst={shifted}, data={angle}, op0=nl.add, "
@@ -1707,10 +1727,10 @@ class Kernel:
         condition, x, y = args
         r, w = chunk
         if kinds[0] == "tile":
-            other = self.pool("t", (PARTITIONS, w), "float32", 2)
+            other = self.temp("t", w)
             inverse = f"{other}[0:{r}, 0:{w}]"
         elif kinds[0] == "column":
-            other = self.pool("sc", (PARTITIONS, 1), "float32", 2)
+            other = self.temp("sc", 1)
             inverse = f"{other}[0:{r}, 0:1]"
         else:
             raise NotImplementedError("where on a scalar condition")
@@ -1723,7 +1743,7 @@ class Kernel:
             (condition, x, kinds[1]),
             (inverse, y, kinds[2]),
         ):
-            temp = self.pool("t", (PARTITIONS, w), "float32", 2)
+            temp = self.temp("t", w)
             term = f"{temp}[0:{r}, 0:{w}]"
             if kind == "tile" and kinds[0] == "tile":
                 self.emit(
@@ -1780,7 +1800,7 @@ class Kernel:
         """A row-wise op (a layer norm, an RMS norm, a softmax) and the ops
         fused before or after it, 128 rows at a time.  The ops before it
         write each block's rows to ``dst``, where the op then runs in place;
-        the op writes ``dst`` itself, or a temporary the ops after it
+        the op writes ``dst`` itself, or a scratch tile the ops after it
         read."""
         index = next(i for i, p in enumerate(prims) if p.target in ROWWISE)
         pre, prim, post = prims[:index], prims[index], prims[index + 1 :]
@@ -1803,7 +1823,7 @@ class Kernel:
             if not post:
                 rows_op(prim, data, r, self._rows_ap(dst, start, r, 0, cols))
                 continue
-            temp = self.pool("rw", (PARTITIONS, cols), "float32", 2)
+            temp = self.temp("rw", cols)
             rows_op(prim, data, r, f"{temp}[0:{r}, 0:{cols}]")
             linear = (start + np.arange(r))[:, None] * cols + np.arange(cols)
             coords = np.stack(np.unravel_index(linear, shape))
@@ -1827,18 +1847,18 @@ class Kernel:
         ]
         pieces = _runs(cols, STATS_FREE)
         data = rows(0, cols)
-        stats = self.pool("st", (PARTITIONS, 6 * len(pieces)), "float32", 2)
+        stats = self.temp("st", 6 * len(pieces))
         for q, (lo, hi) in enumerate(pieces):
             self.emit(
                 f"nisa.bn_stats(dst={stats}[0:{r}, {6 * q}:{6 * q + 6}], "
                 f"data={rows(lo, hi)})"
             )
-        moments = self.pool("mv", (PARTITIONS, 2), "float32", 2)
+        moments = self.temp("mv", 2)
         self.emit(
             f"nisa.bn_aggr(dst={moments}[0:{r}, 0:2], "
             f"data={stats}[0:{r}, 0:{6 * len(pieces)}])"
         )
-        rstd = self.pool("rs", (PARTITIONS, 1), "float32", 2)
+        rstd = self.temp("rs", 1)
         self.emit(
             f"nisa.tensor_scalar(dst={rstd}[0:{r}, 0:1], "
             f"data={moments}[0:{r}, 1:2], op0=nl.add, "
@@ -1888,19 +1908,19 @@ class Kernel:
             raise NotImplementedError("an RMS norm over more than one dim")
         weight = self._view(prim.kwargs["weight"].tensor_box)
         pieces = _runs(cols, STATS_FREE)
-        stats = self.pool("st", (PARTITIONS, 6 * len(pieces)), "float32", 2)
+        stats = self.temp("st", 6 * len(pieces))
         for q, (lo, hi) in enumerate(pieces):
             self.emit(
                 f"nisa.bn_stats(dst={stats}[0:{r}, {6 * q}:{6 * q + 6}], "
                 f"data={rows(lo, hi)})"
             )
-        moments = self.pool("mv", (PARTITIONS, 2), "float32", 2)
+        moments = self.temp("mv", 2)
         self.emit(
             f"nisa.bn_aggr(dst={moments}[0:{r}, 0:2], "
             f"data={stats}[0:{r}, 0:{6 * len(pieces)}])"
         )
         mean = f"{moments}[0:{r}, 0:1]"
-        rstd = f"{self.pool('rs', (PARTITIONS, 1), 'float32', 2)}[0:{r}, 0:1]"
+        rstd = self.temp("rs", 1) + f"[0:{r}, 0:1]"
         self.emit(
             f"nisa.scalar_tensor_tensor(dst={rstd}, data={mean}, "
             f"op0=nl.multiply, operand0={mean}, op1=nl.add, "
@@ -1918,27 +1938,111 @@ class Kernel:
             f"operand1={self._rows_ap(weight, 0, r, 0, cols)})"
         )
 
+    def _rms_norm_kmajor(self, prims, dst):
+        """RMS norm of a K-major ``[..., H, T]`` tile over ``H``, which lies
+        across the partitions, into ``dst``.  Per 512 columns: the 128-row
+        blocks squared on ScalarE, ``SQUARE_BLOCKS`` an instruction, the
+        squares summed over the blocks and their partitions by ones-matmuls
+        accumulating in PSUM -- which puts the sum on every partition -- the
+        mean square's rsqrt, then per block one pass scaling by it and by
+        the ``[H, 1]`` weight, one value per row."""
+        if len(prims) > 1:
+            raise NotImplementedError(f"{prims[1].name}: fused to an RMS norm")
+        prim = prims[0]
+        kw = self._kwargs(prim)
+        x = self._view(prim.kwargs["input"].tensor_box)
+        weight = self._view(prim.kwargs["weight"].tensor_box)
+        *lead, hidden, tokens = x.shape
+        if hidden > PARTITIONS and hidden % PARTITIONS:
+            raise NotImplementedError(f"{prim.name}: hidden size {hidden}")
+        parts = min(hidden, PARTITIONS)
+        blocks = hidden // parts
+        ones = self.temp("one", PARTITIONS)
+        column = self.temp("wc", blocks)
+        if ("ones", ones) not in self.memo:
+            self.memo["ones", ones] = True
+            self.emit(f"nisa.memset(dst={ones}, value=1.0)")
+        # The weight as float32 columns, block ``b``'s in column ``b``.
+        linear = np.arange(parts)[:, None] + np.arange(blocks) * parts
+        aps = fit([(self.free(weight.box), self.flat(weight, linear))], parts)
+        self.emit(
+            f"nisa.tensor_copy(dst={column}[0:{parts}, 0:{blocks}], "
+            f"src={_ap(self.var(weight.box, weight.slot), aps[0])})"
+        )
+        eps = float(kw["eps"])
+        free = self.config.moving_free_max
+        width = SQUARE_BLOCKS * free
+        for e in range(math.prod(lead)):
+            starts = [e * hidden + b * parts for b in range(blocks)]
+            for lo, hi in _runs(tokens, free):
+                w = hi - lo
+                acc = self.temp("acc", free)
+                for g in range(0, blocks, SQUARE_BLOCKS):
+                    group = range(g, min(blocks, g + SQUARE_BLOCKS))
+                    square = self.temp("sq", width)
+                    # The group's blocks side by side, partition ``p``
+                    # holding row ``starts[b] + p`` of each block ``b``.
+                    rows = np.array([starts[b] for b in group])
+                    rows = np.arange(parts)[:, None] + rows
+                    linear = rows[:, :, None] * tokens + np.arange(lo, hi)
+                    linear = linear.reshape(parts, -1)
+                    on_x = self.flat(x, linear, np.arange(parts)[:, None])
+                    on_square = np.arange(parts)[:, None] * width
+                    on_square = on_square + np.arange(len(group) * w)
+                    aps = fit(
+                        [(self.free(x.box), on_x), (width, on_square)], parts
+                    )
+                    if aps is None:
+                        raise NotImplementedError("blocks no pattern walks")
+                    self.emit(
+                        f"nisa.activation(dst={_ap(square, aps[1])}, "
+                        f"op=nl.square, "
+                        f"data={_ap(self.var(x.box, x.slot), aps[0])})"
+                    )
+                    for n, b in enumerate(group):
+                        self.emit(
+                            f"nisa.nc_matmul(dst={acc}[0:{PARTITIONS}, "
+                            f"0:{w}], stationary={ones}[0:{parts}, "
+                            f"0:{PARTITIONS}], moving={square}[0:{parts}, "
+                            f"{n * w}:{(n + 1) * w}], accumulate={b > 0})"
+                        )
+                rstd = self.temp("rq", free)
+                rstd = f"{rstd}[0:{parts}, 0:{w}]"
+                self.emit(
+                    f"nisa.tensor_scalar(dst={rstd}, data={acc}[0:{parts}, "
+                    f"0:{w}], op0=nl.multiply, operand0={1 / hidden!r}, "
+                    f"op1=nl.add, operand1={eps!r})"
+                )
+                self.emit(
+                    f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})"
+                )
+                for b, start in enumerate(starts):
+                    self.emit(
+                        "nisa.scalar_tensor_tensor(dst="
+                        f"{self._rows_ap(dst, start, parts, lo, hi)}, "
+                        f"data={self._rows_ap(x, start, parts, lo, hi)}, "
+                        f"op0=nl.multiply, operand0={column}[0:{parts}, "
+                        f"{b}:{b + 1}], op1=nl.multiply, operand1={rstd})"
+                    )
+
     def _softmax(self, prim, rows, r, out):
         """Softmax over the last dim of the ``r`` rows ``rows(lo, hi)`` reads
-        (columns ``lo .. hi``) into ``out``: the row maximum, the
-        exponentials summed on the way, the scaling by the sum's
-        reciprocal."""
+        (columns ``lo .. hi``) into ``out``: the row maximum, negated, the
+        exponentials on ScalarE summed on the way, and the scaling by the
+        sum's reciprocal on VectorE, so ScalarE runs only the
+        exponentials."""
         kw = self._kwargs(prim)
         shape = prim.kwargs["input"].tensor_box.output_shape
         cols = shape[-1]
         if kw["dim"] % len(shape) != len(shape) - 1:
             raise NotImplementedError("a softmax over a dim but the last")
         data = rows(0, cols)
-        top = self.pool("mx", (PARTITIONS, 1), "float32", 2)
-        total = self.pool("sm", (PARTITIONS, 1), "float32", 2)
-        exps = self.pool("t", (PARTITIONS, cols), "float32", 2)
+        top = self.temp("mx", 1)
+        total = self.temp("sm", 1)
+        exps = self.temp("t", cols)
         self.emit(
             f"nisa.tensor_reduce(dst={top}[0:{r}, 0:1], op=nl.maximum, "
-            f"data={data}, axis=1, keepdims=True)"
-        )
-        self.emit(
-            f"nisa.tensor_scalar(dst={top}[0:{r}, 0:1], "
-            f"data={top}[0:{r}, 0:1], op0=nl.multiply, operand0=-1.0)"
+            f"data={data}, axis=1, negate=True, keepdims=True)"
         )
         self.emit(
             f"nisa.activation(dst={exps}[0:{r}, 0:{cols}], op=nl.exp, "
@@ -1952,12 +2056,50 @@ class Kernel:
         )
         self.emit(
             f"nisa.tensor_scalar(dst={out}, data={exps}[0:{r}, 0:{cols}], "
-            f"op0=nl.multiply, operand0={total}[0:{r}, 0:1])"
+            f"op0=nl.multiply, operand0={total}[0:{r}, 0:1], "
+            f"engine=nisa.vector_engine)"
         )
+
+    def _reduce(self, prims, dst):
+        """A max or sum over a stored tile's last dim into ``dst``, kept as
+        a dim of 1: one ``tensor_reduce`` per 128 rows."""
+        if len(prims) > 1:
+            raise NotImplementedError(f"{prims[1].name}: fused to a reduction")
+        prim = prims[0]
+        kw = self._kwargs(prim)
+        x = self._view(prim.kwargs["input"].tensor_box)
+        last = len(x.shape) - 1
+        if [d % len(x.shape) for d in kw["dim"]] != [last] or not kw["keepdim"]:
+            raise NotImplementedError(f"{prim.name}: not over the last dim")
+        rows, cols = _rows_cols(x.shape)
+        for start, stop in _runs(rows, PARTITIONS):
+            r = stop - start
+            self.emit(
+                f"nisa.tensor_reduce(dst={self._rows_ap(dst, start, r, 0, 1)}, "
+                f"op={REDUCTIONS[prim.target]}, "
+                f"data={self._rows_ap(x, start, r, 0, cols)}, axis=1, "
+                "keepdims=True)"
+            )
+
+    def _transposed(self, prim):
+        """The stored tile ``aten.transpose`` prim ``prim`` swaps the last two
+        dims of.
+
+        Raises:
+            NotImplementedError: It swaps other dims.
+        """
+        x = self._view(prim.kwargs["input"].tensor_box)
+        ndim = len(x.shape)
+        dims = sorted(
+            prim.kwargs[k].scalar.int_value % ndim for k in ("dim0", "dim1")
+        )
+        if dims != [ndim - 2, ndim - 1]:
+            raise NotImplementedError(f"{prim.name}: not the last two dims")
+        return x
 
     def _max_pool(self, prims, dst):
         """A 2-D max pool of its input's windows (``_window_load``) into
-        ``dst``: the ``kH`` rows of each window maxed into a temporary, then
+        ``dst``: the ``kH`` rows of each window maxed into a scratch tile, then
         its ``kW`` columns, ``sW`` apart, into ``dst``."""
         if len(prims) > 1:
             raise NotImplementedError("ops fused after a pool")
@@ -1975,7 +2117,7 @@ class Kernel:
             return
         cols, iw = dst.box.cols, x.box.cols
         src = self.var(x.box, x.slot)
-        temp = self.pool("pv", (PARTITIONS, iw), x.box.dtype, 2)
+        temp = self.temp("pv", iw)
         vertical = f"{temp}[0:{out_rows}, 0:{iw}]"
 
         def strip(k):
@@ -2007,6 +2149,239 @@ class Kernel:
                 f"data2={tap(k)}, op=nl.maximum)"
             )
 
+    # TensorE writing PSUM.
+
+    def _nc_matmul(self, gemm, dst, accumulate):
+        """K-major GEMM prim ``gemm`` into PSUM view ``dst``: per batch
+        element, 128 rows and 512 columns of the result, one ``nc_matmul``
+        per 128-deep chunk of the contraction, each after the first adding
+        to the ones before, and the first too given ``accumulate``.  The
+        activation is the stationary operand, or the moving one when the
+        output is transposed (``_gemm_kmajor``).
+
+        Raises:
+            NotImplementedError: The GEMM has a bias.
+        """
+        if self._kwargs(gemm).get("bias") is not None:
+            raise NotImplementedError(f"{gemm.name}: a K-major GEMM's bias")
+        act, weight = (
+            self._view(gemm.kwargs[k].tensor_box)
+            for k in ("input", "weight", "other")
+            if k in gemm.kwargs
+        )
+        batch, batch_a, batch_w, m, k, n = self._gemm_extents(gemm, act, weight)
+        operands = [(act, batch_a, m), (weight, batch_w, n)]
+        if _output_transposed(gemm):
+            operands.reverse()
+        (stationary, batch_s, rows), (moving, batch_m, cols) = operands
+        for e in range(math.prod(batch)):
+            e_coords = [int(c) for c in np.unravel_index(e, batch)]
+            es = _batch_index(e_coords, batch_s)
+            em = _batch_index(e_coords, batch_m)
+            for i, i_end in _runs(rows, PARTITIONS):
+                r = i_end - i
+                for j, j_end in _runs(cols, self.config.moving_free_max):
+                    out = self._rows_ap(dst, e * rows + i, r, j, j_end)
+                    for c, (lo, hi) in enumerate(_runs(k, PARTITIONS)):
+                        self.emit(
+                            f"nisa.nc_matmul(dst={out}, stationary="
+                            f"{self._block(stationary, es, lo, hi, i, r)}, "
+                            "moving="
+                            f"{self._block(moving, em, lo, hi, j, j_end - j)}"
+                            f", accumulate={c > 0 or accumulate})"
+                        )
+
+    def _nc_matmul_mx(self, gemm, dst, accumulate):
+        """MX GEMM prim ``gemm`` (``linear_mx``) into PSUM view ``dst``: per
+        128 rows and 512 columns of the result, one ``nc_matmul_mx`` per
+        512-element chunk of the contraction, each after the first adding to
+        the ones before, and the first too given ``accumulate``.  The
+        operands are parts of on-chip tiles in the ``Mx`` layout -- some of
+        an activation's rows, some of a weight's columns -- so nothing is
+        transposed; a stationary chunk of odd width takes the tile's zeroed
+        pad column with it, and writes a row of PSUM more.
+
+        Raises:
+            NotImplementedError: The GEMM has a bias or codebooks, blocks
+                other than 32, or a contraction not in whole chunks.
+        """
+        kw = self._kwargs(gemm)
+        extra = [
+            k
+            for k in ("bias", "input_code", "weight_code")
+            if kw.get(k) is not None
+        ]
+        if extra or kw.get("block_size") != MX_BLOCK:
+            raise NotImplementedError(f"{gemm.name}: {extra or kw}")
+        act, act_scale, weight, weight_scale = (
+            self._view(gemm.kwargs[key].tensor_box) for key in MX_OPERANDS
+        )
+        *lead, k = act.shape
+        k_w, n = weight.shape
+        if k != k_w or k % MX_CHUNK:
+            raise NotImplementedError(f"{gemm.name}: contraction {k}")
+        # The activation's first row and the weight's first column in
+        # their tiles: the rows and columns the ``Mx`` layout places.
+        first = np.zeros(1, dtype=int)
+        x0 = int(act.positions(first)[0]) // act.box.cols
+        y0 = int(weight.positions(first)[0]) % weight.box.cols
+        rows_padded = self.mx_tiles[act.box.name][1]
+        cols_padded = self.mx_tiles[weight.box.name][1]
+        names = [
+            self.var(v.box, v.slot)
+            for v in (act, act_scale, weight, weight_scale)
+        ]
+        psum = self.var(dst.box, dst.slot)
+        row0, col0 = dst.start[-2:]
+        for i, i_end in _runs(math.prod(lead), PARTITIONS):
+            width = i_end - i + (i_end - i) % 2
+            for j, j_end in _runs(n, self.config.moving_free_max):
+                w = j_end - j
+                out = (
+                    f"{psum}[{row0 + i}:{row0 + i + width}, "
+                    f"{col0 + j}:{col0 + j_end}]"
+                )
+                for c in range(k // MX_CHUNK):
+                    a = c * rows_padded + x0 + i
+                    b = c * cols_padded + y0 + j
+                    stationary = f"[0:{PARTITIONS}, {a}:{a + width}]"
+                    moving = f"[0:{PARTITIONS}, {b}:{b + w}]"
+                    self.emit(
+                        f"nisa.nc_matmul_mx(dst={out}, "
+                        f"stationary={names[0]}{stationary}, "
+                        f"moving={names[2]}{moving}, "
+                        f"stationary_scale={names[1]}{stationary}, "
+                        f"moving_scale={names[3]}{moving}, "
+                        f"accumulate={c > 0 or accumulate})"
+                    )
+
+    def _psum_transpose(self, prim, dst):
+        """A stored tile ``[..., a, b]`` transposed into PSUM view ``dst``,
+        ``[..., b, a]``: one ``nc_transpose`` per 128 x 128 block, by block
+        row of the result."""
+        x = self._transposed(prim)
+        *lead, a, b = x.shape
+        for e in range(math.prod(lead)):
+            for j, j_end in _runs(b, PARTITIONS):
+                for i, i_end in _runs(a, PARTITIONS):
+                    out = self._rows_ap(dst, e * b + j, j_end - j, i, i_end)
+                    block = self._rows_ap(x, e * a + i, i_end - i, j, j_end)
+                    self.emit(f"nisa.nc_transpose(dst={out}, data={block})")
+
+    def _eye(self, dst, value):
+        """An identity matrix times ``value`` into ``dst``: per 128 rows, a
+        ``memset`` of ``value``, then GpSimd's ``affine_select`` keeping the
+        elements whose column is their row -- the block's first row plus the
+        partition."""
+        rows, cols = dst.shape
+        for start, stop in _runs(rows, PARTITIONS):
+            out = self._rows_ap(dst, start, stop - start, 0, cols)
+            self.emit(f"nisa.memset(dst={out}, value={value!r})")
+            self.emit(
+                f"nisa.affine_select(dst={out}, pattern=[[-1, {cols}]], "
+                f"channel_multiplier=1, on_true_tile={out}, "
+                f"on_false_value=0.0, cmp_op=nl.equal, offset={start})"
+            )
+
+    # The fused patterns (``PATTERN_HANDLERS``): each group one instruction
+    # per 128 rows, ``dst`` its results' views in order.
+
+    def _tensor_scalar(self, prims, dst):
+        """``(data <op0> column) <op1> constant``: a ``tensor_scalar`` of two
+        operators per 128 rows, on VectorE, as ScalarE is the
+        exponentials'."""
+        first, second = prims
+        (out,) = dst
+        data, column = (
+            self._view(first.kwargs[k].tensor_box) for k in ("input", "other")
+        )
+        constant = float(self._kwargs(second)["other"])
+        rows, cols = _rows_cols(data.shape)
+        for start, stop in _runs(rows, PARTITIONS):
+            r = stop - start
+            self.emit(
+                f"nisa.tensor_scalar(dst="
+                f"{self._rows_ap(out, start, r, 0, cols)}, "
+                f"data={self._rows_ap(data, start, r, 0, cols)}, "
+                f"op0={BINARY_OPS[first.target]}, "
+                f"operand0={self._rows_ap(column, start, r, 0, 1)}, "
+                f"op1={BINARY_OPS[second.target]}, operand1={constant!r}, "
+                "engine=nisa.vector_engine)"
+            )
+
+    def _tensor_scalar_reduce(self, prims, dst):
+        """``data <op> constant`` and its rows reduced: one
+        ``tensor_scalar_reduce`` per 128 rows, the rows reduced as
+        stored."""
+        first, reduction = prims[0], prims[-1]
+        out, reduced = dst
+        data = self._view(first.kwargs["input"].tensor_box)
+        constant = float(self._kwargs(first)["other"])
+        rows, cols = _rows_cols(data.shape)
+        for start, stop in _runs(rows, PARTITIONS):
+            r = stop - start
+            self.emit(
+                f"nisa.tensor_scalar_reduce(dst="
+                f"{self._rows_ap(out, start, r, 0, cols)}, "
+                f"data={self._rows_ap(data, start, r, 0, cols)}, "
+                f"op0={BINARY_OPS[first.target]}, operand0={constant!r}, "
+                f"reduce_op={REDUCTIONS[reduction.target]}, "
+                f"reduce_res={self._rows_ap(reduced, start, r, 0, 1)})"
+            )
+
+    def _activation_reduce(self, prims, dst):
+        """``exp(data + bias)`` and its rows' sums: one ScalarE
+        ``activation`` per 128 rows, summing its rows from zero."""
+        add, function, _ = prims
+        out, sums = dst
+        data, bias = (
+            self._view(add.kwargs[k].tensor_box) for k in ("input", "other")
+        )
+        rows, cols = _rows_cols(data.shape)
+        for start, stop in _runs(rows, PARTITIONS):
+            r = stop - start
+            self.emit(
+                f"nisa.activation(dst={self._rows_ap(out, start, r, 0, cols)}"
+                f", op={ACTIVATIONS[function.target]}, "
+                f"data={self._rows_ap(data, start, r, 0, cols)}, "
+                f"bias={self._rows_ap(bias, start, r, 0, 1)}, "
+                "reduce_op=nl.add, "
+                f"reduce_res={self._rows_ap(sums, start, r, 0, 1)}, "
+                "reduce_cmd=nisa.reduce_cmd.reset_reduce)"
+            )
+
+    def _scaled_identity(self, prims, dst):
+        """An identity times the constant its ``mul`` takes (``_eye``)."""
+        _, mul = prims
+        (out,) = dst
+        self._eye(out, float(self._kwargs(mul)["other"]))
+
+    def _matmul_accumulate(self, prims, dst):
+        """A K-major or MX GEMM's product added to the PSUM partial sum it
+        writes back: its ``nc_matmul``s or ``nc_matmul_mx``s, each
+        accumulating.
+
+        Raises:
+            NotImplementedError: The partial sum is not the PSUM view the
+                group writes.
+        """
+        gemm, add = prims
+        (out,) = dst
+        partial = next(
+            self._view(arg.tensor_box)
+            for arg in add.kwargs.values()
+            if arg.WhichOneof("arg_type") == "tensor_box"
+            and arg.tensor_box.box.HasField("memory")
+        )
+        if out.box.level != LOCAL or partial.key() != out.key():
+            raise NotImplementedError(
+                f"{add.name}: a sum other than the PSUM view it writes"
+            )
+        if gemm.target == LINEAR_MX:
+            self._nc_matmul_mx(gemm, out, accumulate=True)
+        else:
+            self._nc_matmul(gemm, out, accumulate=True)
+
     # Source.
 
     def source(self, name):
@@ -2026,7 +2401,7 @@ class Kernel:
                 f"dtype={dtype}, buffer=nl.shared_hbm)"
             )
         for box in self.boxes.values():
-            if box.level != SCRATCHPAD:
+            if box.level not in ON_CHIP:
                 continue
             if box.name in self.mx_tiles:
                 mx, padded = self.mx_tiles[box.name]
@@ -2037,22 +2412,16 @@ class Kernel:
             else:
                 layout = self.layouts[box.name]
                 shape, dtype = (layout.parts, layout.free), nl_dtype(box.dtype)
+            buffer = "nl.psum" if box.level == LOCAL else "nl.sbuf"
             for slot in range(box.slots):
                 var = self.var(box, slot)
                 lines.append(
                     f"    {var} = nl.ndarray({shape!r}, dtype={dtype}, "
-                    f"buffer=nl.sbuf)"
+                    f"buffer={buffer})"
                 )
                 if box.name in self.mx_tiles and padded != mx.other:
                     # The pad column a stationary chunk of odd width takes.
                     lines.append(f"    nisa.memset(dst={var}, value=0)")
-        for (kind, shape, dtype), (names, _) in self.pools.items():
-            buffer = "nl.psum" if kind in ("tp", "acc") else "nl.sbuf"
-            for var in names:
-                lines.append(
-                    f"    {var} = nl.ndarray({shape!r}, "
-                    f"dtype={nl_dtype(dtype)}, buffer={buffer})"
-                )
         lines += ["    " + line for line in self.lines]
         outs = "".join(f"out{i}, " for i in range(len(self.writes)))
         lines.append(f"    return ({outs.rstrip(' ')})")
@@ -2390,12 +2759,13 @@ def _structure(ops, immediates, mx):
     return key, list(names)
 
 
-def translate(model, out_dir, immediates):
+def translate(model, out_dir, config, immediates):
     """Translate ``model`` into ``out_dir``.
 
     Args:
         model: A ``voyager`` IR ``Model``, or the path of its ``model.txt``.
         out_dir: Where the translation is written.
+        config: The ``TrainiumConfig`` Voyager compiled ``model`` for.
         immediates: The value of each immediate box (a constant the IR
             names but does not hold), by name.
 
@@ -2405,11 +2775,12 @@ def translate(model, out_dir, immediates):
     if isinstance(model, str):
         with open(model) as f:
             model = text_format.Parse(f.read(), ir.Model())
+    items = segments(model)
     os.makedirs(out_dir, exist_ok=True)
     mx, mx_scales = mx_arrays(model)
     sources, steps, lines, translated = {}, [], [], {}
     allocations = []
-    for kind, item in segments(model):
+    for kind, item in items:
         if kind == "alloc":
             allocations.append((len(steps), item))
             continue
@@ -2422,7 +2793,7 @@ def translate(model, out_dir, immediates):
         else:
             key, names = _structure(item, immediates, mx)
             if key not in translated:
-                kernel = Kernel(item, immediates, mx)
+                kernel = Kernel(item, immediates, mx, config)
                 body = kernel.source("kernel")
                 digest = hashlib.sha1(body.encode()).hexdigest()[:12]
                 name = "kernel_" + digest
@@ -2471,9 +2842,10 @@ def translate(model, out_dir, immediates):
     params = [b.node for b in model.parameters]
     written = {b for s in steps for b in s["outputs"]}
     state = [b for b in params if b in written]
-    with open(os.path.join(out_dir, "program.py"), "w") as f:
-        f.write(program_source(statements, outputs, state))
     dtypes = _hbm_dtypes(model)
+    indices = {b for b, dtype in dtypes.items() if dtype == "int64"}
+    with open(os.path.join(out_dir, "program.py"), "w") as f:
+        f.write(program_source(statements, outputs, state, indices))
     packed = {
         codes: {
             "scales": scales,
@@ -2492,7 +2864,7 @@ def translate(model, out_dir, immediates):
         "state": state,
         "scalars": [
             op.name
-            for kind, op in segments(model)
+            for kind, op in items
             if kind == "host" and op.prim.target == "aten::_local_scalar_dense"
         ],
         "outputs": outputs,
@@ -2508,7 +2880,7 @@ def translate(model, out_dir, immediates):
     return manifest
 
 
-def program_source(statements, outputs, state):
+def program_source(statements, outputs, state, indices):
     """Source of ``program.py``: ``statements`` -- ``(reads, writes,
     line)`` each -- in order, ``mark`` calls between the segments a decoder
     layer's statements make, the ``state`` parameters it writes stored back
@@ -2516,7 +2888,9 @@ def program_source(statements, outputs, state):
 
     A statement belongs to the layer named in a box it writes; one that
     writes none joins the layer before it, or, after the last layer's
-    statements, the segment after the layers.
+    statements, the segment after the layers.  A box of ``indices`` -- an
+    int64 tensor, such as the position a KV cache write takes -- crosses a
+    segment unmarked: a marker on one fails the trace.
     """
     layers = []
     for _, writes, _ in statements:
@@ -2550,6 +2924,7 @@ def program_source(statements, outputs, state):
                 for (_, writes, _), s in zip(statements, segment)
                 if s == done
                 for w in writes
+                if w not in indices
             ]
             passed = [w for w in written if max(read_in.get(w, {0})) > done]
             taken = [w for w in written if done + 1 in read_in.get(w, ())]
@@ -2572,12 +2947,12 @@ def _boxes(message, refs, found):
         return found
     if isinstance(message, ir.TensorBox) and message.HasField("memory"):
         found.setdefault(message.node, message)
-    for field, value in message.ListFields():
-        if field.type != field.TYPE_MESSAGE:
+    for descriptor, value in message.ListFields():
+        if descriptor.type != descriptor.TYPE_MESSAGE:
             continue
-        if field.message_type.GetOptions().map_entry:
+        if descriptor.message_type.GetOptions().map_entry:
             value = value.values()
-        elif not field.is_repeated:
+        elif not descriptor.is_repeated:
             value = [value]
         for item in value:
             _boxes(item, refs, found)

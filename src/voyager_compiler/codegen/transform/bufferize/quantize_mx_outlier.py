@@ -70,6 +70,7 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _stamp_bank_groups,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    BuildContext,
     _compute_input_spec,
     _finalize_exported_gm,
     _lenient_verifier,
@@ -727,7 +728,7 @@ def _row_block(start, bytes_per_row, capacity, M, cap=None) -> int:
 
 
 def build_quantize_mx_outlier(
-    node, *, tiler, num_slots: int = _DEFAULT_NUM_SLOTS
+    node: torch.fx.Node, ctx: BuildContext
 ) -> Optional[torch.fx.GraphModule]:
     """Bufferize a row-swept ``quantize_mx_outlier`` — bare or fused, 2-D or
     batched — as one sweep over ``(row block, K slice)``.
@@ -735,15 +736,15 @@ def build_quantize_mx_outlier(
     Args:
         node: The producer: a bare ``quantize_mx_outlier`` call, or a fused
             ``call_module`` whose submodule ends in one.
-        tiler: The ``Tiler``; supplies both the consumer's k tile and the
-            row-block search.
-        num_slots: Software-pipeline depth for the sweep's inputs.
+        ctx: The ``BuildContext``.  Its ``tiler`` supplies both the
+            consumer's k tile and the row-block search; ``num_slots`` is the
+            software-pipeline depth for the sweep's inputs.
 
     Returns:
         The bufferized gm, or ``None`` when ``node`` is not one this builds.
     """
     qnode = csr_quantize_node(node)
-    if qnode is None or tiler is None:
+    if qnode is None or ctx.tiler is None:
         return None
 
     act = qnode.args[0].value
@@ -757,7 +758,7 @@ def build_quantize_mx_outlier(
     # ``plan_csr_slices`` settled the slice width with the consumers; a CSR
     # nothing consumes is emitted whole.
     tk = node.meta.get("csr_slice", K)
-    tm_consumer = consumer_row_tile(node, tiler)
+    tm_consumer = consumer_row_tile(node, ctx.tiler)
     if K % tk or tk % bs:
         raise ValueError(
             f"{node.name}: k tile {tk} must divide K={K} and hold whole "
@@ -783,17 +784,18 @@ def build_quantize_mx_outlier(
     # the staging tiles, so it starts from the whole activation and lets the
     # consumers' row tile cap it.  The search runs either way: it stamps the
     # operands' bank groups.
-    config = tiler.config
-    tiling = vector_op_tiling(node, tiler)
+    config = ctx.tiler.config
+    tiling = vector_op_tiling(node, ctx.tiler)
+    # The op's model sizes the regions its prefix keeps for this nest's own
+    # row block.
+    op_model = ctx.tiler.model.prepare(node)
     ones = [1] * len(batch)
     act_bytes = act.element_size()
     vals = node.value
     if prefix_gm is not None:
         scratch_per_row = sum(
             math.prod(shape) * dtype.itemsize
-            for _, shape, dtype in tiler.model.kernel_scratch(
-                node, ones + [1, K]
-            )
+            for _, shape, dtype, *_ in op_model.scratch(ones + [1, K])
         )
         start = max(1, M // max(1, tiling[-2]))
         per_row = _NEST_ROW_BLOCK_COPIES * K * act_bytes + scratch_per_row
@@ -811,7 +813,7 @@ def build_quantize_mx_outlier(
             + 4
         )
         start = M
-        per_row = num_slots * tk * act_bytes + staging
+        per_row = ctx.num_slots * tk * act_bytes + staging
         capacity = config.usable_scratchpad_size
     rows = _row_block(start, per_row, capacity, M, cap=tm_consumer)
     if M % rows:
@@ -831,11 +833,9 @@ def build_quantize_mx_outlier(
     # The regions the prefix runs beside, sized off the row-block
     # intermediate, the tile it reduces.
     scratch = (
-        tiler.model.kernel_scratch(node, ones + [rows, K])
-        if prefix_gm is not None
-        else []
+        op_model.scratch(ones + [rows, K]) if prefix_gm is not None else ()
     )
-    scratch_specs = [_ScratchSpec(tuple(shape), dt) for _, shape, dt in scratch]
+    scratch_specs = [_ScratchSpec(*region[1:]) for region in scratch]
 
     # Operand roles: the activation is tiled, codebooks load whole.
     in_nodes = list(node.all_input_nodes)
@@ -911,9 +911,9 @@ def build_quantize_mx_outlier(
         prefix_gm=prefix_gm,
         act_idx=act_idx,
         kw_idx=kw_idx,
-        scratch_names=[name for name, _, _ in scratch],
+        scratch_names=[name for name, *_ in scratch],
         scratch_specs=scratch_specs,
-        num_slots=num_slots,
+        num_slots=ctx.num_slots,
     )
 
     inputs = tuple(n.value.clone() for n in in_nodes)

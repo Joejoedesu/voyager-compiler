@@ -9,8 +9,9 @@ graphviz / text from that graph.
 
 Modules: ``ops`` (voyager.* primitives), ``utils`` (shared builder helpers +
 layout projections), ``pipeline`` (the unified Pallas-style software-pipelining
-scheduler and its GEMM / conv2d / pointwise / pool builders),
-``bufferization`` (the rewrite pass), ``codegen`` (loop-aware output).
+scheduler and its GEMM / conv2d / pointwise / pool builders), ``builders``
+(which builder lowers each node), ``bufferization`` (the rewrite pass),
+``codegen`` (loop-aware output).
 """
 
 import torch
@@ -18,9 +19,14 @@ from torch.fx.node import has_side_effect
 
 # Registers the voyager.* torch.library ops.
 from voyager_compiler.codegen.transform.bufferize import ops  # noqa: F401
+from voyager_compiler.codegen.transform.bufferize.ops import MemoryLevel
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     annotate_tensor_spaces,
     bufferize_graph,
+)
+from voyager_compiler.codegen.transform.bufferize.builders import (
+    SHARED_BUILDERS,
+    BuilderRule,
 )
 from voyager_compiler.codegen.transform.bufferize.emit import (
     flush_tensor_files,
@@ -34,6 +40,7 @@ from voyager_compiler.codegen.transform.bufferize.memory_planning import (
     plan_memory,
     shared_dram_layout,
 )
+from voyager_compiler.codegen.transform.bufferize.utils import BuildContext
 
 # Mark the in-place / DMA primitives side-effecting so DCE never drops them.
 has_side_effect(torch.ops.higher_order.cond)
@@ -46,12 +53,16 @@ has_side_effect(torch.ops.higher_order.with_scratch)
 __all__ = [
     "bufferize_graph",
     "annotate_tensor_spaces",
+    "BuildContext",
+    "BuilderRule",
+    "SHARED_BUILDERS",
     "print_layer_table",
     "flush_tensor_files",
     "gen_code_bufferized",
     "gen_compute_graph",
     "print_bufferized_graph",
     "plan_memory",
+    "MemoryLevel",
     "MemoryPlan",
     "shared_dram_layout",
 ]

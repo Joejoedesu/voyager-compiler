@@ -54,7 +54,9 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     build_tiler,
 )
 from voyager_compiler.codegen.transform.tiling.traversal import (
+    attention_crosses,
     attention_kv_last,
+    attention_mask_dyn,
 )
 
 __all__ = [
@@ -77,7 +79,9 @@ __all__ = [
     "TileConstraint",
     "TileResult",
     "Tiler",
+    "attention_crosses",
     "attention_kv_last",
+    "attention_mask_dyn",
     "attention_op_tiling",
     "build_tiler",
     "gemv_op_tiling",

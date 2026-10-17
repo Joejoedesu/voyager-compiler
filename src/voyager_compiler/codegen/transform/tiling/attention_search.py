@@ -14,7 +14,11 @@ from dataclasses import replace
 import torch
 
 import interstellar
-from voyager_compiler.codegen.node_info import get_arg_value
+from voyager_compiler.codegen.node_info import (
+    attention_shapes,
+    get_arg_value,
+    query_kmajor,
+)
 from voyager_compiler.codegen.transform.tiling.matrix_search import (
     get_tiling,
     prefetch_tilings,
@@ -172,13 +176,15 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
     num_kv_blocks)``.
 
     Enumerates the query / key tile lengths that divide the (GQA-folded)
-    query rows and the key rows in multiples of ``op.space.unit``, keeps
-    those ``op`` fits on chip, maps each one's products
+    query rows and the key rows in multiples of ``op.space.unit`` -- a query
+    tile within one head when it is causal or its query K-major over its
+    tokens (``query_kmajor``), whose heads' tokens are not contiguous --
+    keeps those ``op`` fits on chip, maps each one's products
     (``_attention_products``, the head padded by ``pad_head``) through
-    ``get_tiling`` -- so identical shapes share one search, run concurrently
-    by ``prefetch_tilings`` -- prices each candidate with ``op.cost`` over
-    its products' results, and keeps the ``pick`` under the tiler's
-    ``runtime_tolerance``.  The winner is stamped as
+    ``get_tiling`` -- so identical shapes share one search, run
+    concurrently by ``prefetch_tilings`` -- prices each candidate with
+    ``op.cost`` over its products' results, and keeps the ``pick`` under
+    the tiler's ``runtime_tolerance``.  The winner is stamped as
     ``node.meta["tile_result"]``: its tiling's ``products`` hold each
     product's result, for the builder to copy onto the kernels that run
     them.
@@ -197,23 +203,23 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
         RuntimeError: when no tiling of the operands fits the scratchpad, or
             no tiling's products map on chip.
     """
-    query, key = node.args[0], node.args[1]
-    skv = key.value.shape[-2]
+    query, key, _ = attention_shapes(node)
+    sq, head_dim = query[-2:]
+    skv = key[-2]
     # Under MX the query and key block along head_dim, the value and the
     # probabilities along the keys, so a key tile holds whole blocks.
     block_size = node.kwargs.get("block_size")
     logger.info(f"Running L2 tiling for attention: {node}")
 
     unit = op.space.unit
-    # A causal query tile must not straddle a head under the GQA fold
-    # (``attention_kv_last``).
-    causal = get_arg_value(node, 5, "is_causal", False)
-    sq = query.value.shape[-2]
+    # Under the GQA fold a query tile must not straddle a head when it is
+    # causal (``attention_kv_last``) or K-major over its tokens.
+    per_head = get_arg_value(node, 5, "is_causal", False) or query_kmajor(node)
     candidates = []  # (tiling, placement)
     for tq in _divisors_descending(sq_eff):
         if tq % unit and tq != sq_eff:
             continue
-        if causal and sq % tq:
+        if per_head and sq % tq:
             continue
         for tkv in _divisors_descending(skv):
             if tkv % unit and tkv != skv:
@@ -233,7 +239,7 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
             f"{node}: no tiling of its operands fits the scratchpad"
         )
 
-    head_pad = pad_head(query.value.shape[-1], op.space)
+    head_pad = pad_head(head_dim, op.space)
     products = {
         tiling.tile_sizes: _attention_products(
             node, *tiling.tile_sizes, head_pad

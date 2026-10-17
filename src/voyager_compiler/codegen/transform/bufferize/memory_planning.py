@@ -2,8 +2,9 @@
 Baseline memory planner for the bufferized FX path.
 
 The bufferization pass leaves every tensor node tagged with ``meta['space']``
-(``"DRAM"`` / ``"Scratchpad"``) but with no concrete address.  This pass turns
-those space-annotated buffers/tiles into a concrete map:
+(``"DRAM"`` / ``"Scratchpad"`` / ``"Local"``) but with no concrete address.
+This pass turns the DRAM and Scratchpad buffers/tiles into a concrete map; a
+Local buffer gets no address, because the target places it:
 
   * **DRAM** — the persistent params / inputs are placed first (no reuse), then
     the intermediate ``voyager.alloc`` activation buffers are packed with a
@@ -320,7 +321,7 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
         elif n.op == "call_function" and (
             n.target is _ALLOC or _materializes_dram(n)
         ):
-            if n.meta.get("space") != "Scratchpad":
+            if n.meta.get("space") == "DRAM":
                 reusable.append(n)
         elif n.op == "call_function" and n.target is _COND:
             # A split cache's fold computes the chunk's quantized outputs
@@ -333,7 +334,7 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
                         and (
                             inner.target is _ALLOC or _materializes_dram(inner)
                         )
-                        and inner.meta.get("space") != "Scratchpad"
+                        and inner.meta.get("space") == "DRAM"
                     ):
                         reusable.append(inner)
                         pos[inner] = pos[n]

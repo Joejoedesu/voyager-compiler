@@ -1134,10 +1134,15 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         single_k_extra_pass, split_k_extra_pass = tail_extra_passes(node)
         keeps_shape = tail_keeps_shape(node)
         # A split reduction's extra pass reads the tile back from scratch; a
-        # second region lets it ride the finalize commit, except in a
+        # second region lets it ride the async finalize commit, except in a
         # CSR-producing nest, whose bare stores pin one (``_SparseGemm``).
+        # A sync nest waits for the pass, so it keeps one region.
         scratch_regions = 1
-        if split_k_extra_pass and csr_quantize_node(node) is None:
+        if (
+            config.async_pipeline
+            and split_k_extra_pass
+            and csr_quantize_node(node) is None
+        ):
             scratch_regions = 2
         outlier_pct, out_outlier_pct, outlier_rate = outlier_stats(node)
         if isinstance(out_dtype, (list, tuple)):

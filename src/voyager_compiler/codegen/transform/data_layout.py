@@ -1,4 +1,6 @@
+import itertools
 import logging
+import math
 import operator
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -8,6 +10,7 @@ from torch.fx import GraphModule, Node
 from voyager_compiler.codegen.aten_classifier import is_elementwise_op
 from voyager_compiler.codegen.node_info import (
     AXES_ARG_INDEX_MAP,
+    gemm_layout,
     get_arg_value,
     is_conv2d,
     is_depthwise_conv,
@@ -44,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "eliminate_reshape_with_no_effect",
+    "normalize_activation_layout",
     "normalize_conv2d_layout",
     "normalize_gemm_weight_layout",
 ]
@@ -605,17 +609,23 @@ def _insert_transpose_op(
     fold_transpose_into_constant(model, path, transposed_nodes)
 
 
-def _node_layout(node: Node, gemm_layout: str, gemv_layout: str) -> str:
-    """The target layout of ``node``'s class: matrix-vector
-    (fully-connected / batch-1) nodes follow ``gemv_layout``, matrix-matrix
-    nodes ``gemm_layout``."""
-    return gemv_layout if is_fully_connected(node) else gemm_layout
+def _node_layout(node: Node, gemm_weight: str, gemv_weight: str) -> str:
+    """The target weight layout of ``node``'s class: matrix-vector
+    (fully-connected / batch-1) nodes follow ``gemv_weight``, matrix-matrix
+    nodes ``gemm_weight``."""
+    return gemv_weight if is_fully_connected(node) else gemm_weight
+
+
+def _set_gemm_layout(node: Node, **parts: str) -> None:
+    """Restate GEMM ``node``'s ``layout`` argument with ``parts`` -- its
+    ``activation``, ``weight`` or ``output`` layout -- replaced."""
+    layout = gemm_layout(node)._replace(**parts)
+    node.kwargs = {**node.kwargs, "layout": str(layout)}
 
 
 def _process_linear_node(model: GraphModule, node: Node) -> None:
-    """Point a linear at a CK-stored copy of its KC-native weight and retarget
-    the node to the layout twin, whose weight arrives swapped.  The caller
-    decides which nodes to flip."""
+    """Point a linear at a CK-stored copy of its KC-native weight and state
+    that in its ``layout``.  The caller decides which nodes to flip."""
     logger.info(f"Transposing weight for linear node {node.name}")
 
     weight_node = node.args[1]
@@ -629,24 +639,21 @@ def _process_linear_node(model: GraphModule, node: Node) -> None:
 
     # Mark mx / spmm_csr users as consuming a CK-stored weight.
     for user in list(transposed.users):
-        if user.target in [
-            torch.ops.quantized_ops.linear_mx.default,
-            torch.ops.quantized_ops.spmm_csr.default,
-        ]:
+        if user.target == torch.ops.quantized_ops.linear_mx.default:
+            _set_gemm_layout(user, weight="ck")
+        elif user.target == torch.ops.quantized_ops.spmm_csr.default:
             user.kwargs = {**user.kwargs, "weight_layout": "ck"}
 
     if node.target == torch.ops.aten.linear.default:
         node.target = torch.ops.quantized_ops.linear.default
-
-    node.meta["transposed"] = True
+        _set_gemm_layout(node, weight="ck")
 
 
 def _process_matmul_node(
     model: GraphModule, node: Node, transposed_nodes: dict
 ) -> None:
-    """Flip a matmul's CK-native right operand storage to KC and
-    retarget the node to the layout twin, whose operand arrives swapped.
-    The caller decides which nodes to flip."""
+    """Flip a matmul's CK-native right operand storage to KC and state that
+    in its ``layout``.  The caller decides which nodes to flip."""
     logger.info(f"Transposing weight for matmul node {node.name}")
 
     weight_node = node.args[1]
@@ -657,31 +664,28 @@ def _process_matmul_node(
 
     if node.target == torch.ops.aten.matmul.default:
         node.target = torch.ops.quantized_ops.matmul.default
-    elif node.target == torch.ops.quantized_ops.matmul_mx.default:
-        node.kwargs = {**node.kwargs, "weight_layout": "kc"}
-
-    node.meta["transposed"] = True
+    _set_gemm_layout(node, weight="kc")
 
 
 def normalize_gemm_weight_layout(
     model: GraphModule,
-    gemm_layout: str,
-    gemv_layout: str,
+    gemm_weight: str,
+    gemv_weight: str,
 ) -> GraphModule:
     """Normalize every GEMM right-operand (weight) to one layout per
-    operation class: matrix-matrix nodes to ``gemm_layout``, matrix-vector
-    (fully-connected / batch-1) nodes to ``gemv_layout``; each is ``"kc"``
+    operation class: matrix-matrix nodes to ``gemm_weight``, matrix-vector
+    (fully-connected / batch-1) nodes to ``gemv_weight``; each is ``"kc"``
     ([out, contraction]) or ``"ck"`` ([contraction, out]).
 
     ``aten.linear`` is KC-native and ``aten.matmul`` CK-native, so
     exactly the nodes whose class targets the other layout have their
-    weight storage flipped and are retargeted to the ``layout_ops``
-    twins (same name/schema, second operand arrives swapped).  A node is
-    retargeted iff its storage was flipped, so eager execution stays
-    correct in every configuration with no global patching.
+    weight storage flipped, and say so in their ``layout`` argument: an
+    aten op is retargeted to the ``quantized_ops`` GEMM of its name, which
+    takes one.  Eager execution stays correct in every configuration with
+    no global patching.
     """
-    assert gemm_layout in GEMM_WEIGHT_LAYOUTS, gemm_layout
-    assert gemv_layout in GEMM_WEIGHT_LAYOUTS, gemv_layout
+    assert gemm_weight in GEMM_WEIGHT_LAYOUTS, gemm_weight
+    assert gemv_weight in GEMM_WEIGHT_LAYOUTS, gemv_weight
 
     transposed_nodes = {}
 
@@ -689,14 +693,744 @@ def normalize_gemm_weight_layout(
         # A node is flipped exactly when its class's target layout differs
         # from the op's native one (linear: KC, matmul: CK).
         if is_linear(node):
-            if _node_layout(node, gemm_layout, gemv_layout) == "ck":
+            if _node_layout(node, gemm_weight, gemv_weight) == "ck":
                 _process_linear_node(model, node)
         elif is_matmul(node):
-            if _node_layout(node, gemm_layout, gemv_layout) == "kc":
+            if _node_layout(node, gemm_weight, gemv_weight) == "kc":
                 _process_matmul_node(model, node, transposed_nodes)
 
     deduplicate_nodes(model)
 
     model.graph.lint()
+    model.recompile()
+    return model
+
+
+# -------------------------------------------------------------------------
+# K-major activations
+# -------------------------------------------------------------------------
+aten = torch.ops.aten
+quantized_ops = torch.ops.quantized_ops
+
+SDPA = aten.scaled_dot_product_attention.default
+# The ops that read their activation K-major: the GEMMs taking a CK weight,
+# each restated as the GEMM taking a ``layout`` argument, and attention, as
+# its K-major twin.
+TWINS = {
+    quantized_ops.linear.default: quantized_ops.linear.default,
+    aten.matmul.default: quantized_ops.matmul.default,
+    SDPA: quantized_ops.sdpa_kmajor.default,
+}
+VIEW_OPS = {
+    aten.view.default,
+    aten.reshape.default,
+    aten._unsafe_view.default,
+    aten.unsqueeze.default,
+}
+MOVE_OPS = {aten.transpose.int, aten.permute.default}
+SAME_LAYOUT_OPS = {aten.contiguous.default, aten.clone.default}
+SHAPE_OPS = VIEW_OPS | MOVE_OPS | SAME_LAYOUT_OPS | {aten.expand.default}
+DIM_OPS = {aten.slice.Tensor, aten.cat.default}
+# A write of ``source`` into a buffer along a dim, in place: a KV cache's.
+CACHE_WRITES = {aten.index_copy_.default, aten.index_copy.default}
+RMS_NORM = aten.rms_norm.default
+AGNOSTIC_OPS = SHAPE_OPS | DIM_OPS | {RMS_NORM}
+# The ops whose output's layout follows their first input's.
+SINGLE_INPUT_OPS = SHAPE_OPS | CACHE_WRITES | {aten.slice.Tensor, RMS_NORM}
+
+# The side of the square blocks a relayout transposes.
+BLOCK = 128
+
+Perm = Tuple[int, ...]
+# One layout change: (consumer, operand, operand's perm, perm wanted).
+Relayout = Tuple[Node, Node, Perm, Perm]
+
+
+def _identity(rank: int) -> Perm:
+    return tuple(range(rank))
+
+
+def _swapped(rank: int) -> Perm:
+    """The last two dims swapped; a tensor of rank below 2 has one order."""
+    perm = list(range(rank))
+    if rank >= 2:
+        perm[-2], perm[-1] = perm[-1], perm[-2]
+    return tuple(perm)
+
+
+def _is_tensor(node) -> bool:
+    return isinstance(node, Node) and isinstance(
+        getattr(node, "value", None), torch.Tensor
+    )
+
+
+def _innermost(shape, perm: Perm) -> Optional[int]:
+    """The logical axis stored innermost under ``perm``, unit axes skipped."""
+    return next((a for a in reversed(perm) if shape[a] > 1), None)
+
+
+def transposed_blocks(shape, src: Perm, dst: Perm) -> int:
+    """The 128 x 128 blocks a relayout of a tensor of logical ``shape`` from
+    physical perm ``src`` to ``dst`` transposes: none when the innermost
+    non-unit axis stays innermost (a row reorder), else the blocks of the
+    two axes that trade the free dim."""
+    old, new = _innermost(shape, src), _innermost(shape, dst)
+    if old == new:
+        return 0
+    cols, rows = shape[old], shape[new]
+    batch = math.prod(shape) // (rows * cols)
+    return batch * math.ceil(rows / BLOCK) * math.ceil(cols / BLOCK)
+
+
+def _data_fraction(node: Node) -> float:
+    """The share of ``node``'s elements that are distinct data: below 1 for
+    a view of an ``expand`` (GQA's repeated K and V heads)."""
+    fraction = 1.0
+    while node.op == "call_function" and node.target in SHAPE_OPS:
+        src = node.args[0]
+        if node.target is aten.expand.default:
+            fraction *= src.value.numel() / node.value.numel()
+        node = src
+    return fraction
+
+
+def _view_perm(
+    node: Node, perm: Perm, shapes: Dict[Node, tuple]
+) -> Optional[Perm]:
+    """The perm of a view's output when its input is stored in ``perm`` and
+    the view is applied to that physical tensor, or ``None`` when no
+    reshape of it holds the view's elements.  Of the perms that do, the one
+    displacing the fewest unit axes, then inverting the fewest pairs."""
+    src_shape, out_shape = shapes[node.args[0]], shapes[node]
+    x = torch.arange(math.prod(src_shape), dtype=torch.int32)
+    x = x.reshape(src_shape)
+    physical = x.permute(perm)
+    logical = x.reshape(out_shape)
+
+    def displaced(p):
+        pos = {a: i for i, a in enumerate(p)}
+        units = sum(
+            pos[a] != (pos[a - 1] + 1 if a else 0)
+            for a in p
+            if out_shape[a] == 1
+        )
+        return units, sum(a > b for a, b in itertools.combinations(p, 2))
+
+    candidates = sorted(
+        itertools.permutations(range(len(out_shape))), key=displaced
+    )
+    for out_perm in candidates:
+        phys_shape = [out_shape[a] for a in out_perm]
+        if torch.equal(logical.permute(out_perm), physical.reshape(phys_shape)):
+            return out_perm
+    return None
+
+
+def _on_partitions(dim: int, perm: Perm) -> bool:
+    """Whether logical ``dim`` lands on the partition axis, the physical
+    second-last one."""
+    return perm.index(dim % len(perm)) == len(perm) - 2
+
+
+def _move_dims(node: Node, rank: int) -> Perm:
+    """The input dim each output dim of a ``transpose`` / ``permute`` takes."""
+    if node.target is aten.permute.default:
+        return tuple(d % rank for d in node.args[1])
+    a, b = (d % rank for d in node.args[1:3])
+    dims = list(range(rank))
+    dims[a], dims[b] = dims[b], dims[a]
+    return tuple(dims)
+
+
+def _cat_dim(cat: Node) -> int:
+    return cat.args[1] if len(cat.args) > 1 else 0
+
+
+def _slice_bounds(node: Node) -> Optional[Tuple[int, int, int]]:
+    """``(dim, start, end)`` of a unit-step ``slice``, ``dim`` and ``end``
+    resolved against its input, or ``None`` for another op."""
+    if node.op != "call_function" or node.target is not aten.slice.Tensor:
+        return None
+    shape = node.args[0].value.shape
+    defaults = [0, None, None, 1]
+    dim, start, end, step = list(node.args[1:]) + defaults[len(node.args) - 1 :]
+    if step != 1:
+        return None
+    dim %= len(shape)
+    end = shape[dim] if end is None else min(end, shape[dim])
+    return dim, start or 0, end
+
+
+def _rotated_half(cat: Node) -> Optional[Node]:
+    """The tensor ``x`` a ``cat`` rotates by half along its dim -- RoPE's
+    ``cat([-x[h:], x[:h]])`` of a dim of ``2h`` -- or ``None``."""
+    pieces = cat.args[0]
+    if len(pieces) != 2 or pieces[0].target is not aten.neg.default:
+        return None
+    upper, lower = pieces[0].args[0], pieces[1]
+    upper_bounds, lower_bounds = _slice_bounds(upper), _slice_bounds(lower)
+    if upper_bounds is None or lower_bounds is None:
+        return None
+    x = lower.args[0]
+    if upper.args[0] is not x:
+        return None
+    dim = _cat_dim(cat) % x.value.ndim
+    size = x.value.shape[dim]
+    half = size // 2
+    if size % 2 or upper_bounds != (dim, half, size):
+        return None
+    return x if lower_bounds == (dim, 0, half) else None
+
+
+def _cache_writes(graph) -> Set[Node]:
+    """The cache writes (``CACHE_WRITES``) into a ``get_attr`` buffer that
+    only cache writes read, which can store it in either layout."""
+    readers: Dict[str, List[Node]] = {}
+    for node in graph.nodes:
+        if node.op == "get_attr":
+            readers.setdefault(node.target, []).extend(node.users)
+    writes = set()
+    for target, users in readers.items():
+        if users and all(
+            u.target in CACHE_WRITES
+            and u.args[0].op == "get_attr"
+            and u.args[0].target == target
+            for u in users
+        ):
+            writes.update(users)
+    return writes
+
+
+class _Island:
+    """A set of nodes stored in one orientation, planned before rewriting.
+
+    Attributes:
+        nodes: The members, in graph order.
+        kmajor: Whether the plan stores the island K-major.
+        perms: Each member's physical perm under the plan.
+        relayouts: The layout changes the plan needs.
+    """
+
+    def __init__(self, nodes: List[Node]):
+        self.nodes = nodes
+        self.kmajor = False
+        self.perms: Dict[Node, Perm] = {}
+        self.relayouts: List[Relayout] = []
+
+
+def _extend(perm: Perm, rank: int) -> Perm:
+    """``perm`` of a broadcast operand, ranked up to ``rank`` with leading
+    size-1 axes."""
+    lead = rank - len(perm)
+    return _identity(lead) + tuple(a + lead for a in perm)
+
+
+def _kmajor_operands(twin: Node) -> tuple:
+    """The operands a twin reads K-major: a GEMM's activation, an
+    attention's query and key."""
+    return twin.args[:2] if twin.target is SDPA else twin.args[:1]
+
+
+def _demands(node: Node, perm: Perm, twins: Set[Node]) -> List[Relayout]:
+    """The relayouts ``node``'s readers need of it, stored in ``perm``, when
+    each reads it in its own layout: an op getting a K-major twin (one of
+    ``twins``) its ``_kmajor_operands`` K-major, anything else row-major."""
+    rank = len(perm)
+    relayouts = []
+    for user in node.users:
+        if user in twins and any(a is node for a in _kmajor_operands(user)):
+            dst = _swapped(rank)
+        else:
+            dst = _identity(rank)
+        if dst != perm:
+            relayouts.append((user, node, perm, dst))
+    return relayouts
+
+
+def _plan_kmajor(
+    island: _Island,
+    members: Dict[Node, _Island],
+    shapes: Dict[Node, tuple],
+    twins: Set[Node],
+) -> Tuple[Dict[Node, Perm], List[Relayout]]:
+    """The perms and relayouts of storing ``island`` K-major: its GEMMs
+    write swapped, its views and moves carry their input's storage, and an
+    input from outside enters swapped.  A ``cat`` across the partitions that
+    is no rotate-half, or an op the storage cannot express, reads its input
+    row-major."""
+    perms: Dict[Node, Perm] = {}
+    relayouts: List[Relayout] = []
+
+    def perm_of(arg: Node) -> Perm:
+        if members.get(arg) is island:
+            return perms[arg]
+        return _identity(arg.value.ndim)
+
+    def need(node, arg, src, dst):
+        if src != dst:
+            relayouts.append((node, arg, src, dst))
+
+    for node in island.nodes:
+        rank = len(shapes[node])
+        if node in twins:
+            perms[node] = _swapped(rank)
+            continue
+
+        data = node.args[0]
+        if node.target is aten.cat.default:
+            data = node.args[0][0]
+        src = perm_of(data)
+        single = node.target in SINGLE_INPUT_OPS
+        if single and members.get(data) is not island:
+            # An input from outside enters in the island's orientation.
+            need(node, data, src, _swapped(len(src)))
+            src = _swapped(len(src))
+
+        out = None
+        if node.target in SAME_LAYOUT_OPS | {aten.expand.default}:
+            out = src
+        elif node.target in VIEW_OPS:
+            out = _view_perm(node, src, shapes)
+        elif node.target in MOVE_OPS:
+            moved = _move_dims(node, rank)
+            out = tuple(moved.index(a) for a in src)
+        elif node.target is aten.slice.Tensor:
+            out = src
+        elif node.target in CACHE_WRITES:
+            # The buffer is stored in ``out`` once, so only what the write
+            # stores into it is relaid every step.
+            out = src
+            source = node.args[3]
+            need(node, source, perm_of(source), out)
+        elif node.target is aten.cat.default:
+            out = src
+            if _on_partitions(_cat_dim(node), src) and not _rotated_half(node):
+                out = _identity(rank)
+            for arg in node.args[0]:
+                need(node, arg, perm_of(arg), out)
+        elif node.target is RMS_NORM:
+            out = src if src in (_identity(rank), _swapped(rank)) else None
+        else:  # elementwise
+            tensors = [a for a in node.args if _is_tensor(a)]
+            full = [
+                a
+                for a in tensors
+                if members.get(a) is island and shapes[a] == shapes[node]
+            ]
+            out = perms[full[0]] if full else _swapped(rank)
+            for arg in tensors:
+                if arg.value.numel() > 1:
+                    need(node, arg, _extend(perm_of(arg), rank), out)
+            perms[node] = out
+            continue
+
+        if out is None:
+            need(node, data, src, _identity(len(src)))
+            out = _identity(rank)
+        perms[node] = out
+
+    for node in island.nodes:
+        relayouts += [
+            r
+            for r in _demands(node, perms[node], twins)
+            if members.get(r[0]) is not island or r[0] in twins
+        ]
+    return perms, relayouts
+
+
+def _plan_row(
+    island: _Island, twins: Set[Node]
+) -> Tuple[Dict[Node, Perm], List[Relayout]]:
+    """The perms and relayouts of leaving ``island`` as it is: each GEMM
+    reading a member as its activation takes it transposed."""
+    perms = {n: _identity(n.value.ndim) for n in island.nodes}
+    relayouts = [r for n in island.nodes for r in _demands(n, perms[n], twins)]
+    return perms, relayouts
+
+
+def _moved_blocks(island: _Island, shapes: Dict[Node, tuple]) -> float:
+    """The blocks the moves of ``island`` transpose when it is left as it
+    is: each stores its input in a new order, standalone or fused into the
+    GEMM reading it (a ``Kᵀ``)."""
+    blocks = 0.0
+    for node in island.nodes:
+        if node.target not in MOVE_OPS:
+            continue
+        data = node.args[0]
+        rank = len(shapes[data])
+        dims = _move_dims(node, rank)
+        moved = transposed_blocks(shapes[data], _identity(rank), dims)
+        blocks += moved * _data_fraction(data)
+    return blocks
+
+
+def _cost(relayouts: List[Relayout], shapes: Dict[Node, tuple]) -> float:
+    """The transposed blocks of ``relayouts``, each operand and target perm
+    once, constants free."""
+    seen = {}
+    for _, arg, src, dst in relayouts:
+        if arg.op == "get_attr":
+            continue
+        shape = (1,) * (len(dst) - len(shapes[arg])) + shapes[arg]
+        blocks = transposed_blocks(shape, src, dst) * _data_fraction(arg)
+        seen[(arg, dst)] = blocks
+    return sum(seen.values())
+
+
+def _resolve_writes(
+    relayouts: List[Relayout],
+    writes: Set[Node],
+    perms: Dict[Node, Perm],
+    shapes: Dict[Node, tuple],
+) -> List[Relayout]:
+    """``relayouts`` with each cache write's relayout restated by ``perms``,
+    the decided layouts (row-major where absent): the write stores its source
+    in the buffer's layout, and drops out where the two agree."""
+    resolved = []
+    for consumer, arg, src, dst in relayouts:
+        if consumer in writes and arg is consumer.args[3]:
+            rank = len(shapes[arg])
+            src = perms.get(arg, _identity(rank))
+            dst = perms.get(consumer, _identity(rank))
+            if src == dst:
+                continue
+        resolved.append((consumer, arg, src, dst))
+    return resolved
+
+
+def _islands(
+    model: GraphModule, twins: Set[Node], writes: Set[Node]
+) -> List[_Island]:
+    """The graph's islands: the outputs of ``twins``, of the cache
+    ``writes`` and of layout-agnostic ops over activations of rank 2 or
+    more, joined along agnostic consumers.  A cache write joins no island
+    through what it stores, which is relaid on its way in, and the writes
+    into one buffer share an island."""
+    parent: Dict[Node, Node] = {}
+
+    def find(n):
+        while parent[n] is not n:
+            parent[n] = parent[parent[n]]
+            n = parent[n]
+        return n
+
+    for node in model.graph.nodes:
+        if node.op != "call_function" or not _is_tensor(node):
+            continue
+        if node.value.ndim < 2:
+            continue
+        activations = [a for a in node.all_input_nodes if a.op != "get_attr"]
+        if node in twins or node in writes:
+            parent[node] = node
+        elif node.target in AGNOSTIC_OPS or is_elementwise_op(node):
+            if not activations:
+                continue
+            parent[node] = node
+            for arg in activations:
+                if arg in parent:
+                    parent[find(arg)] = find(node)
+
+    buffers: Dict[str, Node] = {}
+    for node in [n for n in writes if n in parent]:
+        first = buffers.setdefault(node.args[0].target, node)
+        parent[find(node)] = find(first)
+
+    # The members reading one outside tensor share its relayout, so they
+    # share an orientation; a twin or a cache write relays it on its own.
+    for node in model.graph.nodes:
+        if node in parent or node.op == "get_attr":
+            continue
+        readers = [
+            u
+            for u in node.users
+            if u in parent and u not in twins and u not in writes
+        ]
+        for user in readers[1:]:
+            parent[find(user)] = find(readers[0])
+
+    groups: Dict[Node, List[Node]] = {}
+    for node in model.graph.nodes:
+        if node in parent:
+            groups.setdefault(find(node), []).append(node)
+    return [_Island(nodes) for nodes in groups.values()]
+
+
+def _relaid(t: torch.Tensor, shape, dims) -> torch.Tensor:
+    """``t`` viewed at ``shape``, then permuted by ``dims``."""
+    return t.reshape(shape).permute(dims)
+
+
+def _insert_relayout(
+    model: GraphModule,
+    arg: Node,
+    src: Perm,
+    dst: Perm,
+    shape: tuple,
+) -> Node:
+    """``arg``, stored in ``src``, stored in ``dst`` instead: ranked up
+    first if it broadcasts, a reshape when only unit axes move, else a
+    permute.  A constant is relaid into a buffer of its own."""
+    graph = model.graph
+    lead = len(dst) - len(shape)
+    full = (1,) * lead + shape
+    phys = tuple(full[a] for a in src)
+    dims = tuple(src.index(a) for a in dst)
+    with graph.inserting_after(arg):
+        if arg.op == "get_attr":
+            return create_getattr_from_value(
+                model,
+                graph,
+                arg.name + "_kmajor",
+                _relaid(arg.value, phys, dims),
+                derived_producer(arg, _relaid, phys, dims),
+            )
+        if [a for a in src if full[a] > 1] == [a for a in dst if full[a] > 1]:
+            out = tuple(full[a] for a in dst)
+            return graph.call_function(aten.reshape.default, (arg, out))
+        view = arg
+        if lead:
+            view = graph.call_function(aten.reshape.default, (arg, phys))
+        return graph.call_function(aten.permute.default, (view, dims))
+
+
+def _relay_buffer(model: GraphModule, target: str, src: Perm, dst: Perm):
+    """Store buffer ``target``, stored in ``src``, in ``dst`` instead."""
+    value = fetch_attr(model, target)
+    owner, _, name = target.rpartition(".")
+    module = model.get_submodule(owner) if owner else model
+    dims = tuple(src.index(a) for a in dst)
+    setattr(module, name, value.permute(dims).contiguous())
+
+
+def _rewrite(
+    model: GraphModule, node: Node, perm: Perm, shapes: Dict[Node, tuple]
+) -> None:
+    """Restate a K-major island member's args for its output stored in
+    ``perm``."""
+    rank = len(perm)
+    out_shape = shapes[node]
+    if node.target in VIEW_OPS:
+        node.target = aten.reshape.default
+        node.args = (node.args[0], [out_shape[a] for a in perm])
+    elif node.target is aten.expand.default:
+        node.args = (node.args[0], [out_shape[a] for a in perm])
+    elif node.target in DIM_OPS | CACHE_WRITES:
+        node.update_arg(1, perm.index(_cat_dim(node) % rank))
+    elif node.target is RMS_NORM and perm == _swapped(rank):
+        _, _, weight, eps = (list(node.args) + [None, None])[:4]
+        if weight is not None:
+            # The weight scales the hidden dim, now the second-last.
+            with model.graph.inserting_after(weight):
+                weight = create_getattr_from_value(
+                    model,
+                    model.graph,
+                    weight.name + "_kmajor",
+                    weight.value.reshape(-1, 1),
+                    derived_producer(weight, torch.reshape, (-1, 1)),
+                )
+        node.target = quantized_ops.rms_norm_kmajor.default
+        node.args = (node.args[0], weight, eps)
+
+
+def _rotation(size: int, dtype: torch.dtype) -> torch.Tensor:
+    """The signed permutation ``R`` whose ``Rᵀ x`` rotates the ``size``
+    rows of ``x`` by half: ``cat([-x[h:], x[:h]])``."""
+    half = size // 2
+    rotation = torch.zeros(size, size, dtype=dtype)
+    rows = torch.arange(half)
+    rotation[rows + half, rows] = -1
+    rotation[rows, rows + half] = 1
+    return rotation
+
+
+def _rotate_by_matmul(graph, cat: Node, x: Node, rotation: Node) -> None:
+    """Replace ``cat``, the rotate-half of K-major ``x`` across its
+    partitions, by ``matmul(x, rotation, layout="cx,ck,kx")``, ``rotationᵀ
+    x`` (``_rotation``)."""
+    with graph.inserting_before(cat):
+        matmul = graph.call_function(
+            quantized_ops.matmul.default,
+            (x, rotation),
+            {"layout": "cx,ck,kx"},
+        )
+    matmul.meta["dtype"] = cat.meta.get("dtype")
+    cat.replace_all_uses_with(matmul)
+    neg, lower = cat.args[0]
+    upper = neg.args[0]
+    for node in (cat, neg, upper, lower):
+        if not node.users:
+            graph.erase_node(node)
+
+
+def normalize_activation_layout(model: GraphModule) -> GraphModule:
+    """Store the activations K-major wherever that transposes fewer blocks.
+
+    A Trainium TensorE contracts over the SBUF partitions, so a GEMM wants its
+    activation ``[M, K]`` stored ``[K, M]``.  ``normalize_gemm_weight_layout``
+    stores the weights that way; this pass does it for the activations.  It
+    splits the graph into islands -- the GEMM outputs and the layout-agnostic
+    ops joined to them (elementwise ops, views, moves, ``expand``, ``slice``,
+    ``cat``, RMS norms) -- and stores each island either as it is or K-major:
+    its GEMM outputs' last two dims swapped and the swap carried through its
+    views and moves, whichever transposes fewer 128 x 128 blocks where the
+    island meets a reader that wants the other layout.  Every matrix-matrix
+    GEMM reads its activation K-major and writes its output in its island's
+    orientation, as its ``layout`` argument says (``"cx,ck"``, or
+    ``"cx,ck,kx"`` for an output ``[N, M]``).  So does every attention,
+    ``sdpa_kmajor`` (its output by ``transpose_output``):
+    TensorE contracts the head dim of ``Q Kᵀ`` over the partitions, so it
+    reads its query and key K-major, ``[..., head_dim, tokens]``, and its
+    value and mask as they are.  It writes a transposed output by transposing
+    each output tile once, as many blocks as the relayout that output saves,
+    so the plan counts neither.  A KV cache write (``CACHE_WRITES``) into a
+    buffer only cache writes read keeps the buffer in its island's
+    orientation: the buffer is relaid once, in place under its own name, and
+    each step relays only what it writes, so a decode step's key cache is
+    stored ``[..., head_dim, positions]`` for ``Q Kᵀ`` to read as it is.
+    Where a layout still changes, an ``aten.permute`` does it.  The graph
+    computes the physical tensors, so it stays executable.
+
+    Two ops reduce or move data across the partitions of a K-major tensor, and
+    both run on TensorE: an RMS norm over the hidden dim becomes
+    ``rms_norm_kmajor`` (a ones-matmul sums the squares), and RoPE's rotate-half
+    -- ``cat([-x2, x1])`` of the two halves of the head dim -- becomes a
+    K-major ``matmul`` by a signed permutation.  A GEMM whose activation is a
+    single row or column -- a matrix-vector product, an outer product -- keeps
+    its op: its activation has the same bytes either way.
+
+    Args:
+        model: The graph, after ``normalize_gemm_weight_layout`` has stored
+            every GEMM weight CK; rewritten in place.
+
+    Returns:
+        ``model``.
+    """
+    graph = model.graph
+    shapes = {n: tuple(n.value.shape) for n in graph.nodes if _is_tensor(n)}
+    twins = {
+        n
+        for n in graph.nodes
+        if n.target is SDPA
+        or (n.target in TWINS and min(shapes[n.args[0]][-2:]) > 1)
+    }
+    writes = _cache_writes(graph)
+    islands = _islands(model, twins, writes)
+    members = {n: island for island in islands for n in island.nodes}
+
+    # A cache write joins its buffer's island but not its source's, so the
+    # buffers' islands are decided first, and every island prices each write
+    # it takes part in by the layouts already decided, whether or not its
+    # plan relays the write's source.
+    decided: Dict[Node, Perm] = {}
+    for island in sorted(islands, key=lambda i: writes.isdisjoint(i.nodes)):
+        row = _plan_row(island, twins)
+        kmajor = _plan_kmajor(island, members, shapes, twins)
+        crossings = [
+            (write, write.args[3], None, None)
+            for write in writes
+            if island in (members.get(write), members.get(write.args[3]))
+        ]
+        costs = [
+            _cost(
+                _resolve_writes(
+                    relayouts + crossings, writes, decided | perms, shapes
+                ),
+                shapes,
+            )
+            for perms, relayouts in (row, kmajor)
+        ]
+        costs[0] += _moved_blocks(island, shapes)
+        island.kmajor = costs[1] < costs[0]
+        island.perms, island.relayouts = kmajor if island.kmajor else row
+        if island.kmajor:
+            decided |= island.perms
+        logger.debug(
+            f"island {island.nodes[0].name} ({len(island.nodes)} nodes): "
+            f"row {costs[0]:.0f}, kmajor {costs[1]:.0f} blocks"
+        )
+
+    perms = {
+        n: p
+        for island in islands
+        if island.kmajor
+        for n, p in island.perms.items()
+    }
+    # A rotate-half across the partitions of a K-major island: the cat,
+    # the tensor it rotates and the partitions' extent, read before the
+    # rewrite restates them.
+    rotations = [
+        (n, x, shapes[x][_cat_dim(n) % len(shapes[x])])
+        for n in perms
+        if n.target is aten.cat.default
+        and _on_partitions(_cat_dim(n), perms[n])
+        and (x := _rotated_half(n)) is not None
+    ]
+
+    relayouts = [
+        relayout
+        for island in islands
+        for relayout in _resolve_writes(island.relayouts, writes, perms, shapes)
+    ]
+
+    # A twin fed by a fixed op (softmax, the embedding) reads it transposed.
+    for node in [n for n in graph.nodes if n in twins]:
+        for arg in _kmajor_operands(node):
+            if arg not in members:
+                rank = len(shapes[arg])
+                relayouts.append((node, arg, _identity(rank), _swapped(rank)))
+
+    made = {}
+    relaid_buffers = set()
+    for consumer, arg, src, dst in relayouts:
+        if consumer in writes and arg is consumer.args[0]:
+            # A buffer is relaid in place, under its own name, once.
+            if arg.target not in relaid_buffers:
+                _relay_buffer(model, arg.target, src, dst)
+                relaid_buffers.add(arg.target)
+            continue
+        if (arg, dst) not in made:
+            made[(arg, dst)] = _insert_relayout(
+                model, arg, src, dst, shapes[arg]
+            )
+        consumer.replace_input_with(arg, made[(arg, dst)])
+
+    # A move in a K-major island stores nothing new: its readers read the
+    # physical tensor it moves.
+    moved = {}
+    for node in list(perms):
+        if node.target in MOVE_OPS:
+            moved[node] = node.args[0]
+            node.replace_all_uses_with(node.args[0])
+            graph.erase_node(node)
+        elif node not in twins:
+            _rewrite(model, node, perms[node], shapes)
+
+    for node in twins:
+        transposed = perms.get(node) == _swapped(len(shapes[node]))
+        node.target = TWINS[node.target]
+        if node.target is quantized_ops.sdpa_kmajor.default:
+            node.kwargs = {**node.kwargs, "transpose_output": transposed}
+        else:
+            _set_gemm_layout(
+                node, activation="cx", output="kx" if transposed else "xk"
+            )
+
+    tables = {}
+    for cat, x, size in rotations:
+        while x in moved:
+            x = moved[x]
+        key = (size, cat.value.dtype)
+        if key not in tables:
+            with graph.inserting_before(cat):
+                tables[key] = create_getattr_from_value(
+                    model, graph, "rotate_half", _rotation(*key)
+                )
+        _rotate_by_matmul(graph, cat, x, tables[key])
+
+    for node in graph.nodes:
+        if node.op in ("call_function", "get_attr"):
+            propagate_shape(node, model)
+
+    graph.lint()
     model.recompile()
     return model

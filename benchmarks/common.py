@@ -20,15 +20,15 @@ bit-width:
 The MX group (block) size is not a free knob -- it must match the PE array, so
 ``group = max(pe)``.
 
-Decode always runs over a split KV cache (``build_decode`` ->
-``split_kv_cache``): the main cache holds whole chunks of ``group`` positions,
-a full-precision residual holds the chunk being filled, and the residual halves
-of the attention stay unquantized.  ``quant_folding`` bakes the main cache in
-the format its read is quantized to and quantizes each chunk as it completes;
-``kv_bits`` picks that format:
+Decode over a quantized KV cache runs it split (``split_kv_cache``): the main
+cache holds whole chunks of ``group`` positions, a full-precision residual holds
+the chunk being filled, and the residual halves of the attention stay
+unquantized.  ``quant_folding`` bakes the main cache in the format its read is
+quantized to and quantizes each chunk as it completes; ``kv_bits`` picks that
+format:
 
 * 16    -> the cache takes the attention matmuls' operand spec, i.e.
-  ``act_bits``' MX format, and is bf16 only when ``act_bits`` is 16
+  ``act_bits``' MX format; at ``act_bits`` 16 it is bf16 and stays whole
 * 4 / 2 -> KIVI: ``_annotate_kv_cache`` annotates the read ``uint4`` / ``uint2``
   ``group_wise_affine``, keys grouped along the sequence and values along the
   head dim, scale and zero point in ``fp8_e4m3``
@@ -51,7 +51,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from typing import (
     Optional,
     Tuple,
@@ -88,6 +88,7 @@ from voyager_compiler import (
     get_default_quantizer,
     match_and_fuse_rms_norm,
     prepare_pt2e,
+    quantizes_kv_cache,
     split_kv_cache,
     transform,
 )
@@ -150,9 +151,9 @@ DECODE_MAX_GEN = 128
 
 
 # -------------------------------------------------------------------------
-# Operator-fusion pipeline (copied verbatim from test_codegen.py): fold each
-# MXU op's trailing dequant / activation / requantization into one fused
-# kernel.  Stages that match no node are skipped.
+# Operator-fusion pipeline (the same as test_codegen.py's): fold each MXU op's
+# trailing dequant / activation / requantization into one fused kernel.
+# Stages that match no node are skipped.
 # -------------------------------------------------------------------------
 def _can_fuse(node):
     # A bf16 FC runs on the vector unit itself, so nothing chains after it.
@@ -170,7 +171,14 @@ def _is_constant_div(node):
     return True
 
 
-MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
+MXU_OPS = [
+    "conv2d",
+    "linear",
+    "matmul",
+    "conv2d_mx",
+    "linear_mx",
+    "matmul_mx",
+]
 QUANT_OPS = [
     "quantize",
     "quantize_mx",
@@ -200,7 +208,7 @@ FUSION_PIPELINE = [
         OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
-        OpMatcher("layer_norm", "rms_norm", "softmax"),
+        OpMatcher("layer_norm", "rms_norm", "rms_norm_kmajor", "softmax"),
         OpMatcher(*QUANT_OPS),
     ],
 ]
@@ -215,10 +223,10 @@ class SweepConfig:
 
     ``mode`` selects the graph shape: ``"prefill"`` feeds the whole model an
     ``input_ids`` of length ``prompt_len`` (``use_cache=False``); ``"decode"``
-    measures one token over a KIVI split cache whose main cache holds ``kv_len``
-    entries.  ``weight_bits`` and ``act_bits`` are each one of {16, 8, 4};
-    ``kv_bits`` is 16, where the cache follows ``act_bits``, or a KIVI width,
-    4 or 2.
+    measures one token over a cache of ``kv_len`` entries, split into a main
+    cache and a residual only when it is stored quantized.  ``weight_bits``
+    and ``act_bits`` are each one of {16, 8, 4}; ``kv_bits`` is 16, where the
+    cache follows ``act_bits``, or a KIVI width, 4 or 2.
 
     ``pipelined`` and ``fuse_operators`` are the two lowering switches: off,
     ``pipelined`` single-buffers every L2 tile (no prefetch overlap) and
@@ -261,7 +269,7 @@ class SweepConfig:
     attn_implementation: str = "eager"
     pipelined: bool = True
     fuse_operators: bool = True
-    bool_mask: bool = True
+    bool_mask: bool = field(kw_only=True)
     single_buffer_tail: bool = False
     num_layers_override: Optional[int] = None
 
@@ -303,16 +311,16 @@ class SweepConfig:
 
     @classmethod
     def baseline(cls, **overrides) -> "SweepConfig":
-        return replace(cls(), **overrides)
+        return replace(cls(bool_mask=True), **overrides)
 
 
 def add_config_args(parser: argparse.ArgumentParser, defaults=None, exclude=()):
     """Add a ``--field-name`` flag for every SweepConfig field, defaulting to
-    SweepConfig's default (or ``defaults``).  Bools become ``--x/--no-x``;
-    ``pe`` takes two ints.  ``exclude`` names fields a script defines itself
-    (e.g. a ``--mode`` with a ``both`` option); sweep scripts add extra flags
-    on top."""
-    base = defaults or SweepConfig()
+    ``SweepConfig.baseline()``'s value (or ``defaults``'s).  Bools become
+    ``--x/--no-x``; ``pe`` takes two ints.  ``exclude`` names fields a script
+    defines itself (e.g. a ``--mode`` with a ``both`` option); sweep scripts
+    add extra flags on top."""
+    base = defaults or SweepConfig.baseline()
     hints = get_type_hints(SweepConfig)
     for f in fields(SweepConfig):
         if f.name in exclude or f.name in NON_DESIGN_FIELDS:
@@ -450,7 +458,7 @@ def _cfg_value(name: str, value) -> str:
 def _cfg_stem(cfg: SweepConfig) -> str:
     """``cfg`` as a filename: the axes it is swept along, then its mode
     (``kv_len-4096_decode``); ``baseline`` where no axis moved."""
-    base = SweepConfig()
+    base = SweepConfig.baseline()
     skip = {*NON_DESIGN_FIELDS, "mode", _UNUSED_BY_MODE.get(cfg.mode)}
     diff = [
         (f.name, f"{f.name}-{_cfg_value(f.name, getattr(cfg, f.name))}")
@@ -463,19 +471,21 @@ def _cfg_stem(cfg: SweepConfig) -> str:
     return re.sub(r"[^\w.-]+", "_", "_".join(parts))
 
 
-def build_quantizer(cfg: SweepConfig):
+def build_quantizer(cfg: SweepConfig, split: bool):
     """A quantizer for ``cfg``'s weight / activation precision.
 
     Weights and activations are microscaling at 8 / 4 bits and unquantized
     bf16 at 16.  The rotary embedding's matmul is exempted by the scope
-    ``cfg.mode``'s export records for it.  In decode the residual halves of
-    the attention stay unquantized, and over a KIVI cache the main halves
-    take their cache operand in square ``group`` x ``group`` blocks of
-    ``act_bits``' format.  The cache's stored format is not set here:
+    ``cfg.mode``'s export records for it.  Over a split KV cache the residual
+    halves of the attention stay unquantized, and over a KIVI cache the main
+    halves take their cache operand in square ``group`` x ``group`` blocks
+    of ``act_bits``' format.  The cache's stored format is not set here:
     ``_annotate_kv_cache`` annotates its read.
 
     Args:
         cfg: The design point.
+        split: Whether the decode graph's KV caches are split
+            (``split_kv_cache``).
 
     Returns:
         The configured quantizer.
@@ -491,7 +501,7 @@ def build_quantizer(cfg: SweepConfig):
         0,
         None,
     )
-    if cfg.mode == "decode":
+    if split:
         # The split caches' residual halves of the attention (matmul orders
         # 1 and 3 within a layer) stay unquantized.
         for order in (1, 3):
@@ -609,12 +619,8 @@ def build_prefill(cfg: SweepConfig):
 def build_decode(cfg: SweepConfig):
     """Export a single decode step over a KV cache of length ``kv_len``: the
     whole model -- embeddings, every layer, final norm, lm_head -- via HF's
-    ``convert_and_export_with_cache``.  ``split_kv_cache`` keeps the chunk
-    being filled in a full-precision residual of one ``cfg.group`` block;
-    the main cache is quantized on its read -- by the attention matmuls'
-    activation spec, or by the KIVI spec ``_annotate_kv_cache`` puts there
-    -- and ``transform`` bakes it quantized and quantizes each chunk as it
-    completes (``quant_folding``).  The cache holds the ``kv_len`` context plus
+    ``convert_and_export_with_cache``, its caches whole (``_frontend``
+    splits a quantized one).  The cache holds the ``kv_len`` context plus
     ``DECODE_MAX_GEN`` generation slots, rounded up to the MX ``block_size``
     (= ``cfg.group``) so the KV tensors stay block-aligned and need no
     attention padding.  The decode token is at ``cache_position =
@@ -645,7 +651,6 @@ def build_decode(cfg: SweepConfig):
             example_cache_position=cache_position,
         )
     gm = ep.module()
-    split_kv_cache(gm, block, cfg.kv_len)
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, model, (), example_kwargs
 
@@ -834,6 +839,17 @@ def _frontend(cfg: SweepConfig):
         gm, model, example_args, example_kwargs = build_decode(cfg)
     else:
         gm, model, example_args, example_kwargs = build_prefill(cfg)
+    # Only a cache stored quantized -- KIVI's, or one the attention matmuls
+    # read in their MX format -- is split into chunks and a residual.
+    split = (
+        is_decode
+        and (
+            cfg.kv_bits != 16
+            or quantizes_kv_cache(gm, build_quantizer(cfg, split=False))
+        )
+    )
+    if split:
+        split_kv_cache(gm, cfg.group, cfg.kv_len)
 
     # get_decoder() is the text decoder, wherever the model nests it.
     layernorm = model.get_decoder().layers[0].input_layernorm
@@ -851,7 +867,7 @@ def _frontend(cfg: SweepConfig):
     elif cfg.bool_mask and cfg.attn_implementation != "sdpa":
         _annotate_attention_mask(gm)
 
-    quantizer = build_quantizer(cfg)
+    quantizer = build_quantizer(cfg, split)
     gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
     _calibrate(gm, example_args, example_kwargs, model.dtype)
     convert_pt2e(gm, None)
@@ -864,7 +880,7 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         tensor_layout="nhwc",
-        gemm_weight_layout="ck",
+        gemm_layout="xc,ck",
         keep_fp32=False,
     )
 
@@ -893,6 +909,7 @@ def _compile(cfg: SweepConfig):
         gm,
         pipelined=cfg.pipelined,
         tiler=tiler,
+        async_pipeline=cfg.acc_config.async_pipeline,
         single_buffer_tail=cfg.single_buffer_tail,
         bool_mask=cfg.bool_mask,
     )
@@ -1228,6 +1245,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         sub,
         pipelined=cfg.pipelined,
         tiler=tiler,
+        async_pipeline=acc_config.async_pipeline,
         single_buffer_tail=cfg.single_buffer_tail,
         bool_mask=cfg.bool_mask,
     )

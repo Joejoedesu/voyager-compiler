@@ -217,8 +217,13 @@ message PrimOp {
 // explicit, but the name resolves to a PrimOp rather than to an allocation, and
 // no memory is read or written for it -- its box carries shape and dtype, and
 // no memory.
+//
+// pattern names the instruction form the chain is, one of the target's
+// fused patterns, and the target's translator emits the chain as that form.
+// It is unset on a chain the target lowers as any other fusion.
 message PrimOpList {
   repeated PrimOp op_list = 1;
+  optional string pattern = 2;
 }
 
 

@@ -24,18 +24,21 @@ from voyager_compiler.codegen.node_info import (
     compute_tiled_shape,
     csr_quantize_node,
     dtype_byte_size,
+    gemm_output_shape,
     get_anchor_node,
     get_arg_value,
     is_bmm,
     is_conv2d,
     normalize_shape,
     quant_param_arg_nodes,
+    reads_kmajor,
     reduced_input_tiling,
     require_allocation,
     stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
+    writes_transposed,
 )
 from voyager_compiler.codegen.transform.tiling.runtime_model import (
     Fused,
@@ -167,9 +170,8 @@ def matrix_layer(anchor):
         _, _, height, width = unproject(anchor.shape, in_dims)
         stride_h, stride_w = _pair(get_arg_value(anchor, 3, "stride", 1))
     else:
-        width = (
-            anchor.shape[-2] if is_bmm(anchor) else math.prod(anchor.shape[:-1])
-        )
+        out_shape = gemm_output_shape(anchor)
+        width = out_shape[-2] if is_bmm(anchor) else math.prod(out_shape[:-1])
 
         if weight_is_ck(anchor):
             in_channels, out_channels = weight_shape[-2:]
@@ -195,14 +197,16 @@ def _output_pos_to_loop_dim(anchor):
     (``ON`` batch / ``OC`` channels / ``OY`` height / ``OX`` width), in the
     anchor's physical layout — so a fused operand's shape can be broadcast onto
     the output tile.  conv: NCHW or NHWC (``meta['transposed']``); gemm:
-    ``(batch.., M, N)`` with ``M -> OX``, ``N -> OC``, batch dims ``-> ON``.
+    ``(batch.., M, N)`` with ``M -> OX``, ``N -> OC``, batch dims ``-> ON``,
+    or ``(batch.., N, M)`` when it ``writes_transposed``.
     """
     if is_conv2d(anchor):
         if anchor.meta.get("transposed", False):
             return [le.ON, le.OY, le.OX, le.OC]  # NHWC
         return [le.ON, le.OC, le.OY, le.OX]  # NCHW
     ndim = anchor.value.ndim
-    return [le.ON] * (ndim - 2) + [le.OX, le.OC]
+    rows_cols = [le.OC, le.OX] if writes_transposed(anchor) else [le.OX, le.OC]
+    return [le.ON] * (ndim - 2) + rows_cols
 
 
 def _operand_placeholders(root):
@@ -369,6 +373,13 @@ def weight_k_major(anchor):
     its stored layout (``weight_is_ck``), flipped by a transpose fused onto
     it."""
     return weight_is_ck(anchor) != weight_transforms(anchor.args[1])[1]
+
+
+def activation_k_major(anchor):
+    """Whether a GEMM ``anchor``'s activation is stored ``[contraction,
+    rows]``: its layout's (``reads_kmajor``), unless a transpose fused onto
+    it fetches it from a row-major tensor, or the other way round."""
+    return reads_kmajor(anchor) != activation_transforms(anchor.args[0])[1]
 
 
 def outlier_stats(node):

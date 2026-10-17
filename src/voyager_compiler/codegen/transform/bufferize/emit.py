@@ -71,6 +71,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
     MEMORY_LEVEL_IMMEDIATE,
+    MEMORY_LEVEL_LOCAL_BUFFER,
     MEMORY_LEVEL_REGISTER,
     MEMORY_LEVEL_SCRATCHPAD,
     SCALAR_BOOL,
@@ -927,7 +928,8 @@ class _Emitter:
         return box
 
     def _memory_level(self, node):
-        """Where ``node``'s bytes live: the space bufferization annotated.
+        """Where ``node``'s bytes live: the space bufferization annotated.  A
+        Local buffer has no address: the target places it.
 
         A semaphore (``voyager.zeros`` / a credit-seeded ``voyager.fill``) is a
         counter the accelerator maps itself, so it is declared at register level
@@ -939,6 +941,8 @@ class _Emitter:
             return MEMORY_LEVEL_REGISTER
         if node.meta.get("space") == "Scratchpad":
             return MEMORY_LEVEL_SCRATCHPAD
+        if node.meta.get("space") == "Local":
+            return MEMORY_LEVEL_LOCAL_BUFFER
         if node.meta.get("space") == "DRAM":
             return MEMORY_LEVEL_DRAM
         return MEMORY_LEVEL_IMMEDIATE
@@ -1011,7 +1015,9 @@ class _Emitter:
     def _fused(self, node, named, env) -> Operation:
         """A fused group (a GEMM / conv plus its tail) is one instruction: the
         ops it chains, and the destination(s) the chain writes.  Its
-        intermediate values have no storage — they never leave the datapath."""
+        intermediate values have no storage — they never leave the datapath.
+        A group a builder formed as one of its target's fused patterns
+        carries that pattern's name (``meta['pattern']``) as ``pattern``."""
         sub = named[str(node.target)]
         sub_env = self.envs[sub]
         self._dump(node)
@@ -1029,6 +1035,8 @@ class _Emitter:
         op = Operation(name=node.name)
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
+        if (pattern := node.meta.get("pattern")) is not None:
+            op.fused.pattern = pattern
         self._set_outputs(op, node, env)
         if (tiling := _build_tiling(node)) is not None:
             op.tiling.CopyFrom(tiling)
@@ -1474,9 +1482,10 @@ def _type_str(node) -> str:
 
     The dtype is the custom (quantized) ``meta['dtype']`` string (e.g.
     ``int6``) used verbatim when set, else a short name for the builtin torch
-    dtype (``f32`` / ``bf16`` / ...).  ``space`` is ``meta['space']`` (``DRAM``
-    / ``Scratchpad``) from the bufferize pass.  Shapes come from the node's
-    ShapeProp ``value`` or, inside loop bodies, the exported ``meta['val']``.
+    dtype (``f32`` / ``bf16`` / ...).  ``space`` is ``meta['space']``
+    (``DRAM`` / ``Scratchpad`` / ``Local``) from the bufferize pass.  Shapes
+    come from the node's ShapeProp ``value`` or, inside loop bodies, the
+    exported ``meta['val']``.
     """
     val = getattr(node, "value", None)
     if not isinstance(val, torch.Tensor):

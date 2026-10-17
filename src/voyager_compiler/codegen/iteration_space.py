@@ -122,16 +122,19 @@ class AddressMap:
         return tuple(strides)
 
     def reshape(self, shape: Sequence[int]) -> "AddressMap":
-        """Regroup the digits into ``shape`` (one ``-1`` allowed).  A
-        dimension boundary that falls inside a digit splits it; one that
-        falls at no multiple of the digit's radix cannot be expressed."""
+        """Regroup the digits into ``shape`` (one ``-1`` allowed).  The
+        digits of all dimensions form one row-major list, neighbours that
+        read consecutively merged, so only a jump in the address -- not an
+        old dimension boundary -- limits the regrouping.  A new boundary
+        that falls inside a digit splits it; one that falls at no multiple
+        of the digit's radix cannot be expressed."""
         shape = [int(s) for s in shape]
         if shape.count(-1) == 1:
             known = math.prod(s for s in shape if s != -1)
             shape[shape.index(-1)] = self.numel() // max(known, 1)
         if math.prod(shape) != self.numel():
             raise ValueError(f"cannot reshape {self.shape} to {shape}")
-        flat = [d for dim in self.dims for d in dim if d[0] != 1]
+        flat = list(_canonical(d for dim in self.dims for d in dim))
         dims = []
         for size in shape:
             taken = []

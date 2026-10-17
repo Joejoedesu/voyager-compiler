@@ -4,7 +4,9 @@ The GEMM / conv builders emit the L3 grid in the mapping's loop order and load
 an operand only when its block changes, whatever hardware runs the kernel, so
 every runtime model counts tiles, steps and fetches the same way.  The
 flash-attention builder ends a causal query block's key loop at
-``attention_kv_last``, so a model counts its steps by it too.
+``attention_kv_last``, adds the causal mask where ``attention_crosses`` says
+and loads an explicit mask's tile along ``attention_mask_dyn``, so a model
+counts its steps, masked steps and mask loads by them too.
 """
 
 import math
@@ -430,3 +432,43 @@ def attention_kv_last(q_block, tq, tkv, sq):
     stacks heads along the rows, a block never straddling one).
     ``q_block`` may be a loop's SymInt."""
     return ((q_block * tq) % sq + tq - 1) // tkv
+
+
+def attention_crosses(q_block, kv_block, tq, tkv, sq):
+    """Whether the causal mask can drop a key of the pair of query block
+    ``q_block`` and key block ``kv_block``: the block's last key lies past
+    the query block's first row, placed as in ``attention_kv_last``.
+    Either block may be a loop's SymInt."""
+    return (q_block * tq) % sq < (kv_block + 1) * tkv - 1
+
+
+def attention_mask_dyn(mask_batch, grid):
+    """The dims along which the flash-attention walk moves through a mask.
+
+    A batch dim of more than one block the explicit mask does not broadcast
+    along (aligned from the right), then the query and key dims when cut into
+    more than one block.  With none, every step reads the same mask tile,
+    which the kernel loads once into one slot.
+
+    Args:
+        mask_batch: The mask's batch dims.  Under the GQA fold the builder
+            passes the folded mask's, which it addresses; the unfolded
+            mask's give the same dims along the grid.
+        grid: The walk's grid: the key / value batch dims, then the query
+            and key block counts.
+
+    Returns:
+        The dims as ``(mask dim, grid dim)`` pairs.
+    """
+    nb = len(grid) - 2
+    off = nb - len(mask_batch)
+    dyn = [
+        (j, off + j)
+        for j, size in enumerate(mask_batch)
+        if size != 1 and grid[off + j] > 1
+    ]
+    if grid[-2] > 1:
+        dyn.append((len(mask_batch), nb))
+    if grid[-1] > 1:
+        dyn.append((len(mask_batch) + 1, nb + 1))
+    return dyn

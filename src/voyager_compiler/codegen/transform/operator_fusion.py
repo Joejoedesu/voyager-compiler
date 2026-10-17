@@ -113,8 +113,9 @@ def find_sequential_nodes_(
 
             last_node = nodes[-1]
 
-            # Skip if the last node has multiple users
-            if len(last_node.users) > 1:
+            # Skip if the last node has multiple users, unless the stage's op
+            # leaves it to the others as a result of the group
+            if len(last_node.users) > 1 and not stage_sources.keeps_input:
                 if len(nodes) > 1:
                     new_chains.append(nodes)
                 continue
@@ -251,8 +252,11 @@ def select_groups_min_dram(
     return final
 
 
-def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
-    graph = model.graph
+def _match_patterns(
+    graph: torch.fx.Graph, patterns: List[List[Any]]
+) -> List[List[List[Node]]]:
+    """The chains of ``graph``'s ops each of ``patterns`` matches
+    (``find_sequential_nodes_``), pattern by pattern."""
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}
 
     all_sources = {
@@ -264,14 +268,78 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
         if node.target in all_sources:
             nodes_by_source[node.target].append(node)
 
-    all_candidates = []
-    for pattern in patterns:
-        candidates = find_sequential_nodes_(
-            pattern, nodes_order, nodes_by_source
-        )
-        all_candidates.extend(candidates)
+    return [
+        find_sequential_nodes_(pattern, nodes_order, nodes_by_source)
+        for pattern in patterns
+    ]
 
+
+def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
+    all_candidates = [
+        chain
+        for chains in _match_patterns(model.graph, patterns)
+        for chain in chains
+    ]
     return select_groups_min_dram(all_candidates)
+
+
+def fuse_patterns(gm: GraphModule, patterns: List[List[Any]]) -> None:
+    """Fuse each chain of ``gm``'s ops one of ``patterns`` matches, one op
+    per ``OpMatcher``, into one ``call_module``, in ``gm`` and every
+    subgraph it calls (loop bodies, cond branches).
+
+    The instruction-level fusion: a backend's builder runs it on the
+    subgraph it built, each pattern an instruction doing the work of its
+    ops.  It matches as ``fuse_operator`` does, but a chain must hold an op
+    for every matcher, and an op the chains of two patterns claim goes to
+    the earlier pattern.  A group's results are its values read outside it,
+    in program order: its last op's, and the input an op keeps
+    (``OpMatcher.keeps_input``), so a chain whose kept input is read only
+    inside it stays unfused.  The group runs where its last op stood, so a
+    chain with a result read before that stays unfused.  The fused node
+    records a named pattern's name as ``meta['pattern']``.
+
+    Args:
+        gm: The subgraph, fused in place.
+        patterns: The ``Pattern``s, earliest first in a conflict.
+    """
+    for node in list(gm.graph.nodes):
+        if node.op == "get_attr":
+            sub = getattr(gm, str(node.target), None)
+            if isinstance(sub, GraphModule):
+                fuse_patterns(sub, patterns)
+
+    order = {node: i for i, node in enumerate(gm.graph.nodes)}
+    groups, taken = [], set()
+    for pattern, chains in zip(patterns, _match_patterns(gm.graph, patterns)):
+        for chain in chains:
+            ops = [n for n in chain if not is_nop(n)]
+            results = [n for n in chain if any(u not in chain for u in n.users)]
+            read_early = any(
+                order[user] < order[chain[-1]]
+                for node in results
+                for user in node.users
+                if user not in chain
+            )
+            if (
+                len(ops) == len(pattern)
+                and all(
+                    ops[i - 1] in results
+                    for i, matcher in enumerate(pattern)
+                    if matcher.keeps_input
+                )
+                and not read_early
+                and not taken.intersection(chain)
+            ):
+                groups.append((pattern, chain, results))
+                taken.update(chain)
+
+    for pattern, chain, results in groups:
+        fused = create_and_insert_subgraph(chain, gm, results=results)
+        if pattern.name is not None:
+            fused.meta["pattern"] = pattern.name
+    gm.graph.lint()
+    gm.recompile()
 
 
 def search_group(node, node_lists):
@@ -718,7 +786,7 @@ def _tail_fits(
         True if some pattern admits the chain.
     """
     if tail and tail[0].target == torch.ops.quantized_ops.dequantize.default:
-            tail = tail[1:]
+        tail = tail[1:]
     add = torch.ops.aten.add.Tensor
     for pattern in patterns:
         if not pattern[0].matches(anchor):

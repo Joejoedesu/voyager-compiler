@@ -53,29 +53,30 @@ DIFF_EXCERPT_LINES = 60
 SCHEME_ARGS = {
     "E4M3": (
         "--activation fp8_e4m3 --weight fp8_e4m3 --bf16 "
-        "--tensor_layout nhwc --gemm_weight_layout ck"
+        "--tensor_layout nhwc --gemm_layout xc,ck"
     ),
     "P8_1": (
         "--activation posit8_1 --weight posit8_1 --bf16 "
-        "--tensor_layout nhwc --gemm_weight_layout ck"
+        "--tensor_layout nhwc --gemm_layout xc,ck"
     ),
     "INT8": (
         "--activation int8,qs=per_tensor_symmetric "
         "--weight int8,qs=per_tensor_symmetric --bias int24 --bf16 "
-        "--calibration_steps 3 --tensor_layout nhwc --gemm_weight_layout ck"
+        "--calibration_steps 3 --tensor_layout nhwc --gemm_layout xc,ck"
     ),
     "MXINT8": (
         "--activation int8,qs=microscaling,bs=16,pot=1 "
         "--weight int8,qs=microscaling,bs=16,pot=1 "
-        "--bf16 --tensor_layout nhwc --gemm_weight_layout ck"
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
     ),
     "MXNF4": (
         "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
         "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --tensor_layout nhwc "
-        "--gemm_weight_layout ck --scratchpad_size 2097152 --num_banks 16 "
+        "--gemm_layout xc,ck --scratchpad_size 2097152 --num_banks 16 "
         "--conv2d_im2col"
     ),
+    "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck",
 }
 
 # The matrix search sizes its blocking against a scratchpad and a bank
@@ -93,6 +94,7 @@ SCHEME_INPUT_BYTES = {
     "INT8": 1,
     "MXINT8": 1,
     "MXNF4": 0.5,
+    "BF16": 2,
 }
 assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 
@@ -145,6 +147,8 @@ COMMANDS = [
     Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
     Command("llama_decode", "MXNF4", "64,64", "llama_decode", _LLM),
     Command("llama_decode_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
+    # -- BF16 (an unquantized KV cache stays whole) --
+    Command("llama_decode", "BF16", "64,64", "llama_decode", _LLM),
     # -- MXNF4 (vision / bert) --
     Command("resnet18", "MXNF4", "64,64"),
     Command("resnet50", "MXNF4", "64,64"),

@@ -66,6 +66,7 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     tag_base_table,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    BuildContext,
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
@@ -1113,24 +1114,18 @@ def _slice_axis_hidden(node):
 
 
 def build_sparse_gemm(
-    node,
-    *,
-    num_slots: int = _DEFAULT_NUM_SLOTS,
-    accumulate_fp32: bool = False,
-    tiler=None,
-    async_pipeline: bool = False,
+    node: torch.fx.Node, ctx: BuildContext
 ) -> Optional[torch.fx.GraphModule]:
     """Bufferize a GEMM whose activation carries an outlier CSR.
 
+    Under ``ctx.async_pipeline`` each step's compute is a ``voyager.commit``
+    (the :class:`AsyncPipelinedKernel` nest), overlapping the CSR gather and
+    the dense loads with the previous tile's compute.
+
     Args:
         node: The sparse ``linear_mx`` / ``matmul_mx``, bare or fused.
-        num_slots: Software-pipeline depth for the dense operands.
-        accumulate_fp32: Accumulate the K reduction in fp32.
-        tiler: The ``Tiler``.
-        async_pipeline: Dispatch each step's compute as a ``voyager.commit``
-            (the :class:`AsyncPipelinedKernel` nest), overlapping the CSR
-            gather and the dense loads with the previous tile's compute;
-            the synchronous nest otherwise.
+        ctx: The ``BuildContext``; ``num_slots`` is the software-pipeline
+            depth for the dense operands.
 
     Returns:
         The bufferized gm, or ``None`` when the node has no CSR or the
@@ -1148,7 +1143,7 @@ def build_sparse_gemm(
     with _slice_axis_hidden(node) as hidden:
         plan = _gemm_plan(
             node,
-            tiler,
+            ctx.tiler,
             k_tiles=geom.n_k if geom is not None else None,
         )
     if plan is None:
@@ -1184,9 +1179,9 @@ def build_sparse_gemm(
         out_geom=out_geom,
         split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
-        num_slots=num_slots,
-        accumulate_fp32=accumulate_fp32,
-        async_pipeline=async_pipeline,
+        num_slots=ctx.num_slots,
+        accumulate_fp32=ctx.accumulate_fp32,
+        async_pipeline=ctx.async_pipeline,
     )
     if out_geom is not None:
         pattern.out_values = list(node.value)

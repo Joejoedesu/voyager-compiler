@@ -58,11 +58,18 @@ class Placement:
         scratch_slots: The regions the reduction scratch is allocated with.
         tier: How much extra bank sharing the tiling needed to fit, 0 for
             none; the grid search keeps the lowest.
+        scratch: The regions the kernel keeps beside the op's tiles that no
+            FX node names (``OpModel.scratch``), which its builder allocates
+            as placed and hands the op by name (``with_scratch``).
+
+    A backend whose memory has levels the shared code does not know
+    subclasses it to place buffers there too.
     """
 
     groups: tuple | None = None
     scratch_slots: int = 1
     tier: int = 0
+    scratch: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -216,6 +223,16 @@ class OpModel(ABC):
         """The :class:`Cost` of ``tiling`` laid out as ``placement``, the
         answer ``fit`` gave."""
 
+    def scratch(self, out_tile):
+        """The regions the backend's kernel keeps beside the op's tiles that
+        no FX node names, for an output tile ``out_tile`` (one per output
+        for several): ``(name, shape, dtype, slots, space)`` each, ``space``
+        the ``MemoryLevel`` it is allocated in.  The fit places
+        them for its tiling's tile, and a builder sizing its own nest, or an
+        op built whole, asks for its own.  None by default.
+        """
+        return ()
+
 
 class RuntimeModel(ABC):
     """A backend's hardware, as the shared tile search sees it.
@@ -257,21 +274,6 @@ class RuntimeModel(ABC):
             NotImplementedError: The backend does not run fused attention.
         """
         raise NotImplementedError(f"{type(self).__name__}: fused attention")
-
-    def kernel_scratch(self, node, out_tile):
-        """The on-chip regions a backend's kernel keeps beside an op's tiles
-        that no FX node names, which the builders declare and the fit
-        charges.  None by default: a kernel that keeps its intermediates in
-        its own temporaries needs no region in the IR.
-
-        Args:
-            node: The op being bufferized or tiled, bare or fused.
-            out_tile: One tile of ``node``'s output, or one per output.
-
-        Returns:
-            ``[(name, shape, dtype), ...]``, one per region.
-        """
-        return []
 
 
 def pad_head(head_dim, space):
