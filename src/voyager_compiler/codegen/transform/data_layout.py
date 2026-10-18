@@ -1011,7 +1011,12 @@ def _plan_kmajor(
         elif node.target is RMS_NORM:
             out = src if src in (_identity(rank), _swapped(rank)) else None
         else:  # elementwise
-            tensors = [a for a in node.args if _is_tensor(a)]
+            # A quantization table is indexed by value, not position, so it
+            # is read as it is.
+            tables = quant_param_arg_nodes(node)
+            tensors = [
+                a for a in node.args if _is_tensor(a) and a not in tables
+            ]
             full = [
                 a
                 for a in tensors

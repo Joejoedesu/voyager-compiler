@@ -44,6 +44,8 @@ from .utils import (
     TrainiumGrid,
     TrainiumPlacement,
     arithmetic_ops,
+    chain_ops,
+    chain_tiles,
     extents,
     fits_psum,
     group_ops,
@@ -64,20 +66,27 @@ RMS_NORM_KMAJOR = torch.ops.quantized_ops.rms_norm_kmajor.default
 SQUARE_BLOCKS = 8
 
 
-def rms_norm_kmajor_tiles(hidden, dtype, free):
+def rms_norm_kmajor_tiles(hidden, dtype, cols, free, post):
     """The tiles the translator computes a K-major RMS norm over ``hidden``
-    rows of ``dtype`` in (``translate.Kernel._rms_norm_kmajor``), ``free``
-    columns at a time (a matmul's moving free size): a ones tile and the
-    PSUM banks its sums land in, the weight's float32 columns,
-    ``SQUARE_BLOCKS`` blocks' squares and the rstd."""
+    rows of ``dtype`` in (``translate.Kernel._rms_norm_kmajor``), on a tile
+    ``cols`` wide ``free`` columns at a time (a matmul's moving free size),
+    its result read by the chain ``post`` (``chain_ops``) if any: a ones
+    tile and the PSUM banks its sums land in, the weight's float32 columns,
+    ``SQUARE_BLOCKS`` blocks' squares and the rstd, and the float32 result
+    the chain after it reads, with that chain's."""
     blocks = math.ceil(hidden / PARTITIONS)
-    return {
+    tiles = {
         ("one", PARTITIONS, dtype, 1, SRAM),
         ("acc", free, F32, ACCUMULATORS, LOCAL),
         ("wc", blocks, F32, 1, SRAM),
         ("sq", SQUARE_BLOCKS * free, dtype, 2, SRAM),
         ("rq", free, F32, 2, SRAM),
     }
+    if post:
+        tiles.add(("rw", free, F32, 2, SRAM))
+        for width in extents(cols, free):
+            tiles |= chain_tiles(post, width)
+    return tiles
 
 
 def rms_norm_kmajor_busy(model, rows, cols, hidden):
@@ -150,6 +159,7 @@ class TrainiumVector(TrainiumGrid):
         kmajor_hidden: The normalized dim of the K-major RMS norm the group
             runs (``rms_norm_kmajor_busy``), 0 without one.
         kmajor_dtype: That RMS norm's element type.
+        kmajor_post: The chain (``chain_ops``) after that RMS norm.
         group: The group of ops the translator runs (``group_ops``).
     """
 
@@ -166,6 +176,7 @@ class TrainiumVector(TrainiumGrid):
         ops = [node]
         if submod is not None:
             ops = [n for n in submod.graph.nodes if n.op == "call_function"]
+        self.kmajor_post = chain_ops(ops[ops.index(norm) + 1 :]) if norm else ()
         self.group = group_ops(ops)
 
     def placement(self, tiling, shapes, moves):
@@ -188,7 +199,9 @@ class TrainiumVector(TrainiumGrid):
             tiles = rms_norm_kmajor_tiles(
                 self.kmajor_hidden,
                 self.kmajor_dtype,
+                out_tile[-1],
                 self.model.config.moving_free_max,
+                self.kmajor_post,
             )
         else:
             if out_tile and isinstance(out_tile[0], (tuple, list)):

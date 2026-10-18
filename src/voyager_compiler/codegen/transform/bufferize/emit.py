@@ -1141,7 +1141,8 @@ class _Emitter:
         """A ``with_scratch`` region is its op's one instruction, emitted as
         the op would be unwrapped, plus each scratch region as a keyword of
         the op -- of the anchor, in a fused group -- under the region's
-        name."""
+        name.  A view is no instruction (``is_nop``), so a view anchor
+        hands its regions to the op reading it."""
         sub = named[str(node.args[0].target)]
         first = len(ops)
         self.emit_region(sub, ops)
@@ -1149,7 +1150,10 @@ class _Emitter:
         prim = op.prim
         if op.WhichOneof("op_type") == "fused":
             group = next(n for n in sub.graph.nodes if n.op == "call_module")
-            anchor = _target_name(get_anchor_node(group).target)
+            anchor = get_anchor_node(group)
+            while is_nop(anchor):
+                (anchor,) = anchor.users
+            anchor = _target_name(anchor.target)
             prim = next(p for p in op.fused.op_list if p.target == anchor)
         for key, region in node.kwargs["scratch"].items():
             prim.kwargs[key].CopyFrom(self._argument(region, env))

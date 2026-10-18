@@ -1945,10 +1945,9 @@ class Kernel:
         squares summed over the blocks and their partitions by ones-matmuls
         accumulating in PSUM -- which puts the sum on every partition -- the
         mean square's rsqrt, then per block one pass scaling by it and by
-        the ``[H, 1]`` weight, one value per row."""
-        if len(prims) > 1:
-            raise NotImplementedError(f"{prims[1].name}: fused to an RMS norm")
-        prim = prims[0]
+        the ``[H, 1]`` weight, one value per row.  The pass writes ``dst``
+        itself, or a scratch tile the ops fused after the norm read."""
+        prim, post = prims[0], prims[1:]
         kw = self._kwargs(prim)
         x = self._view(prim.kwargs["input"].tensor_box)
         weight = self._view(prim.kwargs["weight"].tensor_box)
@@ -2017,13 +2016,22 @@ class Kernel:
                     f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})"
                 )
                 for b, start in enumerate(starts):
+                    out = self._rows_ap(dst, start, parts, lo, hi)
+                    if post:
+                        temp = self.temp("rw", free)
+                        out = f"{temp}[0:{parts}, 0:{w}]"
                     self.emit(
-                        "nisa.scalar_tensor_tensor(dst="
-                        f"{self._rows_ap(dst, start, parts, lo, hi)}, "
+                        f"nisa.scalar_tensor_tensor(dst={out}, "
                         f"data={self._rows_ap(x, start, parts, lo, hi)}, "
                         f"op0=nl.multiply, operand0={column}[0:{parts}, "
                         f"{b}:{b + 1}], op1=nl.multiply, operand1={rstd})"
                     )
+                    if post:
+                        rows = start + np.arange(parts)
+                        linear = rows[:, None] * tokens + np.arange(lo, hi)
+                        coords = np.stack(np.unravel_index(linear, x.shape))
+                        result = Chunk(temp, free, x.shape, coords)
+                        self._chain(post, {prim.name: result}, dst)
 
     def _softmax(self, prim, rows, r, out):
         """Softmax over the last dim of the ``r`` rows ``rows(lo, hi)`` reads
