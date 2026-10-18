@@ -36,6 +36,7 @@ AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.dequantize.default: 3,
     torch.ops.quantized_ops.quantize.default: 3,
     torch.ops.quantized_ops.quantize_mx.default: 2,
+    torch.ops.quantized_ops.quantize_mx_outlier.default: 2,
     torch.ops.quantized_ops.quantize_affine.default: 2,
 }
 
@@ -464,7 +465,7 @@ def is_aliasing_op(node: Node) -> bool:
     that regroups or drops dims, computing nothing.  Such a node sitting
     *between* two fused compute stages breaks the single-iteration-space
     assumption and is relocated to the fused module's boundary by the
-    iteration-space normalizer (see ``normalize.py``).  A nop that also
+    iteration-space normalizer (see ``iteration_space.py``).  A nop that also
     preserves the shape (same in/out) can stay inside the fused chain.
     """
     if not is_nop(node):

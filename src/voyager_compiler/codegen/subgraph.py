@@ -15,8 +15,8 @@ from torch.fx.node import map_arg
 from transformers.utils.import_utils import is_torch_greater_or_equal
 
 from voyager_compiler.codegen.iteration_space import (
-    IterationSpaceNormalizer,
     NormalizationError,
+    normalize_group,
 )
 from voyager_compiler.codegen.node_info import (
     NORM_OPS,
@@ -353,11 +353,11 @@ def create_and_insert_subgraph(
         for item, value in zip(items, result):
             set_node_value(item, value)
 
-    # Normalize the fused submodule to the anchor's iteration space; skip the
-    # group (leaving it fused as-is) if it cannot share one iteration space.
+    # Normalize the fused submodule to the anchor's iteration space; leave
+    # the group unfused if it cannot share one iteration space.
     if normalize_iteration_space:
         try:
-            IterationSpaceNormalizer().normalize(model, new_node)
+            normalize_group(model, new_node)
         except NormalizationError as exc:
             logger.warning("normalization failed: %s: %s", new_node, exc)
             new_node.replace_all_uses_with(nodes[-1])

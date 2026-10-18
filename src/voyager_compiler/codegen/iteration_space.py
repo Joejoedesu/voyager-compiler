@@ -1,28 +1,20 @@
 from __future__ import annotations
 
-import logging
 import math
-import operator
 from dataclasses import dataclass
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import fx
 
 from voyager_compiler.codegen.node_info import (
-    AXES_ARG_INDEX_MAP,
+    DYNAMIC_QUANTIZE_OPS,
     NORM_OPS,
+    QUANTIZE_FAMILY_OPS,
     SOFTMAX_OPS,
     ancestors,
     get_anchor_node,
+    get_arg_value,
     is_aliasing_op,
     is_elementwise_op,
     is_nop,
@@ -36,18 +28,15 @@ from voyager_compiler.shape_prop import (
     set_node_value,
 )
 
-logger = logging.getLogger(__name__)
-
-
 Shape = Tuple[int, ...]
 # One dimension of an address map: row-major ``(radix, stride)`` digits.
 Digits = Tuple[Tuple[int, int], ...]
 
 
 def _canonical(digits) -> Digits:
-    """``digits`` with radix-1 entries dropped and adjacent entries merged
-    where the higher one's stride is the lower one's radix times its stride,
-    so two equal maps have equal digits.  A size-1 dimension is ``((1, 0),)``.
+    """Drop radix-1 digits and merge neighbours that read consecutively.
+
+    Equal maps then have equal digits; a size-1 dim is ``((1, 0),)``.
     """
     out = []
     for radix, stride in digits:
@@ -60,32 +49,20 @@ def _canonical(digits) -> Digits:
     return tuple(out) or ((1, 0),)
 
 
-def _axis(dim: int, ndim: int) -> int:
-    if not -ndim <= dim < ndim:
-        raise ValueError(f"dimension {dim} out of range for {ndim} dims")
-    return dim % ndim
-
-
 @dataclass(frozen=True)
 class AddressMap:
-    """Where every position of a fused subgraph value reads its external
-    input: the flat index of that input, as a function of the position.
+    """The flat index of its external input each fused-value position reads.
 
-    The function is held symbolically.  ``dims[d]`` is the row-major list of
-    ``(radix, stride)`` digits of dimension ``d``: an index along it
-    contributes each of its mixed-radix digits times that digit's stride,
-    and ``offset`` is added to the total.  A map over a 32-head ``n x n``
-    attention tensor is then a handful of tuples, not an int64 tensor of
-    ``32 n^2`` entries, and every shape op the normalizer replays keeps the
-    form exact: a permute reorders dimensions, an expand is a zero-stride
-    digit, and a reshape regroups digits, splitting one where a new boundary
-    falls inside it.  A dimension of one digit is read at a fixed stride;
-    one that keeps several (the head axis once a GQA repeat is merged) is
-    not, and ``affine_strides`` reports it as such.
+    ``dims[d]`` is the row-major list of ``(radix, stride)`` digits of dim
+    ``d``: an index along it adds each of its mixed-radix digits times that
+    digit's stride.  Held as digits, a map stays a few tuples and every shape
+    op keeps it exact: a permute reorders dims, an expand is a zero-stride
+    digit, and a reshape regroups digits, splitting one a new boundary falls
+    inside.  A dim of one digit is read at a fixed stride; one of several
+    (e.g. a head axis with a merged GQA repeat) is not.
     """
 
     dims: Tuple[Digits, ...]
-    offset: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -94,8 +71,7 @@ class AddressMap:
 
     @classmethod
     def arange(cls, shape: Sequence[int]) -> "AddressMap":
-        """The identity map over ``shape``: position ``p`` reads element
-        ``p`` of a contiguous input of that shape."""
+        """The identity map over a contiguous input of ``shape``."""
         dims = []
         stride = 1
         for size in reversed([int(s) for s in shape]):
@@ -107,32 +83,19 @@ class AddressMap:
     def shape(self) -> Shape:
         return tuple(math.prod(r for r, _ in d) for d in self.dims)
 
-    def numel(self) -> int:
-        return math.prod(self.shape)
-
-    def affine_strides(self) -> Optional[Shape]:
-        """One stride per dimension (0 along a size-1 or broadcast one), or
-        ``None`` when some dimension is not read at a single stride."""
-        strides = []
-        for digits in self.dims:
-            if len(digits) != 1:
-                return None
-            radix, stride = digits[0]
-            strides.append(stride if radix > 1 else 0)
-        return tuple(strides)
-
     def reshape(self, shape: Sequence[int]) -> "AddressMap":
-        """Regroup the digits into ``shape`` (one ``-1`` allowed).  The
-        digits of all dimensions form one row-major list, neighbours that
-        read consecutively merged, so only a jump in the address -- not an
-        old dimension boundary -- limits the regrouping.  A new boundary
-        that falls inside a digit splits it; one that falls at no multiple
-        of the digit's radix cannot be expressed."""
+        """Regroup the digits into ``shape``.
+
+        All dims' digits form one merged row-major list, so only an address
+        jump, not an old dim boundary, limits the regrouping.  A new boundary
+        inside a digit splits it.
+
+        Raises:
+            ValueError: If ``shape`` has another element count, or cuts a
+                digit at no multiple of its radix.
+        """
         shape = [int(s) for s in shape]
-        if shape.count(-1) == 1:
-            known = math.prod(s for s in shape if s != -1)
-            shape[shape.index(-1)] = self.numel() // max(known, 1)
-        if math.prod(shape) != self.numel():
+        if math.prod(shape) != math.prod(self.shape):
             raise ValueError(f"cannot reshape {self.shape} to {shape}")
         flat = list(_canonical(d for dim in self.dims for d in dim))
         dims = []
@@ -141,143 +104,69 @@ class AddressMap:
             remaining = size
             while remaining > 1:
                 radix, stride = flat.pop(0)
+                if remaining % radix and radix % remaining:
+                    raise ValueError(
+                        f"reshape of {self.shape} to {shape} cuts a "
+                        "dimension inside a digit"
+                    )
                 if radix <= remaining:
-                    if remaining % radix:
-                        raise ValueError(
-                            f"reshape of {self.shape} to {shape} cuts a "
-                            "dimension inside a digit"
-                        )
                     taken.append((radix, stride))
                     remaining //= radix
                 else:
-                    if radix % remaining:
-                        raise ValueError(
-                            f"reshape of {self.shape} to {shape} cuts a "
-                            "dimension inside a digit"
-                        )
                     taken.append((remaining, stride * (radix // remaining)))
                     flat.insert(0, (radix // remaining, stride))
                     remaining = 1
             dims.append(tuple(taken))
-        return AddressMap(tuple(dims), self.offset)
-
-    def flatten(self, start_dim: int = 0, end_dim: int = -1) -> "AddressMap":
-        shape = self.shape
-        start = _axis(start_dim, len(shape))
-        end = _axis(end_dim, len(shape))
-        merged = math.prod(shape[start : end + 1])
-        return self.reshape(shape[:start] + (merged,) + shape[end + 1 :])
+        return AddressMap(tuple(dims))
 
     def permute(self, order: Sequence[int]) -> "AddressMap":
-        ndim = len(self.dims)
-        return AddressMap(
-            tuple(self.dims[_axis(o, ndim)] for o in order), self.offset
-        )
-
-    def transpose(self, dim0: int, dim1: int) -> "AddressMap":
-        order = list(range(len(self.dims)))
-        a, b = _axis(dim0, len(order)), _axis(dim1, len(order))
-        order[a], order[b] = order[b], order[a]
-        return self.permute(order)
-
-    def unsqueeze(self, dim: int) -> "AddressMap":
-        d = _axis(dim, len(self.dims) + 1)
-        return AddressMap(
-            self.dims[:d] + (((1, 0),),) + self.dims[d:], self.offset
-        )
-
-    def squeeze(self, dims=None) -> "AddressMap":
-        """Drop the size-1 dimensions, or those of ``dims`` that are size 1."""
-        ndim = len(self.dims)
-        if dims is None:
-            drop = set(range(ndim))
-        elif isinstance(dims, int):
-            drop = {_axis(dims, ndim)}
-        else:
-            drop = {_axis(d, ndim) for d in dims}
-        shape = self.shape
-        kept = tuple(
-            digits
-            for d, digits in enumerate(self.dims)
-            if not (d in drop and shape[d] == 1)
-        )
-        return AddressMap(kept, self.offset)
-
-    def select(self, dim: int, index: int) -> "AddressMap":
-        d = _axis(dim, len(self.dims))
-        index = _axis(index, self.shape[d])
-        offset = self.offset
-        for radix, stride in reversed(self.dims[d]):
-            offset += (index % radix) * stride
-            index //= radix
-        return AddressMap(self.dims[:d] + self.dims[d + 1 :], offset)
-
-    def slice(self, dim=0, start=None, end=None, step=1) -> "AddressMap":
-        d = _axis(dim, len(self.dims))
-        size = self.shape[d]
-        start = 0 if start is None else start
-        end = size if end is None else end
-        start = max(start + size, 0) if start < 0 else min(start, size)
-        end = max(end + size, 0) if end < 0 else min(end, size)
-        length = max(0, -(-(end - start) // step))
-        if start == 0 and length == size and step == 1:
-            return self
-        if len(self.dims[d]) != 1:
-            raise ValueError("slice of a dimension read at several strides")
-        radix, stride = self.dims[d][0]
-        dims = (
-            self.dims[:d] + (((length, stride * step),),) + self.dims[d + 1 :]
-        )
-        return AddressMap(dims, self.offset + start * stride)
+        return AddressMap(tuple(self.dims[o] for o in order))
 
     def expand(self, sizes: Sequence[int]) -> "AddressMap":
-        """Broadcast to ``sizes`` (``-1`` keeps a dimension): a size-1
-        dimension, or a new leading one, becomes a zero-stride digit."""
-        sizes = [int(s) for s in sizes]
+        """Broadcast to ``sizes``; a size-1 or new leading dim gets stride 0.
+
+        Raises:
+            ValueError: If the map does not broadcast to ``sizes``.
+        """
         lead = len(sizes) - len(self.dims)
         if lead < 0:
             raise ValueError(f"cannot expand {self.shape} to {sizes}")
         dims = [((size, 0),) for size in sizes[:lead]]
         for size, digits, current in zip(sizes[lead:], self.dims, self.shape):
-            if size in (-1, current):
+            if size == current:
                 dims.append(digits)
             elif current == 1:
                 dims.append(((size, 0),))
             else:
                 raise ValueError(f"cannot expand {self.shape} to {sizes}")
-        return AddressMap(tuple(dims), self.offset)
+        return AddressMap(tuple(dims))
 
 
-NodePredicate = Callable[[fx.Node], bool]
-
-# Emit relayouts as aten call_function ops (not call_method): the rest of the
-# compiler recognizes these as shape nops and aliases their memory.
+# Parent relayouts are aten ops, which the compiler treats as aliasing nops.
 _RELAYOUT_OPS = {
     "view": torch.ops.aten.view.default,
     "reshape": torch.ops.aten.reshape.default,
 }
 
-# The ops whose data input (args[0]) alone carries an address map: each keeps
-# that input's elements in place, and its other operands -- a
-# (de)quantization's per-block scale / zero_point, a norm's weight and bias --
-# are indexed by block or by the normalized dim, not by iteration position.
-_DATA_INPUT_OPS = (
-    NORM_OPS
-    | SOFTMAX_OPS
-    | {
-        torch.ops.quantized_ops.dequantize.default,
-        torch.ops.quantized_ops.quantize.default,
-    }
+# Ops whose data input (args[0]) alone carries the address map: they keep its
+# elements in place and index their other operands (qparams, tables, a norm's
+# weight and bias) by block or normalized dim, not by position.
+_PASS_THROUGH_OPS = (
+    NORM_OPS | SOFTMAX_OPS | QUANTIZE_FAMILY_OPS | {torch.ops.aten.to.dtype}
 )
 
+# The shape ops that name their output shape outright.
+_VIEW_OPS = (
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten._unsafe_view.default,
+)
 
-def _blocking_axes(node: fx.Node) -> Optional[Sequence[int]]:
-    """The axes ``node`` blocks its quantization along, or ``None`` if it
-    quantizes per tensor or does not quantize at all."""
-    index = AXES_ARG_INDEX_MAP.get(node.target)
-    if index is None or index >= len(node.args):
-        return None
-    return node.args[index] or None
+# The calibrated quantize and dequantize, which take their qparams as operands.
+_QDQ_OPS = (
+    torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.dequantize.default,
+)
 
 
 class NormalizationError(RuntimeError):
@@ -293,971 +182,732 @@ class NormalizationError(RuntimeError):
         self.node = node
 
 
-@dataclass(frozen=True)
-class InputPlan:
-    placeholder: fx.Node
-    original_shape: Shape
-    boundary_shape: Shape
-    iteration_shape: Shape
-    base: int
-    strides: Shape
-    broadcast_dims: Tuple[int, ...]
-    parent_operation: str  # "identity" or "view"
-    role: str = "pointwise_operand"
+def _moves_elements(node: fx.Node) -> bool:
+    """Whether ``node`` is an ``as_strided`` other than the identity view."""
+    if node.target is not torch.ops.aten.as_strided.default:
+        return False
+    source = node.args[0].value
+    size, stride = node.args[1:3]
+    offset = get_arg_value(node, 3, "storage_offset")
+    return not (
+        tuple(size) == tuple(source.shape)
+        and source.is_contiguous()
+        and torch.empty_strided(size, stride, device="meta").is_contiguous()
+        and offset in (None, source.storage_offset())
+    )
 
 
-@dataclass(frozen=True)
-class OutputPlan:
-    internal_shape: Shape
-    external_shape: Shape
-    parent_operation: str  # "identity" or "view"
+def _replay(node: fx.Node, value: AddressMap) -> AddressMap:
+    """``value`` read through the shape op ``node``.
 
+    A transpose or permute reorders dims, an expand broadcasts, and any other
+    op (view, reshape, squeeze, unsqueeze, size-1 select) regroups digits.
 
-@dataclass
-class NormalizationResult:
-    iteration_shape: Shape
-    anchor_name: Optional[str]
-    input_plans: Dict[str, InputPlan]
-    output_plan: OutputPlan
-    parent: fx.GraphModule
-    child: fx.GraphModule
-    call_node: fx.Node
-    anchor_input_names: Tuple[str, ...] = ()
-    output_plans: Tuple[OutputPlan, ...] = ()
-
-
-@dataclass(frozen=True)
-class _OutputDescription:
-    value_node: fx.Node
-    map_target: fx.Node
-    iteration_node: fx.Node
-    external_shapes: Tuple[Shape, ...]
-    output_relayout: Tuple[fx.Node, ...] = ()
-
-    @property
-    def is_multi_output(self) -> bool:
-        return len(self.external_shapes) > 1
-
-
-@dataclass
-class NormalizationConfig:
-    """Configuration for :class:`IterationSpaceNormalizer`.
-
-    The default target detection is intentionally conservative. Projects with
-    custom operators should pass explicit predicates or annotate nodes with:
-
-        node.meta["strong_anchor"] = True
-        node.meta["pointwise"] = True
+    Raises:
+        NormalizationError: If the map cannot take the op, as for any
+            ``as_strided``.
     """
+    target = node.target
+    if target is torch.ops.aten.as_strided.default:
+        raise NormalizationError("Unsupported shape no-op", node=node)
+    try:
+        if target is torch.ops.aten.permute.default:
+            return value.permute(node.args[1])
+        if target is torch.ops.aten.transpose.int:
+            order = list(range(len(value.dims)))
+            a, b = node.args[1:3]
+            order[a], order[b] = order[b], order[a]
+            return value.permute(order)
+        if target is torch.ops.aten.expand.default:
+            return value.expand(node.shape)
+        return value.reshape(node.shape)
+    except ValueError as exc:
+        raise NormalizationError("Unsupported shape no-op", node=node) from exc
 
-    require_contiguous_inputs: bool = True
-    parent_shape_method: str = "view"  # "view" or "reshape"
-    anchor_predicate: Optional[NodePredicate] = None
-    pointwise_predicate: Optional[NodePredicate] = None
 
-    def __post_init__(self) -> None:
-        if self.parent_shape_method not in {"view", "reshape"}:
-            raise ValueError("parent_shape_method must be 'view' or 'reshape'")
+def _boundary_shape(value: AddressMap, shape: Shape, node: fx.Node) -> Shape:
+    """The iteration ``shape`` with each dim ``value`` broadcasts set to 1.
 
+    That is the input's shape at the group boundary: ``value`` regrouped to
+    ``shape`` must read it row-major, broadcast to ``shape``.
 
-class IterationSpaceNormalizer:
-    """Normalize one fused ``call_module`` in a parent FX graph.
-
-    Preconditions
-    -------------
-    * Static tensor shapes are available in ``node.meta["tensor_meta"]`` or
-      ``node.meta["val"]`` for the child graph.
-    * The child has one tensor output, or a terminal microscaling quantization
-      op whose tuple outputs are consumed through parent ``getitem`` nodes.
-    * External inputs are contiguous unless ``require_contiguous_inputs=False``.
-    * Non-compute child operations obey the restricted fusion contract.
-
-    The pass performs all analysis first and mutates the graphs only after every
-    input has a valid plan.
+    Raises:
+        NormalizationError: Blaming ``node``, if ``value`` reads otherwise.
     """
+    try:
+        value = value.reshape(shape)
+    except ValueError as exc:
+        raise NormalizationError(
+            f"Address map of shape {value.shape} cannot be regrouped into "
+            f"{tuple(shape)}",
+            node=node,
+        ) from exc
+    boundary = tuple(
+        1 if all(stride == 0 for _, stride in digits) else extent
+        for digits, extent in zip(value.dims, shape)
+    )
+    if value != AddressMap.arange(boundary).expand(shape):
+        raise NormalizationError(
+            "The input is not read in row-major order, broadcast to the "
+            "iteration shape",
+            node=node,
+        )
+    return boundary
 
-    def __init__(self, config: Optional[NormalizationConfig] = None) -> None:
-        self.config = config or NormalizationConfig()
 
-    def normalize(
-        self,
-        parent: fx.GraphModule,
-        call_node: fx.Node,
-    ) -> NormalizationResult:
-        if call_node.op != "call_module":
+def _propagate(
+    seed: fx.Node, output: fx.Node, anchor: Optional[fx.Node]
+) -> Optional[AddressMap]:
+    """``seed``'s address map at ``output``, or ``None`` if it is not read.
+
+    Maps stop at ``anchor`` unless it is ``seed``, so only the tail is
+    followed.
+
+    Raises:
+        NormalizationError: If an op on the way has no map, or one input
+            reaches an elementwise op through two different maps.
+    """
+    # The nodes ``output`` reads, without looking past the anchor.
+    tail = set()
+    stack = [output]
+    while stack:
+        node = stack.pop()
+        if node not in tail:
+            tail.add(node)
+            if node is not anchor:
+                stack.extend(node.all_input_nodes)
+
+    env: Dict[fx.Node, Optional[AddressMap]] = {}
+    for node in seed.graph.nodes:
+        if node is seed:
+            env[node] = AddressMap.arange(seed.shape)
+        elif (
+            node not in tail
+            or node.op in ("placeholder", "get_attr")
+            or node is anchor
+        ):
+            env[node] = None
+        elif (
+            is_aliasing_op(node)
+            or is_reshape_op(node)
+            or node.target is torch.ops.aten.expand.default
+        ):
+            source = env[node.all_input_nodes[0]]
+            env[node] = None if source is None else _replay(node, source)
+        elif _moves_elements(node):
             raise NormalizationError(
-                "Expected a call_module node", node=call_node
+                "An as_strided that moves elements has no address map",
+                node=node,
             )
-
-        child_obj = parent.get_submodule(str(call_node.target))
-        if not isinstance(child_obj, fx.GraphModule):
-            raise NormalizationError(
-                "The call_module target must be an FX GraphModule",
-                node=call_node,
-            )
-        child = child_obj
-
-        placeholders = [n for n in child.graph.nodes if n.op == "placeholder"]
-        output_node = next(
-            (n for n in child.graph.nodes if n.op == "output"), None
-        )
-        if output_node is None:
-            raise NormalizationError("Child graph has no output node")
-        output = self._describe_output(output_node)
-
-        anchor = get_anchor_node(call_node)
-        # Keep only a *strong* anchor (gemm/conv/norm/softmax); a pointwise
-        # "anchor" means the group is anchorless (iteration == output shape).
-        if anchor is None or is_elementwise_op(anchor):
-            anchor = None
-
-        if anchor is None:
-            iteration_shape = output.iteration_node.shape
-            anchor_inputs: set[fx.Node] = set()
-            normalizable_placeholders = placeholders
-        else:
-            iteration_shape = anchor.shape
-            anchor_inputs = {
-                n for n in ancestors(anchor) if n.op == "placeholder"
-            }
-            self._validate_anchor_stream(
-                anchor, output.map_target, iteration_shape
-            )
-            self._reject_anchor_inputs_reused_in_tail(
-                placeholders=placeholders,
-                anchor=anchor,
-                output_value=output.map_target,
-                anchor_inputs=anchor_inputs,
-            )
-            normalizable_placeholders = [
-                p for p in placeholders if p not in anchor_inputs
-            ]
-
-        # Quantization lookup tables (qmap/code/...) are indexed by value, not
-        # by iteration position, so they have no address map to propagate;
-        # they are passed whole to every tile. Skip them.
-        quant_tables = set()
-        for node in child.graph.nodes:
-            quant_tables |= quant_param_arg_nodes(node)
-
-        input_plans: Dict[str, InputPlan] = {}
-        for placeholder in normalizable_placeholders:
-            if placeholder in quant_tables:
-                continue
-
-            original_shape = placeholder.shape
-            # A scalar input broadcasts to any iteration shape, so it has no
-            # address map to propagate; pass it whole, like the quant tables.
-            if math.prod(original_shape) == 1:
-                continue
-            self._validate_external_layout(placeholder, original_shape)
-
-            propagated = self._propagate_map(
-                child=child,
-                seed_node=placeholder,
-                output_value=output.map_target,
-                anchor=anchor,
-            )
-            if propagated is None:
-                # The placeholder does not contribute to the output. Dead
-                # code can be eliminated independently; it does not need a
-                # boundary plan.
-                continue
-
-            if anchor is not None:
-                if propagated.numel() != math.prod(iteration_shape):
-                    raise NormalizationError(
-                        "Tail operand cannot be expressed in the anchor "
-                        "iteration space because the external tail changes "
-                        "element count",
-                        node=placeholder,
-                    )
-                propagated = propagated.reshape(iteration_shape)
-            elif tuple(propagated.shape) != iteration_shape:
-                raise NormalizationError(
-                    f"Propagated map shape {tuple(propagated.shape)} does not "
-                    f"match iteration shape {iteration_shape}",
-                    node=placeholder,
-                )
-
-            base, strides = self._recover_and_validate_affine_map(
-                propagated, iteration_shape, placeholder
-            )
-            boundary_shape, broadcast_dims = self._derive_boundary_shape(
-                original_shape=original_shape,
-                iteration_shape=iteration_shape,
-                base=base,
-                strides=strides,
-                placeholder=placeholder,
-            )
-            input_plans[placeholder.name] = InputPlan(
-                placeholder=placeholder,
-                original_shape=original_shape,
-                boundary_shape=boundary_shape,
-                iteration_shape=iteration_shape,
-                base=base,
-                strides=strides,
-                broadcast_dims=broadcast_dims,
-                parent_operation=(
-                    "identity"
-                    if original_shape == boundary_shape
-                    else self.config.parent_shape_method
-                ),
-            )
-
-        placeholder_bindings = self._bind_parent_arguments(
-            call_node, placeholders
-        )
-        self._rewrite_parent_inputs(
-            parent=parent,
-            call_node=call_node,
-            placeholder_bindings=placeholder_bindings,
-            input_plans=input_plans,
-        )
-        self._rewrite_child(child=child, anchor=anchor, output=output)
-
-        child.graph.eliminate_dead_code()
-        child.graph.lint()
-        child.recompile()
-
-        args = fx.map_arg(call_node.all_input_nodes, lambda n: n.value)
-        result = ShapeProp(child).propagate(*args)
-        set_node_value(call_node, result)
-
-        output_plans = self._build_output_plans(output)
-        output_plan = output_plans[-1]
-        self._rewrite_parent_output(parent, call_node, output, output_plans)
-
-        return NormalizationResult(
-            iteration_shape=iteration_shape,
-            anchor_name=anchor.name if anchor is not None else None,
-            input_plans=input_plans,
-            output_plan=output_plan,
-            parent=parent,
-            child=child,
-            call_node=call_node,
-            anchor_input_names=tuple(
-                p.name for p in placeholders if p in anchor_inputs
-            ),
-            output_plans=output_plans,
-        )
-
-    # ------------------------------------------------------------------
-    # Address-map propagation
-    # ------------------------------------------------------------------
-
-    def _propagate_map(
-        self,
-        *,
-        child: fx.GraphModule,
-        seed_node: fx.Node,
-        output_value: fx.Node,
-        anchor: Optional[fx.Node],
-    ) -> Optional[AddressMap]:
-        seed = AddressMap.arange(seed_node.shape)
-
-        env: Dict[fx.Node, Optional[AddressMap]] = {}
-        for node in child.graph.nodes:
-            if node is seed_node:
-                env[node] = seed
-            elif node.op in {"placeholder", "get_attr"}:
-                env[node] = None
-            elif anchor is not None and node is anchor:
-                env[node] = None
-            elif (
-                is_aliasing_op(node)
-                or is_reshape_op(node)
-                or node.target is torch.ops.aten.expand.default
-            ):
-                source = node.all_input_nodes[0]
-                source_map = env.get(source) if source is not None else None
-                env[node] = (
-                    None
-                    if source_map is None
-                    else self._apply_shape_noop(node, source_map)
-                )
-            elif is_nop(node) or node.target == torch.ops.aten.to.dtype:
-                # A dtype cast is position-preserving (it reinterprets each
-                # element, never moves one), so it is the identity on the
-                # address map.
-                source = node.args[0]
-                env[node] = (
-                    env.get(source) if isinstance(source, fx.Node) else None
-                )
-            elif node.target in _DATA_INPUT_OPS:
-                source = node.args[0] if node.args else None
-                env[node] = (
-                    env.get(source) if isinstance(source, fx.Node) else None
-                )
-            elif is_elementwise_op(node):
-                maps = [
-                    env[arg]
+        elif is_nop(node) or node.target in _PASS_THROUGH_OPS:
+            env[node] = env.get(node.args[0])
+        elif is_elementwise_op(node):
+            try:
+                maps = {
+                    env[arg].expand(node.shape)
                     for arg in node.all_input_nodes
-                    if env.get(arg) is not None
-                ]
-                if not maps:
-                    env[node] = None
-                else:
-                    output_shape = node.shape
-                    broadcasted = [
-                        self._broadcast_map(m, output_shape, node) for m in maps
-                    ]
-                    first = broadcasted[0]
-                    for other in broadcasted[1:]:
-                        if first != other:
-                            raise NormalizationError(
-                                "One external input reaches the same "
-                                "pointwise operation through incompatible "
-                                "index mappings. Duplicate the argument "
-                                "explicitly or reject the fusion",
-                                node=node,
-                            )
-                    env[node] = first
-            elif self._is_supported_mx_op(node):
-                source = node.args[0] if node.args else None
-                env[node] = (
-                    env.get(source) if isinstance(source, fx.Node) else None
-                )
-            elif node.op != "output":
+                    if env[arg] is not None
+                }
+            except ValueError as exc:
                 raise NormalizationError(
-                    "Cannot propagate address map through node", node=node
+                    "An address map cannot broadcast to the op's shape",
+                    node=node,
+                ) from exc
+            if len(maps) > 1:
+                raise NormalizationError(
+                    "One external input reaches the same pointwise "
+                    "operation through incompatible index mappings",
+                    node=node,
                 )
-
-            if node is output_value:
-                return env.get(node)
-
-        return env.get(output_value)
-
-    def _validate_anchor_stream(
-        self,
-        anchor: fx.Node,
-        output_value: fx.Node,
-        iteration_shape: Shape,
-    ) -> None:
-        propagated = self._propagate_map(
-            child=anchor.graph.owning_module,  # type: ignore[arg-type]
-            seed_node=anchor,
-            output_value=output_value,
-            anchor=anchor,
-        )
-        # _propagate_map treats anchor as the seed before applying the anchor
-        # barrier.
-        if propagated is None:
+            env[node] = maps.pop() if maps else None
+        elif node.op != "output":
             raise NormalizationError(
-                "The fused output does not depend on the strong anchor",
-                node=anchor,
+                "Cannot propagate address map through node", node=node
             )
-        if propagated.numel() != math.prod(iteration_shape):
-            raise NormalizationError(
-                "The tail expands or contracts the anchor-produced stream",
-                node=anchor,
-            )
-        if propagated.reshape(iteration_shape) != AddressMap.arange(
-            iteration_shape
-        ):
-            raise NormalizationError(
-                "The tail changes the order or multiplicity of the "
-                "anchor-produced stream",
-                node=anchor,
-            )
+        if node is output:
+            return env[node]
 
-    def _recover_and_validate_affine_map(
-        self,
-        propagated: AddressMap,
-        iteration_shape: Shape,
-        placeholder: fx.Node,
-    ) -> Tuple[int, Shape]:
-        if tuple(propagated.shape) != iteration_shape:
-            raise NormalizationError(
-                f"Map shape {tuple(propagated.shape)} != iteration shape "
-                f"{iteration_shape}",
-                node=placeholder,
+
+def _strip_output_relayout(
+    value: fx.Node,
+) -> Tuple[fx.Node, Tuple[fx.Node, ...]]:
+    """Peel a trailing single-use relayout chain off ``value``.
+
+    Returns the core and the chain, output-first, but only when the chain
+    holds a transpose, permute or non-identity ``as_strided``, which no
+    parent view can express; otherwise ``(value, ())``.
+    """
+    chain = []
+    node = value
+    while (
+        (is_reshape_op(node) or is_aliasing_op(node) or _moves_elements(node))
+        and len(node.users) == 1
+        and node.all_input_nodes
+    ):
+        chain.append(node)
+        node = node.all_input_nodes[0]
+    if not any(is_reshape_op(n) or _moves_elements(n) for n in chain):
+        return value, ()
+    return node, tuple(chain)
+
+
+def _arg_shapes(node: fx.Node) -> list:
+    """The shape of each node argument of ``node``, in argument order."""
+    shapes = []
+    fx.map_arg(node.args, lambda a: shapes.append(getattr(a, "shape", None)))
+    return shapes
+
+
+def _moves_nothing(node: fx.Node) -> bool:
+    """Whether ``node``, not a view or reshape, moves no element as traced.
+
+    E.g. a shape-keeping nop or a transpose of size-1 dims.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, fx.Node) or node.target in _VIEW_OPS:
+        return False
+    if is_reshape_op(node):
+        moved = _replay(node, AddressMap.arange(source.shape))
+        return moved == AddressMap.arange(node.shape)
+    return (
+        is_nop(node)
+        and tuple(node.shape) == tuple(source.shape)
+        and not _moves_elements(node)
+    )
+
+
+def _moved_dim(
+    node: fx.Node,
+    dim: int,
+    old_shape: Shape,
+    new_shape: Shape,
+    block_size: Optional[int] = None,
+) -> int:
+    """The dim of ``new_shape`` holding what ``dim`` of ``old_shape`` holds.
+
+    Both shapes order the same elements row-major.  The match has the same
+    extent and as many elements after it or, given ``block_size``, keeps the
+    same blocks whole; it counts from the same end as ``dim``.
+
+    Raises:
+        NormalizationError: If no dim of ``new_shape`` does.
+    """
+    old_dim = dim % len(old_shape)
+    after = math.prod(old_shape[old_dim + 1 :])
+    for new_dim in reversed(range(len(new_shape))):
+        if block_size is None:
+            holds = (
+                new_shape[new_dim] == old_shape[old_dim]
+                and math.prod(new_shape[new_dim + 1 :]) == after
             )
-        strides = propagated.affine_strides()
-        if strides is None:
-            raise NormalizationError(
-                "Input map is not representable by one fixed base and one "
-                "stride per iteration dimension",
-                node=placeholder,
-            )
-        return propagated.offset, strides
-
-    def _derive_boundary_shape(
-        self,
-        *,
-        original_shape: Shape,
-        iteration_shape: Shape,
-        base: int,
-        strides: Shape,
-        placeholder: fx.Node,
-    ) -> Tuple[Shape, Tuple[int, ...]]:
-        if base != 0:
-            raise NormalizationError(
-                "A nonzero source offset cannot be produced by the allowed "
-                "shape-only fusion operations",
-                node=placeholder,
-            )
-
-        boundary = tuple(
-            1 if extent > 1 and stride == 0 else extent
-            for extent, stride in zip(iteration_shape, strides)
-        )
-        if math.prod(boundary) != math.prod(original_shape):
-            raise NormalizationError(
-                f"Derived boundary shape {boundary} has "
-                f"{math.prod(boundary)} elements, but input shape "
-                f"{original_shape} has {math.prod(original_shape)}",
-                node=placeholder,
-            )
-
-        # The map must read ``boundary`` in row-major order, broadcast along
-        # the dimensions it drops.
-        contiguous = self._contiguous_strides(boundary)
-        expected = tuple(
-            0 if extent <= 1 or boundary_extent == 1 else stride
-            for extent, boundary_extent, stride in zip(
-                iteration_shape, boundary, contiguous
-            )
-        )
-        if tuple(strides) != expected:
-            raise NormalizationError(
-                "Affine access is not specifically expressible as an "
-                "order-preserving view plus fetch-side broadcast",
-                node=placeholder,
-            )
-
-        broadcast_dims = tuple(
-            dim
-            for dim, (boundary_extent, iteration_extent) in enumerate(
-                zip(boundary, iteration_shape)
-            )
-            if boundary_extent == 1 and iteration_extent > 1
-        )
-        return boundary, broadcast_dims
-
-    # ------------------------------------------------------------------
-    # Output interpretation
-    # ------------------------------------------------------------------
-
-    def _describe_output(self, output_node: fx.Node) -> _OutputDescription:
-        value = output_node.args[0]
-        if not isinstance(value, fx.Node):
-            raise NormalizationError(
-                "Only tensor outputs are supported", node=output_node
-            )
-
-        core, relayout = self._strip_output_relayout(value)
-        if relayout:
-            return _OutputDescription(
-                value_node=value,
-                map_target=core,
-                iteration_node=core,
-                external_shapes=(value.shape,),
-                output_relayout=relayout,
-            )
-
-        if self._is_supported_mx_op(value):
-            # The quantize may sit on top of an output relayout, quantizing the
-            # tile the fused op is about to store through it.  The relayout is
-            # still what ends the iteration space -- the quantize does not move
-            # an element -- so peel it from the quantize's input, not from the
-            # output.
-            core, relayout = self._strip_output_relayout(value.args[0])
-            return _OutputDescription(
-                value_node=value,
-                map_target=core if relayout else value,
-                iteration_node=core,
-                external_shapes=value.shape,
-                output_relayout=relayout,
-            )
-
-        return _OutputDescription(
-            value_node=value,
-            map_target=value,
-            iteration_node=value,
-            external_shapes=(value.shape,),
-        )
-
-    def _strip_output_relayout(
-        self, value: fx.Node
-    ) -> Tuple[fx.Node, Tuple[fx.Node, ...]]:
-        """Peel a trailing single-use chain of relayout ops (view / reshape /
-        squeeze / unsqueeze / transpose / permute) off the output, returning
-        the core node that feeds it and the chain (output-first). Only honored
-        when the chain contains a transpose/permute: that cannot be re-expressed
-        as a parent view, so it must stay inside the fused op and the iteration
-        space ends at the core."""
-        chain = []
-        node = value
-        while (
-            (is_reshape_op(node) or is_aliasing_op(node))
-            and len(node.users) == 1
-            and node.all_input_nodes
-        ):
-            chain.append(node)
-            node = node.all_input_nodes[0]
-        if not any(is_reshape_op(n) for n in chain):
-            return value, ()
-        return node, tuple(chain)
-
-    def _build_output_plans(
-        self,
-        output: _OutputDescription,
-    ) -> Tuple[OutputPlan, ...]:
-        # Internal shapes were just stamped onto the output node by ShapeProp.
-        # An MX node's shape is already a tuple of per-output shapes; an
-        # ordinary single output is one shape, wrapped to match external_shapes.
-        is_mx = self._is_supported_mx_op(output.value_node)
-        if is_mx:
-            internal_shapes = tuple(tuple(s) for s in output.value_node.shape)
         else:
-            internal_shapes = (tuple(output.value_node.shape),)
+            holds = reshape_preserves_full_blocks(
+                old_shape, old_dim, new_shape, new_dim, block_size
+            )
+        if holds:
+            return new_dim if dim >= 0 else new_dim - len(new_shape)
+    raise NormalizationError(
+        f"Dim {dim} of {old_shape} has no counterpart in {new_shape}",
+        node=node,
+    )
 
-        if len(internal_shapes) != len(output.external_shapes):
+
+def _same_broadcast(old_in, old_out, new_in, new_out) -> bool:
+    """Whether two broadcasts read the same elements in row-major order.
+
+    Compares ``old_in`` -> ``old_out`` with ``new_in`` -> ``new_out``.
+    """
+    try:
+        old = AddressMap.arange(old_in).expand(old_out).reshape(new_out)
+        return old == AddressMap.arange(new_in).expand(new_out)
+    except ValueError:
+        return False
+
+
+def _check_operands(
+    node: fx.Node,
+    old_shapes: Sequence[Shape],
+    new_shapes: Sequence[Shape],
+    old_out: Shape,
+) -> None:
+    """Reject ``node`` unless every operand broadcasts as traced."""
+    pairs = [
+        (old, new)
+        for old, new in zip(old_shapes, new_shapes)
+        if new is not None
+    ]
+    try:
+        new_out = torch.broadcast_shapes(*(new for _, new in pairs))
+    except RuntimeError as exc:
+        raise NormalizationError(
+            "The operands no longer broadcast together", node=node
+        ) from exc
+    for old, new in pairs:
+        if not _same_broadcast(old, old_out, new, new_out):
             raise NormalizationError(
-                "Internal and external output arity differ",
-                node=output.value_node,
+                f"An operand of shape {tuple(new)} broadcasts onto other "
+                "elements",
+                node=node,
             )
 
-        mx_restore_safe = not is_mx or self._mx_restore_safe(
-            output.value_node, internal_shapes, output.external_shapes
+
+def _restate(
+    node: fx.Node, old_shapes: Sequence[Shape], old_out: Shape
+) -> None:
+    """Restate ``node`` for node arguments that changed shape.
+
+    Each argument still holds its traced elements row-major.  A named dim
+    moves to its counterpart (``_moved_dim``); a norm's normalized shape
+    becomes the shortest suffix with as many elements, kept as traced if the
+    norm is affine; a blocked (de)quantize must keep the dims its scale spans,
+    and an outlier quantize its last two (the CSR rows); an expand, an
+    elementwise op and a broadcast (de)quantize need each operand to
+    broadcast onto its traced elements.
+
+    Args:
+        old_shapes: The traced shapes of its node arguments, in order.
+        old_out: Its traced output shape.
+
+    Raises:
+        NormalizationError: If the op would act on other elements.
+    """
+    target = node.target
+    args = list(node.args)
+    new_shapes = _arg_shapes(node)
+    old_in, new_in = tuple(old_shapes[0]), tuple(new_shapes[0])
+    if target in _VIEW_OPS:
+        return
+    if target is torch.ops.aten.transpose.int:
+        args[1:3] = [_moved_dim(node, d, old_in, new_in) for d in args[1:3]]
+    elif target in SOFTMAX_OPS:
+        args[1] = _moved_dim(node, args[1], old_in, new_in)
+    elif target in NORM_OPS:
+        size = math.prod(args[1])
+        suffixes = (new_in[k:] for k in reversed(range(len(new_in))))
+        restated = next((s for s in suffixes if math.prod(s) == size), None)
+        affine = any(isinstance(a, fx.Node) for a in args[2:4])
+        if restated is None or (affine and restated != tuple(args[1])):
+            raise NormalizationError(
+                f"The normalized dims {tuple(args[1])} have no place in "
+                f"{new_in}",
+                node=node,
+            )
+        args[1] = list(restated)
+    elif target is torch.ops.aten.expand.default:
+        lead = (1,) * max(len(new_in) - len(old_out), 0)
+        args[1] = list(lead + tuple(old_out))
+        if not _same_broadcast(old_in, old_out, new_in, args[1]):
+            raise NormalizationError(
+                "The expand broadcasts onto other elements", node=node
+            )
+    elif target in DYNAMIC_QUANTIZE_OPS:
+        outlier = torch.ops.quantized_ops.quantize_mx_outlier.default
+        if target is outlier and old_in[-2:] != new_in[-2:]:
+            raise NormalizationError(
+                "The CSR rows of an outlier quantize change", node=node
+            )
+        args[2] = [
+            _moved_dim(node, axis, old_in, new_in, args[3]) for axis in args[2]
+        ]
+    elif target in _QDQ_OPS and len(args) > 4 and args[4] is not None:
+        # A blocked scale is expanded to the input dim by dim.
+        span = max(len(q.shape) for q in args[1:3] if isinstance(q, fx.Node))
+        if len(new_in) < span or old_in[-span:] != new_in[-span:]:
+            raise NormalizationError(
+                f"The scale spans the last {span} dims of {old_in}, which "
+                f"become {new_in}",
+                node=node,
+            )
+        args[3] = [
+            _moved_dim(node, axis, old_in, new_in, args[4])
+            for axis in args[3] or ()
+        ]
+    elif is_elementwise_op(node) or target is torch.ops.aten.to.dtype:
+        # A (de)quantize broadcasts its input, scale and zero point; the
+        # quantization tables after them are read whole.
+        count = len(new_shapes)
+        if target in _QDQ_OPS:
+            count = sum(isinstance(a, fx.Node) for a in args[:3])
+        _check_operands(node, old_shapes[:count], new_shapes[:count], old_out)
+    else:
+        raise NormalizationError(
+            "Cannot restate the op for its new input shapes", node=node
         )
+    node.args = tuple(args)
 
-        plans = []
-        for internal_shape, external_shape in zip(
-            internal_shapes, output.external_shapes
-        ):
-            if math.prod(internal_shape) != math.prod(external_shape):
-                raise NormalizationError(
-                    "Output restore would change element count: "
-                    f"internal={internal_shape}, external={external_shape}",
-                    node=output.value_node,
-                )
-            if is_mx and not mx_restore_safe:
-                raise NormalizationError(
-                    "MX output restore would regroup non-unit dimensions and "
-                    "change quantization block semantics",
-                    node=output.value_node,
-                )
-            plans.append(
-                OutputPlan(
-                    internal_shape=internal_shape,
-                    external_shape=external_shape,
-                    parent_operation=(
-                        "identity"
-                        if internal_shape == external_shape
-                        else self.config.parent_shape_method
-                    ),
-                )
-            )
-        return tuple(plans)
 
-    def _mx_restore_safe(
-        self,
-        value_node: fx.Node,
-        internal_shapes: Tuple[Shape, ...],
-        external_shapes: Tuple[Shape, ...],
-    ) -> bool:
-        """Whether restoring a single-axis ``quantize_mx`` op's outputs to
-        ``external_shapes`` keeps every quantization block intact.
+def _rewrite_child(
+    child: fx.GraphModule,
+    anchor: Optional[fx.Node],
+    relayout: Tuple[fx.Node, ...],
+    inputs: Dict[fx.Node, object],
+) -> None:
+    """Move the tail's shape nops out of ``child`` to the boundary views.
 
-        The restore is a pure order-preserving row-major view (guaranteed here:
-        a permute would route through the relayout branch and the restore is an
-        ``aten.view``), so ``reshape_preserves_full_blocks`` decides it, on any
-        quantized axis.  An identity restore passes it by construction: nothing
-        moves, and the padding pass has already made the axis a whole number of
-        blocks long.
-        """
-        axes = value_node.args[2]
-        block_size = value_node.args[3]
-        if not isinstance(block_size, int) or block_size <= 0:
-            return False
-        if len(axes) != 1:
-            return False
-        # quantize_mx returns (scale, data); blocks live on the data output.
-        data_internal = tuple(internal_shapes[-1])
-        data_external = tuple(external_shapes[-1])
-        # The axis counts from the end, so the restore hands it to whatever dim
-        # sits that far from the end of the restored shape.
-        dim = axes[0]
-        if dim >= 0:
-            dim -= len(data_internal)
-        if len(data_external) < -dim:
-            return False
-        return reshape_preserves_full_blocks(
+    A value that changes shape keeps its traced elements row-major, so only
+    ops whose input shapes change are touched: a view or reshape is kept, an
+    op that moved no element as traced is dropped, an output relayout reads
+    the core through a view to its traced shape, and any other op is
+    restated (``_restate``).
+
+    Args:
+        anchor: The strong anchor, or ``None`` in an anchorless group.
+        relayout: The output relayout kept inside the child.
+        inputs: The value each placeholder takes.
+
+    Raises:
+        NormalizationError: If an op cannot act on its new input shapes.
+    """
+    # Keep the anchor's operand prelude and the output relayout.
+    keep = ancestors(anchor) | set(relayout)
+    removable = [
+        node
+        for node in child.graph.nodes
+        if is_aliasing_op(node) and node not in keep
+    ]
+    traced = {
+        node: (_arg_shapes(node), getattr(node, "shape", None))
+        for node in child.graph.nodes
+        if node.op == "call_function"
+    }
+    identities = {node for node in traced if _moves_nothing(node)}
+
+    for node in removable:
+        node.replace_all_uses_with(node.all_input_nodes[0])
+        child.graph.erase_node(node)
+
+    for placeholder, value in inputs.items():
+        set_node_value(placeholder, value)
+    for node in list(child.graph.nodes):
+        if node not in traced or _arg_shapes(node) == traced[node][0]:
+            continue
+        arg_shapes, shape = traced[node]
+        if node in identities:
+            node.replace_all_uses_with(node.args[0])
+            child.graph.erase_node(node)
+            continue
+        if node in relayout and node.target not in _VIEW_OPS:
+            source = node.args[0]
+            with child.graph.inserting_before(node):
+                view = child.graph.call_function(
+                    torch.ops.aten.view.default,
+                    (source, list(arg_shapes[0])),
+                )
+            propagate_shape(view, child)
+            node.replace_input_with(source, view)
+        else:
+            _restate(node, arg_shapes, shape)
+        try:
+            propagate_shape(node, child)
+        except (RuntimeError, IndexError) as exc:
+            raise NormalizationError(
+                "The op cannot run on its restated inputs", node=node
+            ) from exc
+
+
+def _check_mx_restore(
+    value: fx.Node, internal: Sequence[Shape], external: Sequence[Shape]
+) -> None:
+    """Reject a ``quantize_mx`` output restore that breaks a block.
+
+    The op must quantize along one axis, and the restore, a row-major view
+    from ``internal`` to ``external`` shapes, must keep every block of the
+    data output (the last) whole along that axis, counted from the end.
+
+    Raises:
+        NormalizationError: If the restore breaks the blocks.
+    """
+    axes, block_size = value.args[2:4]
+    data_internal, data_external = tuple(internal[-1]), tuple(external[-1])
+    dim = axes[0] if len(axes) == 1 else None
+    if dim is not None and dim >= 0:
+        dim -= len(data_internal)
+    if (
+        dim is None
+        or len(data_external) < -dim
+        or not reshape_preserves_full_blocks(
             data_internal,
             dim + len(data_internal),
             data_external,
             dim + len(data_external),
             block_size,
         )
-
-    # ------------------------------------------------------------------
-    # Graph rewriting
-    # ------------------------------------------------------------------
-
-    def _rewrite_parent_inputs(
-        self,
-        *,
-        parent: fx.GraphModule,
-        call_node: fx.Node,
-        placeholder_bindings: Mapping[str, Tuple[str, Any]],
-        input_plans: Mapping[str, InputPlan],
-    ) -> None:
-        args = list(call_node.args)
-        kwargs = dict(call_node.kwargs)
-
-        with parent.graph.inserting_before(call_node):
-            for name, plan in input_plans.items():
-                binding_kind, binding_key = placeholder_bindings[name]
-                value = (
-                    args[binding_key]
-                    if binding_kind == "arg"
-                    else kwargs[binding_key]
-                )
-                if plan.parent_operation == "identity":
-                    continue
-                if not isinstance(value, fx.Node):
-                    raise NormalizationError(
-                        f"Cannot insert {plan.parent_operation} for non-node "
-                        f"argument {name}"
-                    )
-                formatted = parent.graph.call_function(
-                    _RELAYOUT_OPS[plan.parent_operation],
-                    (value, list(plan.boundary_shape)),
-                )
-                # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
-                formatted.meta = dict(value.meta)
-                propagate_shape(formatted, parent)
-                if binding_kind == "arg":
-                    args[binding_key] = formatted
-                else:
-                    kwargs[binding_key] = formatted
-
-        call_node.args = tuple(args)
-        call_node.kwargs = kwargs
-
-    def _rewrite_child(
-        self,
-        *,
-        child: fx.GraphModule,
-        anchor: Optional[fx.Node],
-        output: _OutputDescription,
-    ) -> None:
-        # Shape-nops to keep: those building anchor operands (the anchor
-        # prelude) and the trailing output relayout kept inside the fused op.
-        keep = ancestors(anchor) | set(output.output_relayout)
-        removable = [
-            node
-            for node in child.graph.nodes
-            if is_aliasing_op(node) and node not in keep
-        ]
-
-        # An axis named from the front is stated against the rank the tensor
-        # carries before the shape-nops go, so record that rank per blocking op.
-        ranks = {}
-        for node in child.graph.nodes:
-            if _blocking_axes(node) is None:
-                continue
-            shape = getattr(node.args[0], "shape", None)
-            if shape is not None:
-                ranks[node] = len(shape)
-
-        for node in removable:
-            source = node.all_input_nodes[0] if node.all_input_nodes else None
-            if source is None:
-                raise NormalizationError(
-                    "Shape no-op has no tensor input", node=node
-                )
-            node.replace_all_uses_with(source)
-            child.graph.erase_node(node)
-
-        for node, rank in ranks.items():
-            shape = getattr(node.args[0], "shape", None)
-            if shape is None or len(shape) == rank:
-                continue
-            node.update_arg(
-                AXES_ARG_INDEX_MAP[node.target],
-                tuple(
-                    a + len(shape) - rank if a >= 0 else a
-                    for a in _blocking_axes(node)
-                ),
-            )
-
-    def _rewrite_parent_output(
-        self,
-        parent: fx.GraphModule,
-        call_node: fx.Node,
-        output: _OutputDescription,
-        output_plans: Tuple[OutputPlan, ...],
-    ) -> None:
-        if output.is_multi_output:
-            self._rewrite_parent_tuple_output(parent, call_node, output_plans)
-            return
-
-        plan = output_plans[0]
-        if plan.parent_operation == "identity":
-            return
-
-        old_users = list(call_node.users)
-        with parent.graph.inserting_after(call_node):
-            restored = parent.graph.call_function(
-                _RELAYOUT_OPS[plan.parent_operation],
-                (call_node, list(plan.external_shape)),
-            )
-        # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
-        restored.meta = dict(call_node.meta)
-        propagate_shape(restored, parent)
-        for user in old_users:
-            user.replace_input_with(call_node, restored)
-
-    def _rewrite_parent_tuple_output(
-        self,
-        parent: fx.GraphModule,
-        call_node: fx.Node,
-        output_plans: Tuple[OutputPlan, ...],
-    ) -> None:
-        if all(plan.parent_operation == "identity" for plan in output_plans):
-            return
-
-        graph = call_node.graph
-        for user in list(call_node.users):
-            if user.target != operator.getitem:
-                if user.op == "output":
-                    user.args = (
-                        self._materialize_tuple_outputs(
-                            parent, call_node, output_plans
-                        ),
-                    )
-                    continue
-                raise NormalizationError(
-                    "Tuple output restoration requires parent getitem users",
-                    node=call_node,
-                )
-            raw_index = user.args[1]
-            if not isinstance(raw_index, int):
-                raise NormalizationError(
-                    "Tuple output getitem index must be static",
-                    node=user,
-                )
-            index = raw_index
-            if index < 0:
-                index += len(output_plans)
-            if index < 0 or index >= len(output_plans):
-                raise NormalizationError(
-                    f"Tuple output index {raw_index} is out of range",
-                    node=user,
-                )
-
-            plan = output_plans[index]
-            self._set_tuple_item_meta(user, call_node, index)
-            propagate_shape(user, parent)
-            if plan.parent_operation == "identity":
-                continue
-
-            old_users = list(user.users)
-            with graph.inserting_after(user):
-                restored = graph.call_function(
-                    _RELAYOUT_OPS[plan.parent_operation],
-                    (user, list(plan.external_shape)),
-                )
-            restored.meta = dict(user.meta)
-            propagate_shape(restored, parent)
-            for old_user in old_users:
-                old_user.replace_input_with(user, restored)
-
-    def _materialize_tuple_outputs(
-        self,
-        parent: fx.GraphModule,
-        call_node: fx.Node,
-        output_plans: Tuple[OutputPlan, ...],
-    ) -> Tuple[fx.Node, ...]:
-        graph = call_node.graph
-        outputs = []
-        insert_after = call_node
-        for index, plan in enumerate(output_plans):
-            with graph.inserting_after(insert_after):
-                item = graph.call_function(operator.getitem, (call_node, index))
-            item.meta = dict(call_node.meta)
-            self._set_tuple_item_meta(item, call_node, index)
-            propagate_shape(item, parent)
-            insert_after = item
-            if plan.parent_operation == "identity":
-                outputs.append(item)
-                continue
-            with graph.inserting_after(insert_after):
-                restored = graph.call_function(
-                    _RELAYOUT_OPS[plan.parent_operation],
-                    (item, list(plan.external_shape)),
-                )
-            restored.meta = dict(item.meta)
-            propagate_shape(restored, parent)
-            outputs.append(restored)
-            insert_after = restored
-        return tuple(outputs)
-
-    def _set_tuple_item_meta(
-        self,
-        item: fx.Node,
-        tuple_node: fx.Node,
-        index: int,
-    ) -> None:
-        dtypes = tuple_node.meta.get("dtype")
-        if (
-            isinstance(dtypes, (tuple, list))
-            and index < len(dtypes)
-            and dtypes[index] is not None
-        ):
-            item.meta["dtype"] = dtypes[index]
-
-    # ------------------------------------------------------------------
-    # Anchor use analysis
-    # ------------------------------------------------------------------
-
-    def _reject_anchor_inputs_reused_in_tail(
-        self,
-        *,
-        placeholders: Sequence[fx.Node],
-        anchor: fx.Node,
-        output_value: fx.Node,
-        anchor_inputs: set[fx.Node],
-    ) -> None:
-        for placeholder in placeholders:
-            if placeholder not in anchor_inputs:
-                continue
-            side_map = self._propagate_map(
-                child=anchor.graph.owning_module,  # type: ignore[arg-type]
-                seed_node=placeholder,
-                output_value=output_value,
-                anchor=anchor,
-            )
-            if side_map is not None:
-                raise NormalizationError(
-                    "An anchor operand is also reused by the pointwise tail "
-                    "outside the anchor. This implementation requires a "
-                    "duplicated/formatted argument for that case",
-                    node=placeholder,
-                )
-
-    # ------------------------------------------------------------------
-    # Shape operation interpretation
-    # ------------------------------------------------------------------
-
-    def _apply_shape_noop(self, node: fx.Node, value: AddressMap) -> AddressMap:
-        """Replay a shape-only op on the address map, reindexing it exactly as
-        the op would the data: ``view`` / ``reshape`` / ``flatten`` regroup
-        the digits, ``squeeze`` / ``unsqueeze`` / ``select`` / ``slice`` drop
-        or restrict dimensions, ``transpose`` / ``permute`` reorder them and
-        ``expand`` broadcasts.  A non-order-preserving op yields a map that
-        later fails the fixed-stride check."""
-        aten = torch.ops.aten
-        args = node.args[1:]
-        try:
-            if node.target in (
-                aten.view.default,
-                aten.reshape.default,
-                aten._unsafe_view.default,
-            ):
-                return value.reshape(args[0])
-            if node.target is aten.flatten.using_ints:
-                return value.flatten(*args)
-            if node.target in (aten.squeeze.dim, aten.squeeze.dims):
-                return value.squeeze(args[0])
-            if node.target is aten.squeeze.default:
-                return value.squeeze()
-            if node.target is aten.unsqueeze.default:
-                return value.unsqueeze(args[0])
-            if node.target is aten.select.int:
-                return value.select(args[0], args[1])
-            if node.target is aten.slice.Tensor:
-                return value.slice(*args)
-            if node.target is aten.transpose.int:
-                return value.transpose(args[0], args[1])
-            if node.target is aten.permute.default:
-                return value.permute(args[0])
-            if node.target is aten.expand.default:
-                return value.expand(args[0])
-        except ValueError as exc:
-            raise NormalizationError(
-                "Unsupported shape no-op", node=node
-            ) from exc
-        raise NormalizationError("Unsupported shape no-op", node=node)
-
-    # ------------------------------------------------------------------
-    # Metadata and FX utilities
-    # ------------------------------------------------------------------
-
-    def _is_supported_mx_op(self, node: Optional[fx.Node]) -> bool:
-        return (
-            isinstance(node, fx.Node)
-            and node.op == "call_function"
-            and node.target
-            in {
-                torch.ops.quantized_ops.quantize_mx.default,
-                torch.ops.quantized_ops.quantize_mx_outlier.default,
-                torch.ops.quantized_ops.quantize_affine.default,
-            }
+    ):
+        raise NormalizationError(
+            "MX output restore would regroup non-unit dimensions and change "
+            "quantization block semantics",
+            node=value,
         )
 
-    def _validate_external_layout(
-        self, placeholder: fx.Node, shape: Shape
-    ) -> None:
-        if not self.config.require_contiguous_inputs:
-            return
-        tensor_meta = placeholder.meta.get("tensor_meta")
-        if tensor_meta is None or not hasattr(tensor_meta, "stride"):
-            return
-        actual = tuple(int(x) for x in tensor_meta.stride)
-        expected = self._contiguous_strides(shape)
-        for extent, a, e in zip(shape, actual, expected):
-            if extent != 1 and a != e:
-                raise NormalizationError(
-                    f"External input is not contiguous: shape={shape}, "
-                    f"stride={actual}",
-                    node=placeholder,
-                )
 
-    def _bind_parent_arguments(
-        self, call_node: fx.Node, placeholders: Sequence[fx.Node]
-    ) -> Dict[str, Tuple[str, Any]]:
-        bindings: Dict[str, Tuple[str, Any]] = {}
-        positional_count = len(call_node.args)
-        for index, placeholder in enumerate(placeholders):
-            if index < positional_count:
-                bindings[placeholder.name] = ("arg", index)
-                continue
-            candidates = [str(placeholder.target), placeholder.name]
-            key = next(
-                (name for name in candidates if name in call_node.kwargs), None
-            )
-            if key is None:
-                raise NormalizationError(
-                    f"Cannot bind child placeholder {placeholder.name!r} to "
-                    f"parent call arguments",
-                    node=call_node,
-                )
-            bindings[placeholder.name] = ("kwarg", key)
-        return bindings
+def _input_shapes(
+    placeholders: Sequence[fx.Node],
+    anchor: Optional[fx.Node],
+    output: fx.Node,
+    iteration_shape: Shape,
+) -> Dict[str, Tuple[Shape, Shape]]:
+    """Each input the tail reads -> its traced and boundary shape.
 
-    def _broadcast_map(
-        self, value: AddressMap, output_shape: Shape, node: fx.Node
-    ) -> AddressMap:
-        try:
-            return value.expand(output_shape)
-        except ValueError as exc:
+    A quantization table (indexed by value), a scalar of at most the
+    iteration rank, and an input ``output`` does not read pass whole.
+
+    Args:
+        anchor: The strong anchor, or ``None`` in an anchorless group.
+        output: The node the tail ends at.
+
+    Raises:
+        NormalizationError: If an anchor input is also read by the tail, or
+            an input has no boundary shape.
+    """
+    anchor_inputs = ancestors(anchor)
+    quant_tables = set()
+    for node in output.graph.nodes:
+        quant_tables |= quant_param_arg_nodes(node)
+    shapes = {}
+    for placeholder in placeholders:
+        shape = placeholder.shape
+        # An anchor input is checked even if it is a table or a scalar.
+        scalar = math.prod(shape) == 1 and len(shape) <= len(iteration_shape)
+        broadcasts = placeholder in quant_tables or scalar
+        if broadcasts and placeholder not in anchor_inputs:
+            continue
+        seen = _propagate(placeholder, output, anchor)
+        if seen is None:
+            continue
+        if placeholder in anchor_inputs:
             raise NormalizationError(
-                f"Address map with shape {tuple(value.shape)} cannot "
-                f"broadcast to {output_shape}",
-                node=node,
-            ) from exc
+                "An anchor operand is also reused by the pointwise tail "
+                "outside the anchor",
+                node=placeholder,
+            )
+        boundary = _boundary_shape(seen, iteration_shape, placeholder)
+        shapes[placeholder.name] = (shape, boundary)
+    return shapes
 
-    @staticmethod
-    def _contiguous_strides(shape: Shape) -> Tuple[int, ...]:
-        if not shape:
-            return ()
-        strides = [0] * len(shape)
-        running = 1
-        for index in range(len(shape) - 1, -1, -1):
-            strides[index] = running
-            running *= max(shape[index], 1)
-        return tuple(strides)
+
+def _output_shapes(
+    value: fx.Node, external_shapes: Sequence[Shape]
+) -> Tuple[Tuple[Shape, Shape], ...]:
+    """Each output's shape as the rewritten child returns it, and as traced.
+
+    Raises:
+        NormalizationError: If a restore would change an output's element
+            count or break a dynamic quantize's blocks.
+    """
+    mx = value.target in DYNAMIC_QUANTIZE_OPS
+    internal_shapes = (
+        tuple(tuple(s) for s in value.shape) if mx else (tuple(value.shape),)
+    )
+    for internal, external in zip(internal_shapes, external_shapes):
+        if math.prod(internal) != math.prod(external):
+            raise NormalizationError(
+                "Output restore would change element count: "
+                f"internal={internal}, external={external}",
+                node=value,
+            )
+    if mx:
+        _check_mx_restore(value, internal_shapes, external_shapes)
+    return tuple(zip(internal_shapes, external_shapes))
+
+
+def _restore_outputs(
+    parent: fx.GraphModule,
+    call_node: fx.Node,
+    output_shapes: Sequence[Tuple[Shape, Shape]],
+    relayout_op,
+) -> None:
+    """Restore each output the parent reads at another shape.
+
+    A tuple output is read through ``getitem`` nodes; once any item changes
+    shape, every item re-takes its dtype and value from the call.
+
+    Args:
+        call_node: The fused ``call_module`` node, its value already set.
+        output_shapes: Each output's returned and traced shape.
+        relayout_op: The parent op that restores a shape.
+    """
+    reads = [(call_node, *output_shapes[0])]
+    if len(output_shapes) > 1:
+        reads = []
+        if any(i != tuple(e) for i, e in output_shapes):
+            dtypes = call_node.meta.get("dtype")
+            for item in list(call_node.users):
+                index = item.args[1]
+                if (
+                    isinstance(dtypes, (tuple, list))
+                    and index < len(dtypes)
+                    and dtypes[index] is not None
+                ):
+                    item.meta["dtype"] = dtypes[index]
+                propagate_shape(item, parent)
+                reads.append((item, *output_shapes[index]))
+    for node, internal, external in reads:
+        if internal == tuple(external):
+            continue
+        users = list(node.users)
+        with parent.graph.inserting_after(node):
+            restored = parent.graph.call_function(
+                relayout_op, (node, list(external))
+            )
+        # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
+        restored.meta = dict(node.meta)
+        propagate_shape(restored, parent)
+        for user in users:
+            user.replace_input_with(node, restored)
+
+
+@dataclass(frozen=True)
+class NormalizationResult:
+    """What one ``normalize_group`` call chose.
+
+    Attributes:
+        iteration_shape: The group's iteration shape.
+        input_shapes: Each reshaped input -> its traced and boundary shape.
+        output_shapes: Each output's returned and traced shape.
+    """
+
+    iteration_shape: Shape
+    input_shapes: Dict[str, Tuple[Shape, Shape]]
+    output_shapes: Tuple[Tuple[Shape, Shape], ...]
+
+
+@dataclass
+class NormalizationConfig:
+    """Configuration for :func:`normalize_group`.
+
+    Attributes:
+        require_contiguous_inputs: Under ``"reshape"``, reject an input with
+            no view of its boundary shape instead of copying it.
+        parent_shape_method: The parent op, ``"view"`` or ``"reshape"``,
+            that reshapes inputs to the boundary and outputs back.
+    """
+
+    require_contiguous_inputs: bool = True
+    parent_shape_method: str = "view"
+
+    def __post_init__(self) -> None:
+        if self.parent_shape_method not in {"view", "reshape"}:
+            raise ValueError("parent_shape_method must be 'view' or 'reshape'")
+
+
+def normalize_group(
+    parent: fx.GraphModule,
+    call_node: fx.Node,
+    config: Optional[NormalizationConfig] = None,
+) -> NormalizationResult:
+    """Rewrite fused ``call_node`` and its parent to one iteration shape.
+
+    Each fused group runs one loop nest, so every operand must align from
+    the right with one iteration shape: the strong anchor's (gemm, conv, norm
+    or softmax), or the output's if there is none.  The tail must read the
+    anchor's output in order, once per position, and every other input a
+    boundary shape row-major, broadcast to the iteration shape (exemptions in
+    ``_input_shapes``).  Shape ops move from the child to parent views; an
+    output relayout that moves elements stays in the child, and any other
+    output shape change is undone by a parent view.  The parent changes only
+    after every check, so a rejection leaves it intact.  The child carries
+    ``ShapeProp`` values, binds placeholders by position, and returns a
+    tensor or a terminal dynamic quantize's tuple.
+
+    Args:
+        parent: The graph module holding ``call_node``.
+        call_node: The fused ``call_module`` node.
+        config: How the parent reshapes inputs and outputs.
+
+    Returns:
+        The iteration shape and the shapes moved to the boundary.
+
+    Raises:
+        NormalizationError: If the group cannot use one iteration space.
+    """
+    config = config or NormalizationConfig()
+    method = config.parent_shape_method
+    child = parent.get_submodule(str(call_node.target))
+    placeholders = [n for n in child.graph.nodes if n.op == "placeholder"]
+    output_node = next(n for n in child.graph.nodes if n.op == "output")
+
+    # The tail ends at the output, the quantize's input for a terminal
+    # dynamic quantize, or the core under an output relayout.
+    value = output_node.args[0]
+    if not isinstance(value, fx.Node):
+        raise NormalizationError(
+            "Only tensor outputs are supported", node=output_node
+        )
+    mx = value.target in DYNAMIC_QUANTIZE_OPS
+    core, relayout = _strip_output_relayout(value.args[0] if mx else value)
+    map_target = value if mx and not relayout else core
+    external_shapes = value.shape if mx else (value.shape,)
+
+    # A pointwise or shape-nop "anchor" means the group is anchorless.
+    anchor = get_anchor_node(call_node)
+    if anchor is None or is_elementwise_op(anchor) or is_aliasing_op(anchor):
+        anchor = None
+        iteration_shape = core.shape
+    else:
+        iteration_shape = anchor.shape
+        stream = _propagate(anchor, map_target, anchor)
+        if stream is None:
+            raise NormalizationError(
+                "The fused output does not depend on the strong anchor",
+                node=anchor,
+            )
+        boundary = _boundary_shape(stream, iteration_shape, anchor)
+        if boundary != tuple(iteration_shape):
+            raise NormalizationError(
+                "The tail changes the order or multiplicity of the "
+                "anchor-produced stream",
+                node=anchor,
+            )
+    input_shapes = _input_shapes(
+        placeholders, anchor, map_target, iteration_shape
+    )
+
+    # The value each placeholder takes once the parent's views run.
+    views = {}
+    inputs = {}
+    for index, (placeholder, arg) in enumerate(
+        zip(placeholders, call_node.args)
+    ):
+        inputs[placeholder] = getattr(arg, "value", arg)
+        shape, boundary = input_shapes.get(placeholder.name, (None, None))
+        if shape == boundary:
+            continue
+        views[index] = boundary
+        try:
+            inputs[placeholder] = arg.value.view(boundary)
+        except RuntimeError as exc:
+            if method == "view" or config.require_contiguous_inputs:
+                raise NormalizationError(
+                    f"Input cannot be viewed as {boundary}", node=arg
+                ) from exc
+            inputs[placeholder] = arg.value.reshape(boundary)
+
+    _rewrite_child(child, anchor, relayout, inputs)
+    child.graph.eliminate_dead_code()
+    child.graph.lint()
+    child.recompile()
+    result = ShapeProp(child).propagate(*inputs.values())
+
+    output_shapes = _output_shapes(output_node.args[0], external_shapes)
+
+    # Only now does the parent change: input views, then output restores.
+    args = list(call_node.args)
+    with parent.graph.inserting_before(call_node):
+        for index, boundary in views.items():
+            view = parent.graph.call_function(
+                _RELAYOUT_OPS[method], (args[index], list(boundary))
+            )
+            # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
+            view.meta = dict(args[index].meta)
+            propagate_shape(view, parent)
+            args[index] = view
+    call_node.args = tuple(args)
+    set_node_value(call_node, result)
+
+    _restore_outputs(parent, call_node, output_shapes, _RELAYOUT_OPS[method])
+
+    return NormalizationResult(
+        iteration_shape=tuple(iteration_shape),
+        input_shapes=input_shapes,
+        output_shapes=output_shapes,
+    )
