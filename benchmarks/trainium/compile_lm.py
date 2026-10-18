@@ -101,6 +101,7 @@ def voyager_args(args, config):
     voyager.tensor_layout = args.tensor_layout
     voyager.gemm_layout = args.gemm_layout
     voyager.gemv_layout = args.gemv_layout
+    voyager.merge_linears = args.merge_linears
     # The decode cache is sized in whole vector-lane groups of this core.
     voyager.pe_array_size = config.pe_array_size
     voyager.vector_unit_width = config.vector_unit_width
@@ -119,6 +120,12 @@ def main():
         "--attention", choices=("sdpa", "eager"), default="sdpa"
     )
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--merge-linears",
+        action="store_true",
+        help="run the linears reading one input as one GEMM "
+        "(merge_sibling_linears)",
+    )
     parser.add_argument(
         "--no-reference",
         action="store_true",

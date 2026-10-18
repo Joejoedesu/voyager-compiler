@@ -62,8 +62,13 @@ def restore_weights(step, step_dir):
         if source.get("extra"):
             weights[slot] = extra[slot]
             continue
-        with safe_open(os.path.join(path, files[source["key"]]), "pt") as f:
-            value = f.get_tensor(source["key"])
+        # A stacked weight is its keys' tensors along the rows.
+        keys = source.get("keys") or [source["key"]]
+        values = []
+        for key in keys:
+            with safe_open(os.path.join(path, files[key]), "pt") as f:
+                values.append(f.get_tensor(key))
+        value = torch.cat(values)
         weights[slot] = value.T.contiguous() if source["transposed"] else value
     torch_neuronx.replace_weights(step, weights)
 

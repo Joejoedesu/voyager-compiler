@@ -118,10 +118,39 @@ class Step(torch.nn.Module):
         return (marked,) if isinstance(marked, torch.Tensor) else tuple(marked)
 
 
+def stacked_keys(stem, keys):
+    """The checkpoint keys whose weights ``stem`` stacks, in row order, or
+    ``None``: ``merge_sibling_linears`` names a stacked weight after its
+    linears joined by ``_`` under their common module
+    (``layers_0_self_attn_q_proj_k_proj_v_proj_weight``)."""
+    suffix = "_weight"
+    if not stem.endswith(suffix):
+        return None
+    for cut in (i + 1 for i, c in enumerate(stem) if c == "_"):
+        scope, rest = stem[:cut], stem[cut : -len(suffix)]
+        names = {
+            k[cut : -len(suffix)]: key
+            for k, key in keys.items()
+            if k.startswith(scope) and k.endswith(suffix)
+        }
+        parts = []
+        while rest:
+            name = next((n for n in names if rest.startswith(n + "_")), None)
+            name = name or (rest if rest in names else None)
+            if name is None:
+                break
+            parts.append(names[name])
+            rest = rest[len(name) + 1 :]
+        if not rest and len(parts) > 1:
+            return parts
+    return None
+
+
 def checkpoint_sources(params, model):
-    """Each of ``params`` that is a tensor of HF checkpoint ``model``, as
-    ``{name: (key, transposed)}``, checked bit for bit: same shape, dtype
-    and values.
+    """Each of ``params`` that is a tensor of HF checkpoint ``model``, or a
+    stack of its tensors along the rows (``stacked_keys``), as ``{name:
+    (keys, transposed)}``, checked bit for bit: same shape, dtype and
+    values.
 
     A parameter's name is the checkpoint key with ``.`` as ``_``, behind any
     number of ``model_`` scopes, and a ``_t`` suffix when it is that tensor
@@ -136,18 +165,22 @@ def checkpoint_sources(params, model):
     for name, tensor in params.items():
         transposed = name.endswith("_t")
         stem = name[:-2] if transposed else name
-        while stem not in keys and stem.startswith("model_"):
+        parts = [keys[stem]] if stem in keys else stacked_keys(stem, keys)
+        while parts is None and stem.startswith("model_"):
             stem = stem[len("model_") :]
-        if stem not in keys:
+            parts = [keys[stem]] if stem in keys else stacked_keys(stem, keys)
+        if parts is None:
             continue
-        key = keys[stem]
-        file = snapshot_download(model, allow_patterns=[files[key]])
-        with safe_open(os.path.join(file, files[key]), "pt") as f:
-            value = f.get_tensor(key)
+        values = []
+        for key in parts:
+            file = snapshot_download(model, allow_patterns=[files[key]])
+            with safe_open(os.path.join(file, files[key]), "pt") as f:
+                values.append(f.get_tensor(key))
+        value = torch.cat(values)
         if transposed:
             value = value.T
         if value.dtype == tensor.dtype and torch.equal(value, tensor):
-            sources[name] = (key, transposed)
+            sources[name] = (parts, transposed)
     return sources
 
 
@@ -164,8 +197,8 @@ def strip_weights(traced, step, params, model, step_dir):
     for slot, value in traced.weights._parameters.items():
         name = step.param_names[int(slot[len("param") :])]
         if name in sources:
-            key, transposed = sources[name]
-            slots[slot] = {"name": name, "key": key, "transposed": transposed}
+            keys, transposed = sources[name]
+            slots[slot] = {"name": name, "keys": keys, "transposed": transposed}
         else:
             slots[slot] = {"name": name, "extra": True}
             extra[slot] = value.contiguous()
