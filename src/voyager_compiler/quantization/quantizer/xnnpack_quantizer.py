@@ -16,6 +16,9 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
     _convert_scalars_to_attrs,
 )
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
+    object_type as _object_type,  # The filters' argument is ``object_type``.
+)
 
 __all__ = [
     "XNNPACKQuantizer",
@@ -104,7 +107,7 @@ def _get_object_type_filter(object_type: Union[Callable, str]):
     """
 
     def object_type_filter(n: Node) -> bool:
-        return n.target == object_type
+        return _object_type(n) == object_type
 
     return object_type_filter
 
@@ -136,7 +139,7 @@ def _get_module_name_object_type_order_filter(
                 module_name == current_scope[0]
                 or re.search(module_name, current_scope[0])
             )
-            and object_type == n.target
+            and object_type == _object_type(n)
             and index == current_scope[2]
         )
 
@@ -155,7 +158,7 @@ def _get_module_name_object_type_filter(
 
     def module_name_object_type_filter(n: Node) -> bool:
         nn_module_stack = get_module_stack(n)
-        if n.target != object_type or not nn_module_stack:
+        if _object_type(n) != object_type or not nn_module_stack:
             return False
         name, _ = list(nn_module_stack.values())[-1]
         return module_name == name or re.search(module_name, name) is not None

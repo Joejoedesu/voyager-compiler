@@ -160,7 +160,8 @@ def get_microscaling_quantizer(
 
     act0_qspec = _set_ch_axis(activation, -1)
     act1_qspec = _set_ch_axis(activation, -2)
-    # With an error spec, training GEMMs pick specs by operand type.
+    # Training GEMMs pick specs by operand type; with an error spec, a
+    # matmul operand that views a parameter takes the weight's.
     qconfig_matmul = QuantizationConfig(
         act0_qspec,
         None,
@@ -169,14 +170,16 @@ def get_microscaling_quantizer(
         error=error,
         random_hadamard_transform=random_hadamard_transform,
     )
+    # Attention's key and value are activations, whatever the error spec.
+    qconfig_sdpa = QuantizationConfig(act0_qspec, None, act1_qspec, None)
 
     return (
         XNNPACKQuantizer()
         .set_object_type(torch.ops.aten.conv2d.default, qconfig_conv2d)
         .set_object_type(torch.ops.aten.linear.default, qconfig_linear)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
-        .set_object_type(_SDPA, qconfig_matmul)
-        .set_object_type(MX_OP_MAPPING[_SDPA], qconfig_matmul)
+        .set_object_type(_SDPA, qconfig_sdpa)
+        .set_object_type(MX_OP_MAPPING[_SDPA], qconfig_sdpa)
     )
 
 
@@ -242,11 +245,11 @@ def get_default_quantizer(
         output_activation: Spec for GEMM outputs, or None.
         weight: Spec for weights, or None.
         bias: Dtype the bias is quantized to, with the product of its GEMM's
-            input and weight scales; required with non-microscaling input
-            and weight specs.
-        error: Spec for gradients, or None.  Setting it builds the quantizer
-            of ``prepare_training``, whose GEMM configs give each operand
-            the spec of its type.
+            input and weight scales, and added before the GEMM's result is
+            scaled back.
+        error: Spec for gradients, or None.  Each GEMM of a model
+            ``prepare_training`` prepares gives its operands the spec of
+            their type: activation, weight or error.
         random_hadamard_transform: GEMM kinds -- ``"fprop"``, ``"dgrad"``,
             ``"wgrad"`` -- whose operands are rotated before quantizing;
             microscaling specs only.
@@ -259,38 +262,26 @@ def get_default_quantizer(
         ValueError: ``random_hadamard_transform`` is set with specs that are
             not microscaling.
     """
-    qschemes = []
-    if input_activation is not None:
-        input_activation = QuantizationSpec.from_str(input_activation)
-        qschemes.append(input_activation.qscheme)
-
-    if output_activation is not None:
-        output_activation = QuantizationSpec.from_str(output_activation)
-
-    if weight is not None:
-        weight = QuantizationSpec.from_str(weight)
-        qschemes.append(weight.qscheme)
-
-    if error is not None:
-        error = QuantizationSpec.from_str(error)
-
-    qschemes = [qs for qs in qschemes if qs is not None]
-    if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
-        assert bias is not None, (
-            "Bias quantization is required when quantizing activations and "
-            "weights."
-        )
-
+    input_activation, output_activation, weight, error = (
+        None if spec is None else QuantizationSpec.from_str(spec)
+        for spec in (input_activation, output_activation, weight, error)
+    )
+    scaled = (QScheme.PER_TENSOR_SYMMETRIC, QScheme.PER_CHANNEL_SYMMETRIC)
     # We will specify derived_from later in the quantizer.
-    # We use bias data type to imply the accumulation data type for the output.
-    if bias is not None:
+    if bias is not None or all(
+        spec is not None and spec.qscheme in scaled
+        for spec in (input_activation, weight)
+    ):
         bias = DerivedQuantizationSpec(
             derived_from=None,
             derive_qparams_fn=derive_bias_qparams_fn,
             dtype=bias,
         )
 
-    if QScheme.MICROSCALING in qschemes:
+    if any(
+        spec is not None and spec.qscheme == QScheme.MICROSCALING
+        for spec in (input_activation, weight)
+    ):
         return get_microscaling_quantizer(
             input_activation, weight, error, random_hadamard_transform
         )
@@ -317,7 +308,8 @@ def get_default_quantizer(
     qconfig = QuantizationConfig(
         input_activation, output_activation, weight, bias, error=error
     )
-    # With an error spec, training GEMMs pick specs by operand type.
+    # Training GEMMs pick specs by operand type; with an error spec, a
+    # matmul operand that views a parameter takes the weight's.
     qconfig_matmul = QuantizationConfig(
         input_activation,
         output_activation,
@@ -516,8 +508,12 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                 model, graph, next(iter(node.users)).name + "_scale", scale
             )
             # TODO quantization map can be shared among multiple quantize nodes?
-            get_attr_node = create_getattr_from_value(
-                model, graph, "qmap", activation_post_process.qmap
+            get_attr_node = (
+                None
+                if activation_post_process.qmap is None
+                else create_getattr_from_value(
+                    model, graph, "qmap", activation_post_process.qmap
+                )
             )
             quantized_node = graph.call_function(
                 torch.ops.quantized_ops.quantize.default,
@@ -637,6 +633,11 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         modules: ``model``'s modules by name.
         seed: int64 scalar an activation's ``quantize_mx`` rounds
             stochastically under, or None to round to the nearest value.
+
+    Returns:
+        ``(quantized, scale, code, global_scale)``: the nodes holding the
+        quantized values, their block scales, the codebook they index (or
+        None) and the global scale (or None).
     """
     graph = model.graph
     assert modules is not None
@@ -1044,6 +1045,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
                 mx_op_node.replace_all_uses_with(add_node)
                 add_node.replace_input_with(add_node, mx_op_node)
+
+    return quantized_node, scale_node, dequant_code, global_scale_node
 
 
 def _is_written_buffer(model: GraphModule, node: Node) -> bool:

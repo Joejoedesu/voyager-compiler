@@ -34,8 +34,11 @@ The quantization flags pick the mode::
     flags                          forward GEMMs  backward GEMMs
     -----------------------------  -------------  --------------
     none                           unquantized    unquantized
-    --weight --activation          quantized      unquantized
+    --weight --activation          quantized      unquantized (1)
     --weight --activation --error  quantized      quantized
+
+(1) Reading the forward's original operands or their quantized values, as
+``--backward_override`` says.
 
 Quantized GEMMs are fake-quant, run eagerly, unless ``--compile_step``
 compiles the training step -- forward, loss and backward -- as one program
@@ -89,7 +92,7 @@ from voyager_compiler import (
     TrainingStep,
     add_experiment_args,
     get_default_quantizer,
-    prepare_from_args,
+    prepare_training,
     with_execution_context,
 )
 from voyager_compiler.backend.gpu.training import lower_training
@@ -223,8 +226,8 @@ def parse_args():
         action="store_true",
         help=(
             "Compile the fake-quant training step -- forward, loss and "
-            "backward -- as one program; needs --error.  Steps inside a "
-            "codebook refit window run eagerly."
+            "backward -- as one program.  Steps inside a codebook refit "
+            "window run eagerly."
         ),
     )
     parser.add_argument(
@@ -260,8 +263,6 @@ def parse_args():
         parser.error("--gpu_kernels lowers a quantized training step: --error")
     if args.gpu_kernels and args.codebook_refit_steps:
         parser.error("a codebook refit hooks fake-quants: no --gpu_kernels")
-    if args.compile_step and args.error is None:
-        parser.error("--compile_step compiles a quantized step: --error")
     if args.compile_step and args.gpu_kernels:
         parser.error("--gpu_kernels compiles the step too: no --compile_step")
     return args
@@ -421,12 +422,14 @@ def main(args):
     specs = (args.activation, args.weight, args.error)
     if any(spec is not None for spec in specs):
         with causal_sdpa():
-            model = prepare_from_args(
-                model,
-                args,
+            model = prepare_training(
+                model.train(),
+                build_quantizer(args, config.num_hidden_layers),
                 (),
                 example,
-                quantizer=build_quantizer(args, config.num_hidden_layers),
+                None,
+                args.merge_linears,
+                args.backward_override,
             )
     step = TrainingStep(
         model,

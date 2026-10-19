@@ -13,6 +13,11 @@ from voyager_compiler.hardware_config import (
     DEFAULT_SCRATCHPAD_OFFSET,
     DEFAULT_WEIGHT_BUFFER_SIZE,
 )
+from voyager_compiler.quantization import (
+    DEFAULT_AMAX_HISTORY_LEN,
+    DEFAULT_BACKWARD_OVERRIDE,
+    BACKWARD_OVERRIDES,
+)
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
@@ -30,7 +35,7 @@ __all__ = [
 ]
 
 
-qconfig_help_string = """
+qconfig_help_string = f"""
 Input arguments as a comma-separated list. The first argument must specify \
 the dtype.
 Subsequent arguments can be specified using either abbreviations or full names.
@@ -55,7 +60,8 @@ Parameter details:
 posit8_1)
   - qscheme (str): Quantization scheme
   - quant_max (float): Maximum quantization value
-  - amax_history_len (int): Length of the amax history (default: 50)
+  - amax_history_len (int): Length of the amax history (default: \
+{DEFAULT_AMAX_HISTORY_LEN})
   - ch_axis (int): Channel axis (default: 0)
   - block_size (int): Block size (default: 32)
   - power_2_scale (0/1): Round each scale to a power of two (default: 0)
@@ -102,6 +108,27 @@ def add_quantization_args(parser=None):
             "Gradient quantization spec, in the activation's format. Setting "
             "it quantizes the backward pass too: the backward GEMMs of every "
             "quantized linear and matmul (not yet convolution)."
+        ),
+    )
+    parser.add_argument(
+        "--training",
+        action="store_true",
+        help=(
+            "Compile a whole training step -- the forward and backward "
+            "passes and the optimizer update -- instead of inference: the "
+            "gradient and update programs, into the gradient/ and update/ "
+            "subdirectories of --model_output_dir.  Without --error only the "
+            "forward is quantized; see --backward_override."
+        ),
+    )
+    parser.add_argument(
+        "--backward_override",
+        choices=BACKWARD_OVERRIDES,
+        default=DEFAULT_BACKWARD_OVERRIDE,
+        help=(
+            "What the backward GEMMs of a training step without --error read: "
+            "the forward GEMMs' original operands (high_precision) or their "
+            "quantized values (dequantized)."
         ),
     )
     parser.add_argument(

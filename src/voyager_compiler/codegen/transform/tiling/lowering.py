@@ -423,6 +423,34 @@ def mha_head(node):
     return perm.value.shape[-1]
 
 
+def row_block(node):
+    """The block size of a ``quantize_mx`` ending ``node``'s fused tail when
+    it blocks along the GEMM's rows (``M``, interstellar's ``OX``), or
+    ``None``.  The builder quantizes each output tile on its own, so a row
+    tile must hold whole blocks: one that splits a block takes its amax from
+    part of it and stores no scale for it.  The tail may first cut ``N``
+    into heads and permute them out (an MHA relayout); its view leaves the
+    row dims ahead of the split."""
+    anchor = get_anchor_node(node)
+    submod = node.meta.get("submodule")
+    if submod is None or is_conv2d(anchor):
+        return None
+    tail = [n for n in submod.graph.nodes if n.op == "call_function"][-1]
+    if tail.target is not torch.ops.quantized_ops.quantize_mx.default:
+        return None
+    x, axes, block_size = tail.args[0], tail.args[2], tail.args[3]
+    dims = [a % x.value.ndim for a in axes]
+    if x.target is torch.ops.aten.permute.default:
+        dims = [x.args[1][d] for d in dims]
+        x = x.args[0]
+    if x.target is torch.ops.aten.view.default:
+        x = x.args[0]
+    if x is not anchor:
+        return None
+    rows = anchor.value.ndim - 1
+    return block_size if any(d < rows for d in dims) else None
+
+
 def resolve(member, node, anchor):
     """The input node a :class:`Placement` member names: the one ``node``'s
     kernel loads the operand from -- for a ``Role``, the anchor's operand

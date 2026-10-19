@@ -77,6 +77,20 @@ SCHEME_ARGS = {
         "--conv2d_im2col"
     ),
     "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck",
+    # Training schemes: the gradients (--error) are quantized too.  FP8 is
+    # e4m3 forward and e5m2 gradients with per-tensor delayed scaling.
+    "FP8": (
+        "--activation fp8_e4m3,qs=per_tensor_symmetric,ahl=16 "
+        "--weight fp8_e4m3,qs=per_tensor_symmetric,ahl=16 "
+        "--error fp8_e5m2,qs=per_tensor_symmetric,ahl=16 "
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
+    ),
+    "MXFP4": (
+        "--activation fp4_e2m1,qs=microscaling,bs=32,pot=1 "
+        "--weight fp4_e2m1,qs=microscaling,bs=32,pot=1 "
+        "--error fp4_e2m1,qs=microscaling,bs=32,pot=1 "
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
+    ),
 }
 
 # The matrix search sizes its blocking against a scratchpad and a bank
@@ -95,6 +109,8 @@ SCHEME_INPUT_BYTES = {
     "MXINT8": 1,
     "MXNF4": 0.5,
     "BF16": 2,
+    "FP8": 1,
+    "MXFP4": 0.5,
 }
 assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 
@@ -110,6 +126,7 @@ _LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
 _LLM_SPMM_DB = _LLM_SPMM + " " + _DB
+_LLM_TRAIN = "--training --context_length 1024 --num_hidden_layers 1 " + _FP16
 
 
 @dataclass(frozen=True)
@@ -162,6 +179,10 @@ COMMANDS = [
     Command(
         "llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
     ),
+    # -- training: one AdamW step, compiled into gradient/ and update/ --
+    Command("llama_prefill", "BF16", "64,64", "llama_train", _LLM_TRAIN),
+    Command("llama_prefill", "FP8", "64,64", "llama_train", _LLM_TRAIN),
+    Command("llama_prefill", "MXFP4", "64,64", "llama_train", _LLM_TRAIN),
 ]
 
 # Timestamp folder format; lexicographic sort == chronological sort.
@@ -228,6 +249,12 @@ def _build(command, run_dir):
     return label, dest, argv
 
 
+def _programs(dest):
+    """The ``model.txt`` files a command wrote, relative to ``dest``: one for
+    inference, one per program (``gradient/``, ``update/``) for training."""
+    return sorted(p.relative_to(dest) for p in dest.rglob("model.txt"))
+
+
 def _run_one(label, dest, argv, env):
     """Run one command in ``env``; capture combined output to
     ``dest/run.log``.
@@ -254,7 +281,7 @@ def _run_one(label, dest, argv, env):
 
     if proc.returncode != 0:
         return "error"
-    if not (dest / "model.txt").exists():
+    if not _programs(dest):
         return "no_output"
     log = log_path.read_text()
     if "Skipping output verification" in log:
@@ -275,35 +302,31 @@ def _find_previous_run(out_dir, current):
 
 
 def _compare(label, status, run_dir, prev_run):
-    """Classify one label's model.txt vs the previous run.
+    """Classify one label's model.txt files vs the previous run.
 
     Returns ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only
     for a MISMATCH.
     """
     if status in ("error", "no_output"):
         return "FAILED", ""
-
-    cur = (run_dir / label / "model.txt").read_text()
-
     if prev_run is None:
         return "NEW", ""
-    prev_path = prev_run / label / "model.txt"
-    if not prev_path.exists():
-        return "NEW", ""
 
-    prev = prev_path.read_text()
-    if cur == prev:
+    diff = []
+    for program in _programs(run_dir / label):
+        prev_path = prev_run / label / program
+        if not prev_path.exists():
+            return "NEW", ""
+        diff += difflib.unified_diff(
+            prev_path.read_text().splitlines(),
+            (run_dir / label / program).read_text().splitlines(),
+            fromfile=f"{prev_run.name}/{label}/{program}",
+            tofile=f"{run_dir.name}/{label}/{program}",
+            lineterm="",
+        )
+    if not diff:
         return "MATCH", ""
-
-    diff = difflib.unified_diff(
-        prev.splitlines(),
-        cur.splitlines(),
-        fromfile=f"{prev_run.name}/{label}/model.txt",
-        tofile=f"{run_dir.name}/{label}/model.txt",
-        lineterm="",
-    )
-    excerpt = list(diff)[:DIFF_EXCERPT_LINES]
-    return "MISMATCH", "\n".join(excerpt)
+    return "MISMATCH", "\n".join(diff[:DIFF_EXCERPT_LINES])
 
 
 def main():
@@ -452,10 +475,14 @@ def _build_report(results, run_dir, prev_run):
     # Labels present in the previous run but absent now.
     if prev_run is not None:
         current_labels = {r[0] for r in results}
-        for p in sorted(prev_run.rglob("model.txt")):
-            label = str(p.parent.relative_to(prev_run))
-            if label not in current_labels:
-                lines.append(f"  - MISSING: {label} (in {prev_run.name})")
+        # A label is the first three path segments; training nests its
+        # programs' model.txt one level further down.
+        previous = {
+            "/".join(p.relative_to(prev_run).parts[:3])
+            for p in prev_run.rglob("model.txt")
+        }
+        for label in sorted(previous - current_labels):
+            lines.append(f"  - MISSING: {label} (in {prev_run.name})")
 
     bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]
     lines.append("")

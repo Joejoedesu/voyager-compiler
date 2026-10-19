@@ -1,9 +1,13 @@
 """Training with fake-quantized GEMMs, forward only or backward too.
 
-``prepare_from_args`` picks the mode from the flags.  Without an error spec
-it is QAT: the export is prepared as ``prepare_qat_pt2e`` prepares it, and
-only the forward pass is quantized.  With one, ``prepare_training``
-quantizes the backward pass too.
+``prepare_for_qat`` prepares QAT on an export, as ``prepare_qat_pt2e``
+does: only the forward pass is quantized.  ``prepare_training`` captures the
+forward and backward passes together, which quantizing the backward pass
+and compiling a training step both need.  With an error spec its backward
+GEMMs quantize their own operands; without one the forward alone is
+quantized, and the backward GEMMs read either the forward's original
+operands (``"high_precision"``) or its quantized ones (``"dequantized"``,
+``_read_forward_quantized``).
 
 ``capture_training`` hands ``prepare_training`` AOTAutograd's joint graph of
 the forward and backward passes before splitting it.  AOTAutograd traces it
@@ -79,9 +83,9 @@ from voyager_compiler.quantization.fake_quantize import (
     calculate_global_scale,
 )
 from voyager_compiler.quantization.quantize_pt2e import (
+    MX_OP_MAPPING,
     _get_obs_or_fq_map,
     _replace_observer_with_quantize_mx_node_decomposed,
-    get_default_quantizer,
     prepare_qat_pt2e,
     set_training,
 )
@@ -92,15 +96,21 @@ from voyager_compiler.quantization.quantizer.quantizer import (
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
     XNNPACKQuantizer,
 )
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
+    FUSED_SDPA,
+    FUSED_SDPA_BACKWARD,
+)
 
 __all__ = [
+    "DEFAULT_BACKWARD_OVERRIDE",
+    "BACKWARD_OVERRIDES",
     "TrainingQuantizers",
     "TrainingStep",
     "capture_training",
     "disable_observers",
     "gemm_partners",
     "gradient_program",
-    "prepare_from_args",
+    "prepare_for_qat",
     "prepare_training",
     "return_gradients",
     "update_program",
@@ -112,6 +122,11 @@ aten = torch.ops.aten
 _GEMMS = (aten.mm.default, aten.addmm.default, aten.bmm.default)
 # The ops the quantizer annotates as GEMMs.
 _OPS = (aten.linear.default, aten.matmul.default)
+_SDPA = aten.scaled_dot_product_attention.default
+# What the backward GEMMs read without an error spec: the forward GEMMs'
+# original operands, or their quantized ones.
+BACKWARD_OVERRIDES = ("high_precision", "dequantized")
+DEFAULT_BACKWARD_OVERRIDE = "dequantized"
 # Ops that only view a tensor: an operand read through them is still the
 # tensor they start from.
 _VIEWS = {
@@ -156,6 +171,19 @@ def _fake_quantize(
     global scale ``_share_global_scales`` shares, if any.
     """
     return fake_quant(x, **kwargs)
+
+
+def _with_layout(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """``x`` in ``like``'s memory layout.
+
+    A fake-quant returns a contiguous tensor.  A fused attention lays its
+    output out as its query is laid out, and the views after it were traced
+    with the query's layout, so its fake-quantized operands take that layout
+    back.
+    """
+    if x.stride() == like.stride():
+        return x
+    return torch.empty_like(like, dtype=x.dtype).copy_(x)
 
 
 class TrainingQuantizers(nn.Module):
@@ -485,6 +513,165 @@ def _share_quantized_views(joint: GraphModule) -> None:
     joint.recompile()
 
 
+def _view_chain(node: Node) -> List[Node]:
+    """``node``, then each tensor it views, down to the one it starts from."""
+    chain = [node]
+    while chain[-1].target in _VIEWS:
+        chain.append(chain[-1].args[0])
+    return chain
+
+
+def _undo_view(graph: Graph, view: Node, x: Node, tag: str) -> Node:
+    """The tensor ``view`` reads, computed back from ``x``, its output.
+
+    A symbolic size is read off the tensor ``view`` reads.  Every node
+    added carries ``tag``, the partitioner tag the split places it by.
+
+    Raises:
+        NotImplementedError: ``view`` expands, and cannot be undone.
+    """
+    source = view.args[0].meta["val"]
+    added = []
+    if view.target in (
+        aten.view.default,
+        aten._unsafe_view.default,
+        aten.reshape.default,
+    ):
+        shape = []
+        for dim, size in enumerate(source.shape):
+            if not isinstance(size, int):
+                added.append(
+                    graph.call_function(aten.sym_size.int, (view.args[0], dim))
+                )
+                added[-1].meta["val"] = size
+                size = added[-1]
+            shape.append(size)
+        target, args = aten.view.default, (x, shape)
+    elif view.target in (aten.t.default, aten.alias.default):
+        target, args = view.target, (x,)
+    elif view.target is aten.transpose.int:
+        target, args = view.target, (x, *view.args[1:])
+    elif view.target is aten.permute.default:
+        dims = [d % source.dim() for d in view.args[1]]
+        target, args = view.target, (
+            x,
+            sorted(range(len(dims)), key=dims.__getitem__),
+        )
+    elif view.target is aten.unsqueeze.default:
+        target, args = aten.squeeze.dim, (x, view.args[1])
+    elif view.target is aten.squeeze.dim:
+        dim = view.args[1] % source.dim()
+        target, args = (
+            (aten.unsqueeze.default, (x, dim))
+            if source.shape[dim] == 1
+            else (aten.alias.default, (x,))
+        )
+    else:
+        raise NotImplementedError(f"{view.name} cannot be undone")
+    added.append(graph.call_function(target, args))
+    added[-1].meta["val"] = source
+    for node in added:
+        node.meta["partitioner_tag"] = tag
+    return added[-1]
+
+
+def _read_forward_quantized(joint: GraphModule, backward_override: str) -> None:
+    """Make each backward GEMM without an error spec read its forward GEMM's
+    operands as ``backward_override`` says.
+
+    Such a GEMM -- one whose error operand the quantizer left unquantized --
+    has its own operand specs dropped, and its incoming gradient stays in
+    high precision.  Under ``"high_precision"`` its other operands stay the
+    original tensors.  Under ``"dequantized"`` each reads the output of the
+    forward GEMM's fake-quant (paired by ``seq_nr``) instead: back through
+    the forward's views to where the two operands meet, then on through the
+    backward's.
+
+    Args:
+        joint: Annotated, tagged joint graph, rewritten in place.
+        backward_override: One of ``BACKWARD_OVERRIDES``.
+
+    Raises:
+        NotImplementedError: A backward operand views none of its forward
+            GEMM's operands, or meets one only through a view that cannot be
+            undone.
+    """
+    graph = joint.graph
+    forward = {
+        gemm.meta["seq_nr"]: gemm
+        for gemm in graph.nodes
+        if gemm.meta.get("gemm_kind") == "fprop"
+        and "quantization_annotation" in gemm.meta
+    }
+    for gemm in list(graph.nodes):
+        annotation = gemm.meta.get("quantization_annotation")
+        if (
+            gemm.target not in _OPS
+            or annotation is None
+            or gemm.meta["gemm_kind"] == "fprop"
+        ):
+            continue
+        specs = annotation.input_qspec_map
+        operands = list(zip(gemm.args[:2], gemm.meta["operand_types"]))
+        if any(
+            kind == "error" and specs.get(operand) is not None
+            for operand, kind in operands
+        ):
+            continue
+        fprop = forward.get(gemm.meta["seq_nr"])
+        for operand, kind in operands:
+            specs.pop(operand, None)
+            if (
+                backward_override == "high_precision"
+                or kind == "error"
+                or fprop is None
+            ):
+                continue
+            below = _view_chain(operand)
+            for tensor in fprop.args[:2]:
+                above = _view_chain(tensor)
+                common = next((n for n in below if n in above), None)
+                if common is not None:
+                    break
+            else:
+                raise NotImplementedError(
+                    f"{gemm.name} reads {operand.name}, which views none of "
+                    f"{fprop.name}'s operands"
+                )
+            spec = fprop.meta["quantization_annotation"].input_qspec_map.get(
+                tensor
+            )
+            if spec is None:
+                continue
+            undo = above[: above.index(common)]
+            redo = below[: below.index(common)]
+            if not undo and not redo:
+                specs[operand] = spec
+                continue
+            with graph.inserting_before(gemm):
+                read = [tensor]
+                for view in undo:
+                    read.append(
+                        _undo_view(
+                            graph, view, read[-1], gemm.meta["partitioner_tag"]
+                        )
+                    )
+                copies = {common: read[-1]}
+                for view in reversed(redo):
+                    copies[view] = graph.node_copy(
+                        view, lambda arg: copies.get(arg, arg)
+                    )
+                    read.append(copies[view])
+            for node in read[1:]:
+                # The split places a node by its tag.
+                node.meta["partitioner_tag"] = gemm.meta["partitioner_tag"]
+            read[1].meta["quantization_annotation"] = QuantizationAnnotation(
+                input_qspec_map={tensor: spec}, _annotated=True
+            )
+            gemm.replace_input_with(operand, read[-1])
+    joint.recompile()
+
+
 def capture_training(
     model: torch.nn.Module,
     args: Tuple[Any, ...],
@@ -578,6 +765,14 @@ def capture_training(
         graphs["backward"] = graph
         return make_boxed_func(graph)
 
+    # Backward ops break into the smaller ones the compiler lowers.
+    decompositions = core_aten_decompositions()
+    # Workaround for a PyTorch bug (2.13): the decomposition of CPU flash
+    # attention returns the attention weights where its fused backward
+    # expects the logsumexp, so the backward crashes in bf16 and computes
+    # wrong gradients in fp32.  Keep the fused op undecomposed; drop this
+    # once PyTorch fixes the decomposition.
+    decompositions.pop(aten._scaled_dot_product_flash_attention_for_cpu.default)
     # The backward is compiled now, not at the first backward call.
     with (
         torch.enable_grad(),
@@ -589,8 +784,7 @@ def capture_training(
             fw_compiler=compile_forward,
             bw_compiler=compile_backward,
             partition_fn=partition,
-            # Backward ops break into the smaller ones the compiler lowers.
-            decompositions=core_aten_decompositions(),
+            decompositions=decompositions,
         )
     for node in graphs["forward"].graph.nodes:
         schema = getattr(node.target, "_schema", None)
@@ -648,6 +842,50 @@ def capture_training(
     model.forward = forward
 
 
+def _maybe_insert_input_observers_for_node(
+    node: Node,
+    qconfig,
+    model: nn.Module,
+    named_modules: Dict[str, nn.Module],
+    obs_or_fq_map,
+    is_qat: bool,
+    model_device: Optional[torch.device] = None,
+) -> None:
+    """torchao's ``_maybe_insert_input_observers_for_node``, refusing only a
+    keyword tensor the annotation gives a spec.
+
+    torchao inserts fake-quants on positional arguments alone, and refuses
+    any tensor passed by keyword so that none goes unquantized silently.  A
+    tensor without a spec, such as the attention mask CPU flash attention
+    takes by keyword, is left as it is.
+
+    Raises:
+        NotImplementedError: A keyword tensor has a spec.
+    """
+    node.args = tuple(
+        torchao_prepare._maybe_insert_input_observer_for_arg_or_kwarg(
+            node,
+            arg,
+            qconfig,
+            model,
+            named_modules,
+            obs_or_fq_map,
+            is_qat,
+            model_device,
+        )
+        for arg in node.args
+    )
+    annotation = node.meta.get("quantization_annotation")
+    specs = {} if annotation is None else annotation.input_qspec_map
+    for name, value in node.kwargs.items():
+        tensors = []
+        map_arg(value, tensors.append)
+        if any(specs.get(tensor) is not None for tensor in tensors):
+            raise NotImplementedError(
+                f"{node.name} passes its quantized {name} by keyword"
+            )
+
+
 def prepare_training(
     model: nn.Module,
     quantizer: XNNPACKQuantizer,
@@ -655,12 +893,19 @@ def prepare_training(
     example_kwargs: Optional[Dict[str, Any]],
     dynamic_shapes,
     merge_linears: bool = False,
+    backward_override: str = DEFAULT_BACKWARD_OVERRIDE,
 ) -> nn.Module:
     """Quantize ``model``'s GEMMs in the forward and the backward pass.
 
-    ``model`` keeps its parameters, names and ``train()`` / ``eval()``; its
-    forward runs the graphs ``capture_training`` captures.  The fake-quants
-    are held by ``model.training_quantizers``.
+    A backward GEMM whose incoming gradient the quantizer leaves
+    unquantized -- every one, without an error spec -- quantizes none of its
+    operands, and reads its forward GEMM's as ``backward_override`` says.
+    A quantized fused attention's backward reads the forward's quantized
+    query, key and value either way: it recomputes the attention from them
+    and the forward's saved statistics.  ``model`` keeps its parameters,
+    names and ``train()`` / ``eval()``; its forward runs the graphs
+    ``capture_training`` captures.  The fake-quants are held by
+    ``model.training_quantizers``.
 
     Args:
         model: Float model, in training mode.
@@ -672,6 +917,9 @@ def prepare_training(
         merge_linears: Merge the bias-free linears that read one input with
             the same specs into one (``merge_sibling_linears``), whose operands
             then share their scales.
+        backward_override: What a backward GEMM without an error spec reads:
+            its forward GEMM's original operands (``"high_precision"``) or
+            their quantized values (``"dequantized"``).
 
     Returns:
         ``model``.
@@ -680,8 +928,14 @@ def prepare_training(
         NotImplementedError: The quantizer would quantize an op other than
             a linear or matmul, or a GEMM output; or the model has a batch
             norm or a fused attention dropout.
-        ValueError: A spec is per-channel, or ``model`` is in eval mode.
+        ValueError: A spec is per-channel, ``model`` is in eval mode, or
+            ``backward_override`` is not one of ``BACKWARD_OVERRIDES``.
     """
+    if backward_override not in BACKWARD_OVERRIDES:
+        raise ValueError(
+            f"backward_override is {backward_override!r}, not one of "
+            f"{BACKWARD_OVERRIDES}"
+        )
     model.training_quantizers = quantizers = TrainingQuantizers()
 
     def make_transform(export):
@@ -692,7 +946,7 @@ def prepare_training(
             annotation = node.meta.pop("quantization_annotation", None)
             if (
                 annotation is not None
-                and node.target not in _OPS
+                and node.target not in (*_OPS, _SDPA)
                 and any(
                     spec is not None
                     for spec in annotation.input_qspec_map.values()
@@ -706,6 +960,7 @@ def prepare_training(
             _merge_duplicate_views(joint)
             errors = _tag_operands(joint)
             quantizer.annotate(joint)
+            _read_forward_quantized(joint, backward_override)
             for node in joint.graph.nodes:
                 annotation = node.meta.get("quantization_annotation")
                 if annotation is None:
@@ -725,6 +980,9 @@ def prepare_training(
                     )
             _share_quantized_views(joint)
             torchao_prepare._get_obs_or_fq_map = _get_obs_or_fq_map
+            torchao_prepare._maybe_insert_input_observers_for_node = (
+                _maybe_insert_input_observers_for_node
+            )
             with unset_fake_temporarily():
                 prepared = torchao_prepare.prepare(joint, {}, True)
             graph = prepared.graph
@@ -745,6 +1003,15 @@ def prepare_training(
                 call.meta["val"] = operand.meta["val"]
                 node.replace_all_uses_with(call)
                 graph.erase_node(node)
+                for reader in list(call.users):
+                    if reader.target not in (*FUSED_SDPA, *FUSED_SDPA_BACKWARD):
+                        continue
+                    with graph.inserting_before(reader):
+                        laid_out = graph.call_function(
+                            _with_layout, (call, operand)
+                        )
+                    laid_out.meta["val"] = operand.meta["val"]
+                    reader.replace_input_with(call, laid_out)
             prepared.recompile()
             return prepared
 
@@ -821,16 +1088,20 @@ def _delayed_scale(
     return new
 
 
-def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
+def _dequantize_gemms(
+    graph: Graph, scales: Dict[Node, Node], biases: Set[Node]
+) -> None:
     """Scale each GEMM of per-tensor quantized operands back after it.
 
     The GEMM reads the quantized values themselves, so its result is scaled
-    by the product of its operands' scales, and its bias, which is not in
-    that domain, is added after.
+    by the product of its operands' scales.  A bias quantized by that
+    product stays in the GEMM, added before the result is scaled back; any
+    other bias is added after.
 
     Args:
         graph: Graph rewritten in place.
         scales: Each per-tensor ``quantize`` -> the scale it divides by.
+        biases: The ``quantize`` of each bias, by its GEMM's scale product.
 
     Raises:
         NotImplementedError: A quantized tensor is read by an op other than
@@ -858,7 +1129,8 @@ def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
         if not found:
             continue
         bias = gemm.args[2] if len(gemm.args) > 2 else None
-        gemm.args = gemm.args[:2]
+        if bias not in biases:
+            gemm.args = gemm.args[:2]
         users = list(gemm.users)
         with graph.inserting_before(gemm.next):
             product = found[0]
@@ -867,7 +1139,7 @@ def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
             result = graph.call_function(
                 torch.ops.quantized_ops.dequantize.default, (gemm, product)
             )
-            if bias is not None:
+            if bias is not None and bias not in biases:
                 result = graph.call_function(aten.add.Tensor, (result, bias))
         for user in users:
             user.replace_input_with(gemm, result)
@@ -1200,6 +1472,25 @@ def _merge_pair(
     return True
 
 
+def _reads_mx(program: GraphModule, gemm: Node) -> bool:
+    """Whether ``gemm`` takes both its operands as MX values: as an ``_mx``
+    twin already, or reading two enabled microscaling fake-quants."""
+    if gemm.target in MX_OP_MAPPING.values():
+        return True
+    if gemm.target not in _OPS:
+        return False
+    for operand in gemm.args[:2]:
+        if operand.target is not _fake_quantize:
+            return False
+        fake_quant = program.get_submodule(operand.args[0].target)
+        if not (
+            isinstance(fake_quant, MXFakeQuantize)
+            and fake_quant.fake_quant_enabled
+        ):
+            return False
+    return True
+
+
 def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     """Replace each fake-quant of ``program`` with the ops that quantize.
 
@@ -1212,14 +1503,16 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     rotates the operand before its ``quantize_mx`` (``_insert_rotation``);
     where the fake-quant rotates it back, the GEMM multiplies the rotations
     of its two operands, which cancel, over the padded contraction axis.
+    A reader that cannot take MX values -- a view, or a GEMM whose other
+    operand is not MX, as a QAT backward GEMM's -- reads them dequantized.
 
     A per-tensor fake-quant scales by its delayed-scaling state: its amax
     history and scale become program inputs, named after the fake-quant's
     buffers in the model, that the program updates as the fake-quant does
     (``_delayed_scale``).  Its GEMMs read the quantized values and are
-    scaled back after (``_dequantize_gemms``).  A bias fake-quant, derived
-    from its GEMM's operand scales as they stand where it runs, rounds the
-    bias as the fake-quant does.
+    scaled back after (``_dequantize_gemms``).  A bias is quantized by the
+    product of its GEMM's operand scales as they stand where its fake-quant
+    runs, and the GEMM adds it before scaling back.
 
     Args:
         program: A gradient program, rewritten in place.
@@ -1228,11 +1521,23 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
 
     Raises:
         NotImplementedError: A fake-quant's scheme has no lowering yet, a
-            GEMM rotates one of its operands only, or a per-tensor quantized
-            tensor is read by an op other than a GEMM.
+            GEMM rotates one of its operands only, a per-tensor quantized
+            tensor is read by an op other than a GEMM, or a fused attention
+            reads a quantized tensor.
     """
     graph = program.graph
     calls = [n for n in graph.nodes if n.target is _fake_quantize]
+    for node in calls:
+        readers = list(node.users)
+        while readers:
+            reader = readers.pop()
+            if reader.target in _VIEWS:
+                readers.extend(reader.users)
+            elif reader.target in (*FUSED_SDPA, *FUSED_SDPA_BACKWARD):
+                raise NotImplementedError(
+                    f"{reader.name}: a fused attention has no lowering in a "
+                    "training step; quantize eager attention instead"
+                )
     attributes = {id(m): name for name, m in program.named_children()}
 
     # The scale each per-tensor fake-quant holds where the graph now stands:
@@ -1273,12 +1578,13 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             rotated.add(node)
     for node in rotated:
         for gemm in node.users:
-            if not rotated.issuperset(gemm.args[:2]):
+            if gemm.target not in _OPS or not rotated.issuperset(gemm.args[:2]):
                 raise NotImplementedError(
-                    f"{gemm.name} rotates one of its operands only"
+                    f"{gemm.name} reads a rotated operand without rotating "
+                    "the other"
                 )
 
-    scales = {}
+    scales, biases = {}, set()
     for node in calls:
         fake_quant_attr, operand = node.args
         target = fake_quant_attr.target
@@ -1314,12 +1620,32 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
                 # leaves.
                 call = graph.call_module(target, (operand,))
             call.meta = node.meta
-            node.replace_all_uses_with(call)
-            graph.erase_node(node)
+            # A reader that cannot take MX values -- a view, or a GEMM whose
+            # other operand is not MX, as a QAT backward GEMM's gradient --
+            # reads them dequantized.
+            plain = [u for u in node.users if not _reads_mx(program, u)]
+            node.replace_all_uses_with(call, lambda user: user not in plain)
             modules = dict(program.named_modules(remove_duplicate=False))
-            _replace_observer_with_quantize_mx_node_decomposed(
-                program, call, modules, seed
+            quantized, scale, code, global_scale = (
+                _replace_observer_with_quantize_mx_node_decomposed(
+                    program, call, modules, seed
+                )
             )
+            if plain:
+                if fake_quant.outlier_threshold is not None:
+                    raise NotImplementedError(
+                        f"{node.name}: dequantizing an outlier-filtered "
+                        "tensor has no lowering yet"
+                    )
+                with graph.inserting_before(node):
+                    value = graph.call_function(
+                        torch.ops.quantized_ops.dequantize_mx.default,
+                        (quantized, scale, fake_quant.block_size),
+                        {"code": code, "global_scale": global_scale},
+                    )
+                value.meta["val"] = node.meta["val"]
+                node.replace_all_uses_with(value)
+            graph.erase_node(node)
             continue
         if isinstance(fake_quant, FusedAmaxObsFakeQuantize):
             if fake_quant.is_per_channel:
@@ -1351,8 +1677,12 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
                 (current[target],),
                 {"dtype": operand.meta["val"].dtype},
             )
-            qmap = create_getattr_from_value(
-                program, graph, "qmap", fake_quant.qmap
+            qmap = (
+                None
+                if fake_quant.qmap is None
+                else create_getattr_from_value(
+                    program, graph, "qmap", fake_quant.qmap
+                )
             )
             quantized = graph.call_function(
                 torch.ops.quantized_ops.quantize.default,
@@ -1360,17 +1690,12 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             )
             quantized.meta["dtype"] = fake_quant.dtype
             if isinstance(fake_quant, _DerivedObserverOrFakeQuantize):
-                # A bias is added in its own dtype, rounded as the fake-quant
-                # rounds it.
-                quantized = graph.call_function(
-                    torch.ops.quantized_ops.dequantize.default,
-                    (quantized, scale),
-                )
+                biases.add(quantized)
             else:
                 scales[quantized] = scale
         node.replace_all_uses_with(quantized)
         graph.erase_node(node)
-    _dequantize_gemms(graph, scales)
+    _dequantize_gemms(graph, scales, biases)
     graph.eliminate_dead_code()
     program.delete_all_unused_submodules()
 
@@ -2061,61 +2386,42 @@ def disable_observers(model: nn.Module) -> None:
                 getattr(module, name).enable_observer()
 
 
-def prepare_from_args(
+def prepare_for_qat(
     model: nn.Module,
-    args,
-    example_args: Tuple[Any, ...] = (),
-    example_kwargs: Optional[Dict[str, Any]] = None,
-    dynamic_shapes=None,
-    quantizer: Optional[XNNPACKQuantizer] = None,
-) -> nn.Module:
-    """Prepare ``model`` for training as the quantization flags ask.
+    quantizer: XNNPACKQuantizer,
+    example_args: Tuple[Any, ...],
+    example_kwargs: Optional[Dict[str, Any]],
+    dynamic_shapes,
+    merge_linears: bool,
+) -> GraphModule:
+    """Prepare ``model`` for QAT: its forward GEMMs train through
+    ``quantizer``'s fake-quants, and the backward pass stays in high
+    precision.
 
-    The flags are the ones ``add_quantization_args`` defines.  With
-    ``--error``, ``prepare_training`` quantizes the forward and backward
-    passes.  Without it the model is exported in training mode and
-    prepared for QAT: each conv-BN pair trains through the simulated fold,
-    and ``train()`` and ``eval()`` switch the graph's dropouts and batch
-    norms.
+    ``model`` is exported in training mode and prepared by
+    ``prepare_qat_pt2e``: each conv-BN pair trains through the simulated
+    fold, and ``train()`` and ``eval()`` switch the graph's dropouts and
+    batch norms.  ``prepare_training`` instead quantizes the backward pass
+    too, and captures the graph a training step compiles from.
 
     Args:
         model: Float model.
-        args: Parsed command-line arguments.
+        quantizer: Picks the GEMM operands to quantize and their specs.
         example_args: Positional inputs to export with.
         example_kwargs: Keyword inputs to export with.
         dynamic_shapes: Dynamic dimensions of the inputs.
-        quantizer: Quantizer to prepare with instead of the one the flags
-            build, e.g. one that leaves some GEMMs unquantized.
+        merge_linears: Merge the bias-free linears that read one input into
+            one GEMM (``merge_sibling_linears``).
 
     Returns:
-        The prepared model: ``model`` itself with ``--error``, otherwise
-        the prepared graph.
+        The prepared graph.
     """
-    if args.bf16:
-        model.bfloat16()
-    if quantizer is None:
-        quantizer = get_default_quantizer(
-            input_activation=args.activation,
-            weight=args.weight,
-            bias=args.bias,
-            error=args.error,
-            random_hadamard_transform=args.random_hadamard_transform,
-        )
-    if args.error is not None:
-        return prepare_training(
-            model.train(),
-            quantizer,
-            example_args,
-            example_kwargs,
-            dynamic_shapes,
-            args.merge_linears,
-        )
     exported = export_model(
         model.train(),
         example_args,
         example_kwargs,
         dynamic_shapes=dynamic_shapes,
-        merge_linears=args.merge_linears,
+        merge_linears=merge_linears,
     )
     model = prepare_qat_pt2e(exported, quantizer)
 

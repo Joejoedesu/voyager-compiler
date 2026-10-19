@@ -56,18 +56,19 @@ def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
     into its own directory under ``args.model_output_dir``.  They run on
     ``model``'s own tensors and ``inputs``, zeroed gradient buffers or, for
     the update, random gradients, and the optimizer's state as before a
-    first step.  With ``--error``, the step trains through ``quantizer``'s
-    fake-quants, forward and backward, after ``--calibration_steps`` eager
-    steps have started their delayed scaling.  A dropout draws its mask per
-    tile once compiled, so with dropout the compiled program's results
-    differ from the reference's.
+    first step.  With quantization specs, the step trains through
+    ``quantizer``'s fake-quants -- the backward too with ``--error``, else
+    as ``--backward_override`` says -- after ``--calibration_steps`` eager steps
+    have started their delayed scaling.  A dropout draws its mask per tile
+    once compiled, so with dropout the compiled program's results differ
+    from the reference's.
 
     Args:
         model: A Hugging Face model that returns its loss given labels.
         inputs: One batch, labels included.
         fusion_patterns: The fusion patterns ``transform`` applies.
         args: The command line.
-        quantizer: Picks the GEMM operands to quantize, with ``--error``.
+        quantizer: Picks the GEMM operands to quantize.
 
     Returns:
         ``(programs, reference, lowered)``, each keyed ``"gradient"`` and
@@ -77,8 +78,16 @@ def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
         same from the compiled graphs under ``--debug``, else ``None``.
     """
     model = Loss(model).train()
-    if args.error is not None:
-        prepare_training(model, quantizer, (), inputs, None)
+    specs = (args.activation, args.weight, args.error)
+    if any(spec is not None for spec in specs):
+        prepare_training(
+            model,
+            quantizer,
+            (),
+            inputs,
+            None,
+            backward_override=args.backward_override,
+        )
         for _ in range(args.calibration_steps):
             with torch.enable_grad():
                 model(**inputs).backward()

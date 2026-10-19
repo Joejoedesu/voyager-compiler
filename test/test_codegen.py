@@ -1,5 +1,6 @@
 import argparse
 import logging
+from contextlib import nullcontext
 
 import torch
 from torch.testing import assert_close
@@ -248,17 +249,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--training",
-        action="store_true",
-        help=(
-            "Compile one AdamW training step instead of inference: the "
-            "gradient program (forward, loss and backward) and the update "
-            "program, into the gradient/ and update/ subdirectories of "
-            "--model_output_dir.  bert trains on a GLUE batch; "
-            "llama_prefill pre-trains on --context_length wikitext tokens."
-        ),
-    )
-    parser.add_argument(
         "--log_level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="WARNING",
@@ -271,8 +261,6 @@ def main():
         parser.error("--training compiles bert or llama_prefill")
     if args.training and args.report:
         parser.error("--report takes one graph; --training compiles two")
-    if args.training and args.activation and args.error is None:
-        parser.error("--training quantizes the backward pass too: give --error")
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -397,9 +385,13 @@ def main():
             quantizer.set_module_name_object_type_order(
                 llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
             )
-            gm, old_output, new_output = compile_training_step(
-                model, inputs, FUSION_PATTERNS, args, quantizer
-            )
+            # As inference: sdpa attention runs ``is_causal``, with no
+            # mask tensor.
+            sdpa = args.attn_implementation == "sdpa"
+            with llama._sdpa_is_causal() if sdpa else nullcontext():
+                gm, old_output, new_output = compile_training_step(
+                    model, inputs, FUSION_PATTERNS, args, quantizer
+                )
         else:
             gm, old_output, new_output = llama.quantize_and_dump_model(
                 model=model,

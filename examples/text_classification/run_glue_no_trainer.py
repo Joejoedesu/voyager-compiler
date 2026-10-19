@@ -52,7 +52,8 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 
 from voyager_compiler import (
     add_experiment_args,
-    prepare_from_args,
+    get_default_quantizer,
+    prepare_training,
     with_execution_context,
 )
 from voyager_compiler.quantization import (
@@ -514,7 +515,24 @@ def main(args):
         k: {0: batch_size} if v.dim() == 1 else {0: batch_size, 1: seq_len}
         for k, v in example_kwargs.items()
     }
-    model = prepare_from_args(model, args, (), example_kwargs, dynamic_shapes)
+    if args.bf16:
+        model.bfloat16()
+    quantizer = get_default_quantizer(
+        input_activation=args.activation,
+        weight=args.weight,
+        bias=args.bias,
+        error=args.error,
+        random_hadamard_transform=args.random_hadamard_transform,
+    )
+    model = prepare_training(
+        model.train(),
+        quantizer,
+        (),
+        example_kwargs,
+        dynamic_shapes,
+        args.merge_linears,
+        args.backward_override,
+    )
     refitter = None
     if args.codebook_refit_steps:
         refitter = CodebookRefitter(

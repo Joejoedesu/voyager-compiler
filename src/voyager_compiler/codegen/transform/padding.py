@@ -385,6 +385,7 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
         propagate_shape(input.args[0])
         propagate_shape(input)
         propagate_shape(scale)
+        _propagate_readers(model, input.args[0])
     else:
         node.replace_input_with(node_to_pad, new_input)
 
@@ -393,6 +394,26 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
                 scale,
                 _hoist_pad_above_repeat(model, scale, pad_scale, 0, fold_cache),
             )
+
+
+def _propagate_readers(model, node):
+    """Re-propagate the shapes of the ops reading ``node`` after its input
+    was padded, down to the GEMMs reading them, which pad themselves.
+
+    A quantized tensor another reader shares, such as a QAT backward GEMM
+    reading a weight's ``quantize_mx`` through ``dequantize_mx``, grows with
+    the pad.
+    """
+    reached, pending = set(), [*node.users]
+    while pending:
+        user = pending.pop()
+        if user in reached or is_gemm_op(user):
+            continue
+        reached.add(user)
+        pending.extend(user.users)
+    order = {n: i for i, n in enumerate(model.graph.nodes)}
+    for user in sorted(reached, key=order.__getitem__):
+        propagate_shape(user)
 
 
 def _crossable(node, user, slice_args):
@@ -526,13 +547,23 @@ def pad_matrix_op_dimensions(
             padding_oc = padding_ic
             padding_ic = padding_ic_scale = 0
 
+        if is_conv:
+            ic_dim, oc_dim = -3, -4  # (out, in, kH, kW)
+        elif is_mm:
+            ic_dim, oc_dim = -2, -1  # (in, out)
+        else:
+            ic_dim, oc_dim = -1, -2  # (out, in)
+        if not is_conv:
+            # The weight pads its own contraction to the input's padded
+            # size: one another GEMM already padded, as a quantized weight
+            # both read, is longer than the input.
+            weight_ic = weight.shape[ic_dim]
+            padding_ic = ic + padding_ic - weight_ic
+            padding_ic_scale = (weight_ic + padding_ic) // bs - math.ceil(
+                weight_ic / bs
+            )
+
         if padding_ic or padding_oc:
-            if is_conv:
-                ic_dim, oc_dim = -3, -4  # (out, in, kH, kW)
-            elif is_mm:
-                ic_dim, oc_dim = -2, -1  # (in, out)
-            else:
-                ic_dim, oc_dim = -1, -2  # (out, in)
             ndim = len(weight.shape)
             pad_input_node(
                 model,

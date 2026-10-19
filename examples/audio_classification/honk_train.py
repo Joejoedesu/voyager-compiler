@@ -22,7 +22,8 @@ from honk_model import SpeechResModel, configs
 from voyager_compiler import (
     add_experiment_args,
     disable_observers,
-    prepare_from_args,
+    get_default_quantizer,
+    prepare_for_qat,
     with_execution_context,
 )
 
@@ -294,8 +295,21 @@ def main(args):
         example_args = (batch["input_values"].to(device),)
         batch_size = torch.export.Dim("batch", max=args.batch_size)
         dynamic_shapes = {"x": {0: batch_size}}
-        model = prepare_from_args(
-            model, args, example_args, dynamic_shapes=dynamic_shapes
+        if args.bf16:
+            model.bfloat16()
+        quantizer = get_default_quantizer(
+            input_activation=args.activation,
+            weight=args.weight,
+            bias=args.bias,
+            random_hadamard_transform=args.random_hadamard_transform,
+        )
+        model = prepare_for_qat(
+            model.train(),
+            quantizer,
+            example_args,
+            None,
+            dynamic_shapes,
+            args.merge_linears,
         )
 
     if args.model_id is not None:

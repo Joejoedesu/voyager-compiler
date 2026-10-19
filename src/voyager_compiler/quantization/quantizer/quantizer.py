@@ -91,7 +91,7 @@ class DerivedQuantizationSpec(QuantizationSpecBase):
     derive_qparams_fn: Callable[
         [List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]
     ]
-    dtype: str
+    dtype: Optional[str]
     quant_min: Optional[int] = None
     quant_max: Optional[int] = None
     qscheme: Optional[QScheme] = None

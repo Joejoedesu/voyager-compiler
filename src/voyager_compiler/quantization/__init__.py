@@ -32,7 +32,11 @@ from voyager_compiler.quantization.codebook_optimizer import (
     optimal_codebooks,
     refit_window,
 )
-from voyager_compiler.quantization.qspec import QScheme, parse_codebook_dtype
+from voyager_compiler.quantization.qspec import (
+    DEFAULT_AMAX_HISTORY_LEN,
+    QScheme,
+    parse_codebook_dtype,
+)
 from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
@@ -48,13 +52,15 @@ from voyager_compiler.quantization.quantize_pt2e import (
     swap_matmul_inputs,
 )
 from voyager_compiler.quantization.training import (
+    DEFAULT_BACKWARD_OVERRIDE,
+    BACKWARD_OVERRIDES,
     TrainingQuantizers,
     TrainingStep,
     capture_training,
     disable_observers,
     gemm_partners,
     gradient_program,
-    prepare_from_args,
+    prepare_for_qat,
     prepare_training,
     return_gradients,
     update_program,
@@ -70,6 +76,9 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 __all__ = [
     "CACHE_RESERVE",
     "CodebookRefitter",
+    "DEFAULT_AMAX_HISTORY_LEN",
+    "DEFAULT_BACKWARD_OVERRIDE",
+    "BACKWARD_OVERRIDES",
     "Weighting",
     "Histogram",
     "DerivedQuantizationSpec",
@@ -102,7 +111,7 @@ __all__ = [
     "load_codebooks",
     "optimal_codebooks",
     "parse_codebook_dtype",
-    "prepare_from_args",
+    "prepare_for_qat",
     "prepare_pt2e",
     "prepare_qat_pt2e",
     "prepare_training",

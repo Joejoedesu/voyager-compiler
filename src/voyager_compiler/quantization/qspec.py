@@ -16,6 +16,7 @@ from enum import Enum
 from typing import NamedTuple, Optional, Tuple
 
 __all__ = [
+    "DEFAULT_AMAX_HISTORY_LEN",
     "FloatFormat",
     "QScheme",
     "float_format",
@@ -24,6 +25,10 @@ __all__ = [
     "parse_spec_fields",
     "posit_format",
 ]
+
+
+# How many past amaxes a per-tensor or per-channel scale is taken over.
+DEFAULT_AMAX_HISTORY_LEN = 64
 
 
 class QScheme(Enum):
@@ -263,6 +268,6 @@ def parse_spec_fields(s: str) -> dict:
             QScheme.PER_TENSOR_SYMMETRIC,
             QScheme.PER_CHANNEL_SYMMETRIC,
         ]:
-            params.setdefault("amax_history_len", 16)
+            params.setdefault("amax_history_len", DEFAULT_AMAX_HISTORY_LEN)
 
     return params

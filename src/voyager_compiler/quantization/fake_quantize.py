@@ -816,7 +816,7 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
 
     def __init__(
         self,
-        dtype: torch.dtype,
+        dtype: Optional[str],
         obs_or_fqs: List[ObserverOrFakeQuantize],
         derive_qparams_fn: Callable[
             [List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]
@@ -825,19 +825,17 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
         super().__init__()
         self.obs_or_fqs = obs_or_fqs
         self.derive_qparams_fn = derive_qparams_fn
-        self.register_buffer(
-            "qmap", get_quantization_map(dtype), persistent=False
-        )
+        qmap = None if dtype is None else get_quantization_map(dtype)
+        self.register_buffer("qmap", qmap, persistent=False)
         self.disable_observer()
         self.dtype = dtype
 
     def forward(self, x: Tensor) -> Tensor:
-        devices = {p.device for p in self.buffers()}
-        if len(devices) != 1 or next(iter(devices)) != x.device:
-            self.to(x.device)
-
         if not self.fake_quant_enabled:
             return x
+        if self.qmap is None:
+            scale = self.calculate_qparams().to(x.dtype)
+            return x / scale * scale
         return ops.fake_quant(x, self.qmap, self.calculate_qparams())
 
     def calculate_qparams(self):

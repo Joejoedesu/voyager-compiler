@@ -35,6 +35,7 @@ from voyager_compiler.codegen.transform.tiling.grid_search import gemv_op_tiling
 from voyager_compiler.codegen.transform.tiling.lowering import (
     matrix_layer,
     mha_head,
+    row_block,
 )
 from voyager_compiler.codegen.transform.tiling.runtime_model import (
     GridSpace,
@@ -150,7 +151,17 @@ def _prepare_search(node, tiler, constraint):
             constraint
         )
 
+    # A microscaling tile holds whole blocks: the contraction tile of MX
+    # operands, and the row tile of a quantize_mx tail blocking along rows.
     layer = matrix_layer(anchor)
+    multiple = []
+    if (block := anchor.kwargs.get("block_size")) is not None:
+        multiple.append((le.IC, min(block, layer.nifm)))
+    if (block := row_block(node)) is not None:
+        multiple.append((le.OX, min(block, layer.wofm)))
+    if multiple:
+        constraint = TileConstraint(multiple=tuple(multiple)).merged(constraint)
+
     logger.info(
         f"[interstellar] {anchor.name}: "
         f"IC={layer.nifm} OC={layer.nofm} "

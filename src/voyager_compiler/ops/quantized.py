@@ -450,7 +450,8 @@ def quantize(
             table indexed by the bfloat16 bit pattern; a smaller one is a
             codebook, searched for the nearest entry. A 2-D codebook
             carries one row per attention head (or head group), a 3-D one
-            a row per group of channels along the last axis.
+            a row per group of channels along the last axis. None only
+            scales, keeping the input's dtype.
         output_code (torch.Tensor): codebook for quantizing the output
         seed (torch.Tensor): int64 scalar keying stochastic rounding
             (``_stochastic_round``) against a ``qmap`` of values -- a table
@@ -461,8 +462,6 @@ def quantize(
         parameters are not stored in the Tensor, we are storing them in
         function arguments instead
     """
-    assert qmap is not None, "qmap must be provided for quantization"
-
     if block_size is not None:
         scale = expand(scale, input.shape, block_size)
         if zero_point is not None:
@@ -473,6 +472,8 @@ def quantize(
     else:
         input = input / scale + zero_point
 
+    if qmap is None:
+        return input
     if seed is not None:
         return _stochastic_round(input, qmap, seed)
 
@@ -1078,6 +1079,48 @@ def quantize_mx(
         input, element_scale, None, axes, block_size, qmap, output_code, seed
     )
     return scale, input
+
+
+quantized_ops_lib.define(
+    "dequantize_mx(Tensor self, Tensor scale, int block_size, "
+    "Tensor? code=None, Tensor? global_scale=None) -> Tensor"
+)
+
+
+@impl(quantized_ops_lib, "dequantize_mx", "CompositeExplicitAutograd")
+def dequantize_mx(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int,
+    code: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Read ``quantize_mx``'s codes back as values.
+
+    Args:
+        input: The codes: values, or a codebook's indices.
+        scale: One scale per block, as ``quantize_mx`` returns it.
+        block_size: Elements per block along the blocked axis.
+        code: The codebook ``input`` indexes, or None.
+        global_scale: The scale ``quantize_mx`` left out of ``scale``, or
+            None.
+
+    Returns:
+        The values, each its code's entry times its block's scale and the
+        global scale.
+    """
+    output = _dequantize_mx(input, scale, code, block_size)
+    if global_scale is not None:
+        output = output * global_scale
+    return output
+
+
+@torch.library.register_fake("quantized_ops::dequantize_mx")
+def _(input, scale, block_size, code=None, global_scale=None):
+    dtype = torch.promote_types(input.dtype, scale.dtype)
+    if global_scale is not None:
+        dtype = torch.promote_types(dtype, global_scale.dtype)
+    return input.new_empty(input.shape, dtype=dtype)
 
 
 quantized_ops_lib.define(

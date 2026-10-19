@@ -22,9 +22,40 @@ from voyager_compiler.quantization.quantizer.quantizer import (
 )
 
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
+# The fused attention ops a joint training graph traces
+# ``scaled_dot_product_attention`` into; each reads the query, key and value
+# first.
+FUSED_SDPA = (
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+)
+# Their backwards; each reads the forward's query, key and value as its
+# arguments 1 to 3.
+FUSED_SDPA_BACKWARD = (
+    torch.ops.aten._scaled_dot_product_flash_attention_backward.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention_backward.default,
+    torch.ops.aten._scaled_dot_product_cudnn_attention_backward.default,
+    torch.ops.aten._scaled_dot_product_flash_attention_for_cpu_backward.default,
+)
 # ``split_kv_cache`` spells a decode graph's attention as the twin, with its
 # residual operands; it takes the same annotation.
-_SDPA_OPS = (_SDPA, torch.ops.quantized_ops.sdpa_mx.default)
+_SDPA_OPS = (
+    _SDPA,
+    torch.ops.quantized_ops.sdpa_mx.default,
+    *FUSED_SDPA,
+    *FUSED_SDPA_BACKWARD,
+)
+
+
+def object_type(node: Node):
+    """The op ``node`` calls, a fused attention op or its backward counting
+    as ``scaled_dot_product_attention``, so a config set on it reaches the
+    attention of a joint training graph."""
+    if node.target in (*FUSED_SDPA, *FUSED_SDPA_BACKWARD):
+        return _SDPA
+    return node.target
 
 
 # In the absence of better name, just winging it with QuantizationConfig
@@ -337,7 +368,9 @@ def _annotate_sdpa(
     contracts along its last axis, so its blocks go there rather than on
     the axis the spec names for a ``[contraction, out]`` operand; the value
     contracts along the keys, as the spec says.  The probabilities are
-    quantized inside the attention kernel with the query's spec."""
+    quantized inside the attention kernel with the query's spec.  A fused
+    attention's backward reads its forward's query, key and value, and,
+    annotated alike, reads them through the forward's fake-quants."""
     annotated_partitions = []
     input_act_qspec = quantization_config.input_activation
     output_act_qspec = quantization_config.output_activation
@@ -353,7 +386,12 @@ def _annotate_sdpa(
         if _is_annotated([node]):
             continue
 
-        query, key, value = node.args[:3]
+        operands = (
+            node.args[1:4]
+            if node.target in FUSED_SDPA_BACKWARD
+            else node.args[:3]
+        )
+        query, key, value = operands
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map={
                 query: input_act_qspec,
