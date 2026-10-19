@@ -14,6 +14,7 @@
 # limitations under the License.
 """ Finetuning a 🤗 Transformers model for sequence classification on GLUE."""
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -53,6 +54,11 @@ from voyager_compiler import (
     add_experiment_args,
     prepare_from_args,
     with_execution_context,
+)
+from voyager_compiler.quantization import (
+    CodebookRefitter,
+    Weighting,
+    refit_window,
 )
 
 
@@ -206,6 +212,32 @@ def parse_args():
         "--ignore_mismatched_sizes",
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
+    )
+    parser.add_argument(
+        "--codebook_refit_steps",
+        type=int,
+        default=0,
+        help="Refit the forward lookup tables every this many steps; 0 never.",
+    )
+    parser.add_argument(
+        "--codebook_collect_steps",
+        type=int,
+        default=4,
+        help="Steps before each refit its statistics are collected over.",
+    )
+    parser.add_argument(
+        "--codebook_weighting",
+        choices=[Weighting.PARTNER.value, Weighting.FISHER_ACTIVATIONS.value],
+        default=Weighting.PARTNER.value,
+        help=(
+            "What weights each sample of a refit: the partner's channel "
+            "energy, or the activations' own loss-gradient Fisher diagonal."
+        ),
+    )
+    parser.add_argument(
+        "--codebook_refit_gradients",
+        action="store_true",
+        help="Refit the gradients' lookup tables too.",
     )
     add_experiment_args(parser)
     args = parser.parse_args()
@@ -483,6 +515,13 @@ def main(args):
         for k, v in example_kwargs.items()
     }
     model = prepare_from_args(model, args, (), example_kwargs, dynamic_shapes)
+    refitter = None
+    if args.codebook_refit_steps:
+        refitter = CodebookRefitter(
+            model,
+            weighting=Weighting(args.codebook_weighting),
+            refit_gradients=args.codebook_refit_gradients,
+        )
 
     num_params = sum(p.numel() for p in model.parameters())
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -669,11 +708,22 @@ def main(args):
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss
-            total_loss += loss.detach().float()
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+            window = (
+                refit_window(
+                    refitter,
+                    completed_steps,
+                    args.codebook_refit_steps,
+                    args.codebook_collect_steps,
+                )
+                if refitter is not None
+                else contextlib.nullcontext()
+            )
+            with window:
+                outputs = model(**batch)
+                loss = outputs.loss
+                total_loss += loss.detach().float()
+                loss = loss / args.gradient_accumulation_steps
+                loss.backward()
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
                 optimizer.step()
@@ -681,6 +731,15 @@ def main(args):
                 optimizer.zero_grad()
                 progress_bar.update(1)
                 completed_steps += 1
+                if (
+                    refitter is not None
+                    and completed_steps % args.codebook_refit_steps == 0
+                ):
+                    fitted = refitter.refit()
+                    logger.info(
+                        f"refit {len(fitted)} codebooks at step "
+                        f"{completed_steps}"
+                    )
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:

@@ -3,7 +3,9 @@
 Everything runs through PT2E (``quantize_pt2e``), configured with the
 comma-separated spec strings ``QuantizationSpec.from_str`` parses.
 Training -- QAT, or with the backward pass quantized too -- is set up by
-``training``.
+``training``.  The fake-quants and the codebook fit run ops of their own,
+``torch.ops.quantization.*`` (``ops``), which importing the package
+registers.
 """
 
 from voyager_compiler.quantization.fake_quantize import (
@@ -25,6 +27,7 @@ from voyager_compiler.quantization.codebook_optimizer import (
     Histogram,
     codebook_qmaps,
     fit_codebooks,
+    in_refit_window,
     load_codebooks,
     optimal_codebooks,
     refit_window,
@@ -46,12 +49,14 @@ from voyager_compiler.quantization.quantize_pt2e import (
 )
 from voyager_compiler.quantization.training import (
     TrainingQuantizers,
+    TrainingStep,
     capture_training,
     disable_observers,
     gemm_partners,
     gradient_program,
     prepare_from_args,
     prepare_training,
+    return_gradients,
     update_program,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
@@ -76,6 +81,7 @@ __all__ = [
     "QuantizationConfig",
     "QuantizationSpec",
     "TrainingQuantizers",
+    "TrainingStep",
     "capture_training",
     "codebook_qmaps",
     "compensate_weight",
@@ -92,6 +98,7 @@ __all__ = [
     "get_quantization_map",
     "gptq",
     "gradient_program",
+    "in_refit_window",
     "load_codebooks",
     "optimal_codebooks",
     "parse_codebook_dtype",
@@ -100,6 +107,7 @@ __all__ = [
     "prepare_qat_pt2e",
     "prepare_training",
     "refit_window",
+    "return_gradients",
     "set_batch_norm_training",
     "set_training",
     "sink_obs_or_fq",

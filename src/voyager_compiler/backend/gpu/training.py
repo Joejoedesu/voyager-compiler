@@ -77,7 +77,7 @@ from .nvfp4 import (
 )
 from .rmsnorm import fuse_rmsnorm_backward
 
-__all__ = ["lower_training", "return_gradients"]
+__all__ = ["lower_training"]
 
 aten = torch.ops.aten
 
@@ -86,7 +86,6 @@ QUANTIZE_MX_TRANSPOSE = torch.ops.quantized_ops.quantize_mx_transpose.default
 # The indices of ``quantize_mx_transpose``'s row-wise scale and codes; the
 # transpose's follow them.
 PAIR_ROWS = (0, 1)
-CONVERT_ELEMENT_TYPE = torch.ops.prims.convert_element_type.default
 # Stores a tensor in one buffer of the given strides; Inductor gives each
 # GEMM reading a tensor it has not stored a copy of its own.
 FORCE_STRIDES = torch.ops.prims.inductor_force_stride_order.default
@@ -566,39 +565,3 @@ def lower_training(program: GraphModule) -> Dict[str, str]:
     graph.lint()
     program.recompile()
     return lowered
-
-
-def return_gradients(program: GraphModule) -> List[str]:
-    """Make a gradient program return its gradients after the loss instead
-    of copying them into its gradient buffers, in place.  Each ``copy_``
-    into a ``<name>_grad`` input becomes an output, in the input's dtype,
-    and the input goes.
-
-    Args:
-        program: A program ``gradient_program`` built.
-
-    Returns:
-        Each output gradient's parameter name, as the program's inputs spell
-        it, in output order.
-    """
-    graph = program.graph
-    output = graph.output_node()
-    names, gradients = [], []
-    for copy in graph.find_nodes(op="call_function", target=aten.copy_.default):
-        buffer, gradient = copy.args
-        if buffer.op != "placeholder" or not buffer.name.endswith("_grad"):
-            continue
-        # A conversion to the dtype it already has is no op to Inductor.
-        with graph.inserting_before(copy):
-            gradient = graph.call_function(
-                CONVERT_ELEMENT_TYPE, (gradient, buffer.meta["val"].dtype)
-            )
-        gradient.meta["val"] = buffer.meta["val"]
-        names.append(buffer.name.removesuffix("_grad"))
-        gradients.append(gradient)
-        graph.erase_node(copy)
-        graph.erase_node(buffer)
-    output.args = ((*output.args[0], *gradients),)
-    graph.lint()
-    program.recompile()
-    return names

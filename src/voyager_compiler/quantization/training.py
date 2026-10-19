@@ -26,8 +26,11 @@ split saves when the backward reads it.
 For the compiler, a training step is two graphs: ``gradient_program`` runs
 the forward, the loss and the backward, and ``update_program`` the
 optimizer's update.  Each writes the tensors it updates in place.
+``TrainingStep`` runs the first on the model, eagerly or compiled by
+``torch.compile``.
 """
 
+import contextlib
 import copy
 import operator
 import types
@@ -43,6 +46,7 @@ from torch._functorch._aot_autograd.descriptors import (
     GradAOTOutput,
     ParamAOTInput,
     PlainAOTInput,
+    PlainAOTOutput,
     TangentAOTInput,
 )
 from torch._functorch.aot_autograd import (
@@ -65,13 +69,14 @@ from voyager_compiler.export_utils import (
     export_model,
     merge_sibling_linears,
 )
-from voyager_compiler.ops import HADAMARD_SIZE
+from voyager_compiler.ops import EAGER_NUMERICS, HADAMARD_SIZE
 from voyager_compiler.quantization.fake_quantize import (
     SEED_BOUND,
     FusedAmaxObsFakeQuantize,
+    GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
-    RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
+    calculate_global_scale,
 )
 from voyager_compiler.quantization.quantize_pt2e import (
     _get_obs_or_fq_map,
@@ -90,12 +95,14 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
 
 __all__ = [
     "TrainingQuantizers",
+    "TrainingStep",
     "capture_training",
     "disable_observers",
     "gemm_partners",
     "gradient_program",
     "prepare_from_args",
     "prepare_training",
+    "return_gradients",
     "update_program",
 ]
 
@@ -139,13 +146,16 @@ def _quantized_once(spec: QuantizationSpec) -> bool:
     return spec.qscheme in (None, QScheme.PER_TENSOR_SYMMETRIC)
 
 
-def _fake_quantize(fake_quant: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Apply ``fake_quant`` to ``x``.
+def _fake_quantize(
+    fake_quant: nn.Module, x: torch.Tensor, **kwargs
+) -> torch.Tensor:
+    """Apply ``fake_quant`` to ``x``, passing it ``kwargs``.
 
     The graph node calling a fake-quant: AOTAutograd's split keeps a
-    ``call_function``, where it drops a ``call_module``.
+    ``call_function``, where it drops a ``call_module``.  ``kwargs`` holds a
+    global scale ``_share_global_scales`` shares, if any.
     """
-    return fake_quant(x)
+    return fake_quant(x, **kwargs)
 
 
 class TrainingQuantizers(nn.Module):
@@ -495,15 +505,16 @@ def capture_training(
     given, rewrites the joint graph before AOTAutograd splits it into the
     forward graph and the backward graph that differentiates it.
     ``model.forward.graphs`` holds the ``"joint"``, ``"forward"`` and
-    ``"backward"`` graphs, and ``model``'s forward is replaced to run the
-    last two.  Parameters stay the
-    model's own, so optimizers, checkpoints and ``train()`` / ``eval()``
-    work as on the eager model: ``eval()`` switches the graphs' dropouts
-    off, and under ``torch.no_grad()`` the outputs come back detached.
-    Moving or casting the model, and choosing which parameters require
-    grad, must come before this call.  If capture fails, ``model`` is left
-    as it was.  A deep copy of a captured model still runs the original's
-    graphs, and pickling one fails.
+    ``"backward"`` graphs, ``model.forward.in_spec`` and ``out_spec`` the
+    pytree specs of the export's inputs and outputs, and ``model``'s forward
+    is replaced to run the last two graphs.  Parameters stay the model's
+    own, so optimizers, checkpoints and ``train()`` / ``eval()`` work as on
+    the eager model: ``eval()`` switches the graphs' dropouts off, and under
+    ``torch.no_grad()`` the outputs come back detached.  Moving or casting
+    the model, and choosing which parameters require grad, must come before
+    this call.  If capture fails, ``model`` is left as it was.  A deep copy
+    of a captured model still runs the original's graphs, and pickling one
+    fails.
 
     Args:
         model: Module to capture, in training mode.
@@ -633,6 +644,7 @@ def capture_training(
         return pytree.tree_unflatten(outputs, out_spec)
 
     forward.graphs = graphs
+    forward.in_spec, forward.out_spec = in_spec, out_spec
     model.forward = forward
 
 
@@ -957,6 +969,7 @@ def rotation_input(node: Node) -> Optional[Tuple[Node, int, Node]]:
     return source, runs.args[1], matrices[side]
 
 
+_CONVERT_ELEMENT_TYPE = torch.ops.prims.convert_element_type.default
 _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
 _QUANTIZE_MX_TRANSPOSE = torch.ops.quantized_ops.quantize_mx_transpose.default
 # The views that keep a tensor's elements in order.
@@ -1253,7 +1266,7 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     for node in calls:
         fake_quant = program.get_submodule(node.args[0].target)
         if (
-            isinstance(fake_quant, RandomHadamardTransform)
+            isinstance(fake_quant, MXFakeQuantize)
             and fake_quant.fake_quant_enabled
             and fake_quant.rht_axis is not None
         ):
@@ -1362,26 +1375,39 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     program.delete_all_unused_submodules()
 
 
-def gradient_program(model: nn.Module) -> GraphModule:
+def gradient_program(
+    model: nn.Module, lower_fake_quants: bool = True
+) -> GraphModule:
     """The forward, the loss and the backward of a training step, as a graph.
 
     Built from the joint graph ``capture_training`` captured from ``model``,
-    whose forward returns only the loss.  The loss's incoming gradient is 1,
-    and each parameter's gradient is written in place into a buffer of its
-    own.  A parameter is named after its module path (``fc1.weight`` becomes
-    ``fc1_weight``), a tied one after its first, and its gradient buffer
-    after it, with ``_grad``.  The fake-quants of a model
-    ``prepare_training`` prepared become the ops that quantize.
+    whose forward returns the loss, alone or as the ``loss`` of its output,
+    such as a Hugging Face ``ModelOutput``.  The program returns the loss
+    and starts the backward from a loss gradient of 1.  The other outputs,
+    such as the logits, are dropped, and their gradient is zero: where it is
+    added to another gradient, as the logits' is to the one the loss sends
+    them, the sum is just that other gradient.  Each parameter's gradient
+    is written in place into a buffer of its own.  A parameter is named
+    after its module path (``fc1.weight`` becomes ``fc1_weight``), a tied
+    one after its first, and its gradient buffer after it, with ``_grad``.
+    The fake-quants of a model ``prepare_training`` prepared become the ops
+    that quantize, or with ``lower_fake_quants`` off stay calls to the
+    model's own fake-quants, so a change to them, such as a refit lookup
+    table, reaches the program.  Which of them share a global scale
+    (``_share_global_scales``) is decided once, when the program is built,
+    from their element and scale maxima, global-scale flags and transforms.
 
     Args:
         model: Model captured by ``capture_training``.
+        lower_fake_quants: Lower the fake-quants to the ops that quantize.
 
     Returns:
         A graph taking the parameters, the model's inputs and one gradient
         buffer per trainable parameter, in that order, and returning the loss.
 
     Raises:
-        ValueError: ``model``'s forward returns more than the loss.
+        NotImplementedError: A dropped output's gradient is used other than
+            added, unscaled, to a gradient of the sum's shape and dtype.
     """
     joint = model.forward.graphs["joint"]
     paths = {id(m): name for name, m in model.named_modules()}
@@ -1398,16 +1424,14 @@ def gradient_program(model: nn.Module) -> GraphModule:
         ):
             # As the fake-quant's first call starts it.
             module.start_history((), operand.meta["val"].dtype)
-    program = copy.deepcopy(joint)
+    # Unlowered, the program calls the model's own fake-quants; lowering
+    # rewrites copies of them.
+    shared = {} if lower_fake_quants else {id(m): m for m in joint.children()}
+    program = copy.deepcopy(joint, shared)
     graph = program.graph
     # The joint graph takes its inputs as two lists, primals and tangents.
     graph._codegen = CodeGen()
     placeholders = [n for n in graph.nodes if n.op == "placeholder"]
-    tangents = [
-        n for n in placeholders if isinstance(n.meta["desc"], TangentAOTInput)
-    ]
-    if len(tangents) != 1:
-        raise ValueError("The model's forward must return only the loss")
     # A tensor under several names, such as tied embeddings, takes the first,
     # as ``named_parameters`` and so ``update_program`` name it.
     tensors = [
@@ -1433,30 +1457,60 @@ def gradient_program(model: nn.Module) -> GraphModule:
             node._rename(name)
             node.target = node.name
 
-    (tangent,) = tangents
-    last = placeholders[-1]
-    with graph.inserting_after(last):
-        one = graph.call_function(
-            aten.full.default,
-            ([], 1.0),
-            {
-                "dtype": tangent.meta["val"].dtype,
-                "device": tangent.meta["val"].device,
-            },
-        )
-    one.meta["val"] = tangent.meta["val"]
-    tangent.replace_all_uses_with(one)
-    graph.erase_node(tangent)
-
+    # The loss's position among the forward's flattened outputs: rebuilding
+    # the output with each leaf replaced by its position, 0, 1, ..., puts
+    # the loss's position where the loss was.
+    out_spec = model.forward.out_spec
+    structure = pytree.tree_unflatten(range(out_spec.num_leaves), out_spec)
+    index = structure if isinstance(structure, int) else structure.loss
     output = graph.output_node()
-    loss = []
+    (loss,) = [
+        value
+        for value, desc in zip(output.args[0], output.meta["desc"])
+        if isinstance(desc, PlainAOTOutput) and desc.idx == index
+    ]
+    for tangent in placeholders:
+        desc = tangent.meta["desc"]
+        if not isinstance(desc, TangentAOTInput):
+            continue
+        if desc.output.idx == index:
+            with graph.inserting_after(placeholders[-1]):
+                one = graph.call_function(
+                    aten.full.default,
+                    ([], 1.0),
+                    {
+                        "dtype": tangent.meta["val"].dtype,
+                        "device": tangent.meta["val"].device,
+                    },
+                )
+            one.meta["val"] = tangent.meta["val"]
+            tangent.replace_all_uses_with(one)
+        else:
+            # A dropped output's gradient is zero, so a sum it joins is the
+            # other term -- when the sum neither scales that term (alpha)
+            # nor broadcasts or casts it.
+            for add in list(tangent.users):
+                others = [a for a in add.args if a is not tangent]
+                if (
+                    add.target is aten.add.Tensor
+                    and not add.kwargs
+                    and len(others) == 1
+                    and isinstance(others[0], Node)
+                ):
+                    value, total = others[0].meta["val"], add.meta["val"]
+                    if (value.shape, value.dtype) == (total.shape, total.dtype):
+                        add.replace_all_uses_with(others[0])
+                        graph.erase_node(add)
+            if tangent.users:
+                raise NotImplementedError(
+                    "A dropped output's gradient may only be added, "
+                    "unscaled, to a gradient of the sum's shape and dtype"
+                )
+        graph.erase_node(tangent)
+
     grads = {}
     for value, desc in zip(output.args[0], output.meta["desc"]):
-        if value is None:
-            continue
-        if not isinstance(desc, GradAOTOutput):
-            loss.append(value)
-        else:
+        if value is not None and isinstance(desc, GradAOTOutput):
             name = _parameter_name(canonical[desc.grad_of.target])
             grads.setdefault(name, []).append(value)
     for name, values in grads.items():
@@ -1473,11 +1527,311 @@ def gradient_program(model: nn.Module) -> GraphModule:
                 total = graph.call_function(aten.add.Tensor, (total, value))
                 total.meta["val"] = values[0].meta["val"]
             graph.call_function(aten.copy_.default, (buffer, total))
-    output.args = (tuple(loss),)
+    output.args = ((loss,),)
     graph.eliminate_dead_code()
-    _lower_fake_quants(program, names)
+    if lower_fake_quants:
+        _lower_fake_quants(program, names)
+    else:
+        _share_global_scales(program)
     program.recompile()
     return program
+
+
+def _share_global_scales(program: GraphModule) -> None:
+    """Compute each tensor's global scale once for all its fake-quants.
+
+    A tensor is fake-quantized once per orientation its GEMMs read it in,
+    as it is or through views.  Microscaling fake-quants of one tensor that
+    divide by a global scale (``calculate_global_scale``) with the same
+    element and scale maxima, and that quantize the tensor itself, neither
+    rotated nor with outliers zeroed, take one global scale computed from
+    the tensor: a max is the same in any order.
+
+    Args:
+        program: A gradient program with its fake-quants unlowered,
+            rewritten in place.
+    """
+    graph = program.graph
+    groups = {}
+    for node in graph.nodes:
+        if node.target is not _fake_quantize:
+            continue
+        fake_quant_attr, source = node.args
+        fake_quant = program.get_submodule(fake_quant_attr.target)
+        if not (
+            isinstance(fake_quant, MXFakeQuantize)
+            and fake_quant.global_scale
+            and fake_quant.rht_axis is None
+            and fake_quant.outlier_threshold is None
+        ):
+            continue
+        while source.target in _VIEWS:
+            source = source.args[0]
+        key = (source, fake_quant.quant_max, fake_quant.scale_max)
+        groups.setdefault(key, []).append(node)
+    for (source, quant_max, scale_max), calls in groups.items():
+        if len(calls) < 2:
+            continue
+        with graph.inserting_before(calls[0]):
+            scale = graph.call_function(
+                calculate_global_scale, (source, quant_max, scale_max)
+            )
+        for node in calls:
+            node.kwargs = {"global_scale": scale}
+
+
+def return_gradients(program: GraphModule) -> List[str]:
+    """Make a gradient program return its gradients after the loss instead
+    of copying them into its gradient buffers, in place.  Each ``copy_``
+    into a ``<name>_grad`` input becomes an output, in the input's dtype,
+    and the input goes.
+
+    Args:
+        program: A program ``gradient_program`` built.
+
+    Returns:
+        Each output gradient's parameter name, as the program's inputs spell
+        it, in output order.
+    """
+    graph = program.graph
+    output = graph.output_node()
+    names, gradients = [], []
+    for write in graph.find_nodes(
+        op="call_function", target=aten.copy_.default
+    ):
+        buffer, gradient = write.args
+        if buffer.op != "placeholder" or not buffer.name.endswith("_grad"):
+            continue
+        # A conversion to the dtype it already has is no op to Inductor.
+        with graph.inserting_before(write):
+            gradient = graph.call_function(
+                _CONVERT_ELEMENT_TYPE, (gradient, buffer.meta["val"].dtype)
+            )
+        gradient.meta["val"] = buffer.meta["val"]
+        names.append(buffer.name.removesuffix("_grad"))
+        gradients.append(gradient)
+        graph.erase_node(write)
+        graph.erase_node(buffer)
+    output.args = ((*output.args[0], *gradients),)
+    graph.lint()
+    program.recompile()
+    return names
+
+
+def split_weight_quantization(program: GraphModule) -> GraphModule:
+    """Move the quantization of ``program``'s weights into a program of its
+    own.
+
+    A weight's fake-quant -- a fake-quant call on a parameter or a view of
+    one -- reads the parameters alone, so its output serves every step until
+    they change.  Each such call becomes an input of ``program``, after its
+    others, unless it rounds stochastically, which draws afresh on every
+    call.  No gradient flows through a fake-quant here: the joint graph was
+    differentiated before the fake-quants went in.
+
+    Args:
+        program: A gradient program with its fake-quants unlowered,
+            rewritten in place.
+
+    Returns:
+        A program taking parameters, named as in ``program``, and returning
+        ``program``'s new inputs, in order.
+    """
+    graph = program.graph
+    calls = []
+    for node in graph.find_nodes(op="call_function", target=_fake_quantize):
+        fake_quant_attr, source = node.args
+        while source.target in _VIEWS:
+            source = source.args[0]
+        fake_quant = program.get_submodule(fake_quant_attr.target)
+        if isinstance(source.meta.get("desc"), ParamAOTInput) and not getattr(
+            fake_quant, "stochastic_rounding", False
+        ):
+            calls.append(node)
+    needed, pending = set(), list(calls)
+    while pending:
+        node = pending.pop()
+        if node not in needed:
+            needed.add(node)
+            pending.extend(node.all_input_nodes)
+    weights = Graph()
+    copies = {}
+    for node in graph.nodes:
+        if node in needed:
+            copies[node] = weights.node_copy(node, copies.__getitem__)
+    weights.output(tuple(copies[node] for node in calls))
+    last = graph.find_nodes(op="placeholder")[-1]
+    for node in calls:
+        with graph.inserting_after(last):
+            last = graph.placeholder(node.name)
+        last.meta["val"] = node.meta["val"]
+        node.replace_all_uses_with(last)
+        graph.erase_node(node)
+    graph.eliminate_dead_code()
+    program.recompile()
+    return GraphModule(program, weights)
+
+
+class TrainingStep:
+    """The loss and the gradients of a training step of ``model``.
+
+    A step runs eagerly -- the model's forward and ``loss.backward()`` -- or
+    as the model's ``gradient_program`` under ``torch.compile``.  The
+    compiled program keeps the fake-quants as calls to the model's own,
+    unless ``lower`` rewrites its quantized GEMMs as real kernels.  On a GPU
+    those fake-quants round as eager's do, but Inductor may sum reductions
+    in another order, so results can differ from eager's in the last bits,
+    which 4-bit rounding can amplify; on a CPU Inductor's kernels also round
+    differently.  Each call reads the model's parameters, buffers and
+    fake-quants afresh, so an optimizer's update, a refit lookup table or a
+    loaded checkpoint takes effect on the next one -- except inside
+    ``fixed_weights``, where the weights are quantized once for every
+    compiled step, and in a lowered program, which holds its lookup tables
+    as constants.  Compiled code runs no hooks: a step whose fake-quants
+    are hooked, as in a codebook refit window, must run eagerly
+    (``eager=True``).
+
+    Args:
+        model: Model to train, whose forward returns its loss as the
+            ``loss`` of its output; to compile, one ``prepare_training``
+            prepared.
+        compile: Run the steps the caller does not ask to run eagerly as the
+            compiled program; otherwise every step runs eagerly.
+        lower: Rewrites the program's quantized GEMMs as real kernels in
+            place, such as ``backend.gpu.lower_training``; None keeps the
+            fake-quants.
+
+    Raises:
+        NotImplementedError: A fake-quant the compiled program keeps changes
+            its state on every call: delayed scaling, group-wise affine,
+            which writes its scale and zero point, or an outlier filter
+            calibrating its threshold.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        compile: bool,
+        lower: Optional[Callable[[GraphModule], Any]] = None,
+    ) -> None:
+        self.model = model
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.program = None
+        # The quantized weights ``fixed_weights`` holds.
+        self.quantized = None
+        self.fixed = False
+        if not compile:
+            return
+        if lower is None:
+            # The fake-quants the program keeps must not update state.
+            for module in model.modules():
+                if isinstance(module, FusedAmaxObsFakeQuantize):
+                    raise NotImplementedError(
+                        "Delayed scaling updates its state on every call; "
+                        "compile the step lowered to real kernels instead"
+                    )
+                if isinstance(module, GroupWiseAffineFakeQuantize):
+                    raise NotImplementedError(
+                        "Group-wise affine writes its scale and zero point "
+                        "on every call; run the step eagerly instead"
+                    )
+                if (
+                    isinstance(module, MXFakeQuantize)
+                    and module.outlier_pct is not None
+                    and module.observer_enabled
+                ):
+                    raise NotImplementedError(
+                        "An outlier filter calibrating its threshold updates "
+                        "it on every call; disable its observer to compile"
+                    )
+        program = gradient_program(model, lower_fake_quants=lower is not None)
+        if lower is not None:
+            lower(program)
+        index = {name: i for i, name in enumerate(return_gradients(program))}
+        self.order = [
+            index[_parameter_name(name)]
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        ]
+        # Each input is a model input (None) or the (module, attribute) of a
+        # tensor of the model, read on every call.
+        sources = {}
+        for name, _ in [
+            *model.named_parameters(remove_duplicate=False),
+            *model.named_buffers(remove_duplicate=False),
+        ]:
+            path, _, attr = name.rpartition(".")
+            sources[_parameter_name(name)] = (model.get_submodule(path), attr)
+        self.inputs = [
+            sources.get(node.name)
+            for node in program.graph.find_nodes(op="placeholder")
+        ]
+        weights = split_weight_quantization(program)
+        self.weight_inputs = [
+            sources[node.name]
+            for node in weights.graph.find_nodes(op="placeholder")
+        ]
+        self.in_spec = model.forward.in_spec
+        options = EAGER_NUMERICS if lower is None else None
+        self.weights = torch.compile(weights, options=options)
+        self.program = torch.compile(program, options=options)
+
+    @contextlib.contextmanager
+    def fixed_weights(self):
+        """Quantize each weight once for the compiled steps run inside.
+
+        The first compiled step quantizes the weights and the rest reuse
+        them, so nothing a weight's fake-quant reads -- the parameters, a
+        lookup table -- may change inside.  Outside, each step quantizes
+        them afresh.  A weight that rounds stochastically draws afresh on
+        every step either way (``split_weight_quantization``).
+        """
+        self.fixed = True
+        try:
+            yield
+        finally:
+            self.fixed, self.quantized = False, None
+
+    def __call__(self, *args, eager: bool, **kwargs):
+        """Run a step on a batch.
+
+        Args:
+            *args: The model's positional inputs.
+            eager: Run this step eagerly, as a step whose fake-quants are
+                hooked must.
+            **kwargs: The model's keyword inputs.
+
+        Returns:
+            ``(loss, gradients)``: the loss, detached, and the gradients of
+            ``model``'s trainable parameters, in ``model.parameters()``
+            order.
+        """
+        if eager or self.program is None:
+            with torch.enable_grad():
+                loss = self.model(*args, **kwargs).loss
+                loss.backward()
+            grads = [p.grad for p in self.params]
+            for param in self.params:
+                param.grad = None
+            return loss.detach(), grads
+        flat = _check_inputs_match(args, kwargs, self.in_spec)
+        batch = (leaf for _, leaf in flat)
+        with torch.no_grad():
+            quantized = self.quantized
+            if quantized is None:
+                quantized = self.weights(
+                    *(getattr(*source) for source in self.weight_inputs)
+                )
+                if self.fixed:
+                    self.quantized = quantized
+            loss, *grads = self.program(
+                *(
+                    next(batch) if source is None else getattr(*source)
+                    for source in self.inputs
+                ),
+                *quantized,
+            )
+        return loss, [grads[i] for i in self.order]
 
 
 def update_program(

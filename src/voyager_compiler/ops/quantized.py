@@ -30,7 +30,15 @@ def _cuda_system_info_or_note():
 after_aot._cuda_system_info_comment = _cuda_system_info_or_note
 
 
-def _compile(fn, dynamic):
+# Inductor options under which a compiled kernel keeps eager's bfloat16
+# roundings and rounds every division correctly.
+EAGER_NUMERICS = {
+    "eager_numerics.division_rounding": True,
+    "emulate_precision_casts": True,
+}
+
+
+def compile_like_eager(fn, dynamic):
     """Return ``fn`` compiled with ``torch.compile`` to match eager.
 
     The compile keeps eager's bfloat16 roundings and rounds every division
@@ -48,10 +56,7 @@ def _compile(fn, dynamic):
         fn,
         dynamic=dynamic,
         recompile_limit=64,
-        options={
-            "eager_numerics.division_rounding": True,
-            "emulate_precision_casts": True,
-        },
+        options=EAGER_NUMERICS,
     )
 
 
@@ -60,10 +65,12 @@ def compiled_on_gpu(dynamic):
 
     For a function called directly.  An op registers its compiled kernel
     for the CUDA dispatch key instead, which fake and meta tensors never
-    reach.
+    reach.  Inside an outer ``torch.compile`` the function runs as written,
+    for the outer compile to trace.
 
     Args:
-        dynamic: ``torch.compile``'s ``dynamic``, as ``_compile`` takes it.
+        dynamic: ``torch.compile``'s ``dynamic``, as ``compile_like_eager``
+            takes it.
 
     Returns:
         A decorator.  The function it returns takes the decorated one's
@@ -71,10 +78,12 @@ def compiled_on_gpu(dynamic):
     """
 
     def decorate(fn):
-        compiled = _compile(fn, dynamic)
+        compiled = compile_like_eager(fn, dynamic)
 
         def run(input, *args):
-            return (compiled if input.is_cuda else fn)(input, *args)
+            if input.is_cuda and not torch.compiler.is_compiling():
+                return compiled(input, *args)
+            return fn(input, *args)
 
         return run
 
@@ -191,9 +200,6 @@ def _region_view(input: torch.Tensor, codebook: torch.Tensor):
     return input.reshape(split).permute(order), inverse
 
 
-# Inductor cannot lower ``searchsorted`` against boundaries computed in the
-# same graph, so under ``torch.compile`` this runs eagerly.
-@torch.compiler.disable
 def encode(
     input: torch.Tensor,
     codebook: torch.Tensor,
@@ -346,22 +352,33 @@ def _random_bytes(seed: torch.Tensor, shape, device) -> torch.Tensor:
     return ((words[..., None] >> shifts) & 0xFF).flatten()[:numel].view(shape)
 
 
-def _neighbors(value: torch.Tensor, qmap: torch.Tensor):
-    """The levels of ``qmap`` on either side of each element.
+def qmap_levels(qmap: torch.Tensor) -> torch.Tensor:
+    """The values a lookup table rounds to.
+
+    Args:
+        qmap: A value table of ``QMAP_SIZE`` entries.
+
+    Returns:
+        Its distinct finite entries in ascending order, as float32, with
+        one zero, +0.
+    """
+    table = qmap.float()
+    # ``torch.unique`` can keep -0 as the zero; adding 0 turns it into +0.
+    return torch.unique(table[torch.isfinite(table)]) + 0.0
+
+
+def _neighbors(value: torch.Tensor, levels: torch.Tensor):
+    """The levels on either side of each element.
 
     Args:
         value: float32 tensor, already divided by its scale.
-        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
+        levels: The levels, ascending, as float32.
 
     Returns:
         ``(value, low, high)``: each element saturated to the levels'
         range, the largest level below it and the smallest at or above
         it.  An element on a level is its own ``low`` and ``high``.
     """
-    table = qmap.float()
-    # A table's NaN bit patterns take its first entry, zero's level.
-    levels = torch.sort(torch.where(torch.isfinite(table), table, table[0]))
-    levels = levels.values
     value = value.clamp(levels[0], levels[-1])
     upper = torch.searchsorted(levels, value).clamp(max=levels.numel() - 1)
     high = levels[upper]
@@ -383,13 +400,16 @@ def _stochastic_round(
 
     Args:
         input: Tensor to round, already divided by its scale.
-        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
+        qmap: A value table of ``QMAP_SIZE`` entries, whose levels
+            (``qmap_levels``) are taken on every call, or the levels
+            themselves, ascending, as a 1-D codebook holds them.
         seed: int64 scalar keying the random bits.
 
     Returns:
         The rounded tensor, in ``input``'s dtype.
     """
-    value, low, high = _neighbors(input.float(), qmap)
+    levels = qmap_levels(qmap) if qmap.numel() == QMAP_SIZE else qmap
+    value, low, high = _neighbors(input.float(), levels.float())
     noise = _random_bytes(seed, input.shape, input.device) / 256
     near = torch.where(value < 0, high, low)
     far = torch.where(value < 0, low, high)
@@ -433,8 +453,8 @@ def quantize(
             a row per group of channels along the last axis.
         output_code (torch.Tensor): codebook for quantizing the output
         seed (torch.Tensor): int64 scalar keying stochastic rounding
-            (``_stochastic_round``) against a ``qmap`` of values, or None
-            to round to the nearest value
+            (``_stochastic_round``) against a ``qmap`` of values -- a table
+            or its levels -- or None to round to the nearest value
 
     Returns:
         Tensor with requested dtype (e.g. int8), note the quantization
@@ -1189,7 +1209,9 @@ def quantize_affine(
 # over the tensor per aten op.  The CUDA key alone takes the compiled
 # kernel, so fake and meta tensors keep the plain one.
 for _op in (quantize, dequantize, quantize_mx, quantize_affine):
-    quantized_ops_lib.impl(_op.__name__, _compile(_op, _OPS_DYNAMIC), "CUDA")
+    quantized_ops_lib.impl(
+        _op.__name__, compile_like_eager(_op, _OPS_DYNAMIC), "CUDA"
+    )
 
 
 quantized_ops_lib.define(

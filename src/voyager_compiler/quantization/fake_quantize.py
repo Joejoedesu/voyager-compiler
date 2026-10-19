@@ -7,20 +7,13 @@ import torch
 from torch import Tensor
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
-from voyager_compiler.ops import (
-    HADAMARD_SIZE,
-    compiled_on_gpu,
-    expand,
-    hadamard_rotate,
-    quantize_mx,
-    vmap,
-)
+from voyager_compiler.ops import HADAMARD_SIZE, hadamard_rotate, qmap_levels
+from voyager_compiler.quantization import ops
 from voyager_compiler.quantization.dtypes import (
     quantize_to_minifloat,
     quantize_to_nf,
     quantize_to_posit,
 )
-from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
 from voyager_compiler.quantization.qspec import (
     QScheme,
     float_format,
@@ -34,8 +27,6 @@ __all__ = [
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
-    "OutlierFilter",
-    "RandomHadamardTransform",
     "_DerivedObserverOrFakeQuantize",
     "calculate_global_scale",
     "entry_levels",
@@ -144,10 +135,8 @@ def entry_levels(dtype, device=None):
     Returns:
         The distinct values in ascending order, as float32, with one zero.
     """
-    table = get_quantization_map(dtype, device).float()
-    levels = torch.unique(table[torch.isfinite(table)])
-    # ``torch.unique`` can keep -0 as the zero; adding 0 turns it into +0.
-    return levels[levels >= -levels.max()] + 0.0
+    levels = qmap_levels(get_quantization_map(dtype, device))
+    return levels[levels >= -levels.max()]
 
 
 def calculate_global_scale(
@@ -160,7 +149,7 @@ def calculate_global_scale(
     normal value instead of zero, which its blocks then divide to nothing.
 
     Args:
-        input: Tensor about to be quantized.
+        input: Tensor about to be quantized, or its largest magnitude.
         quant_max: Largest magnitude of the element dtype.
         scale_max: Largest value of the block scales' dtype.
 
@@ -171,225 +160,19 @@ def calculate_global_scale(
     return ratio.clamp_min(torch.finfo(torch.float32).tiny)
 
 
-# A fake-quant graph sees the same shapes window after window.
-_compiled_per_shape = compiled_on_gpu(dynamic=False)
+def _install(module: torch.nn.Module, name: str, value: torch.Tensor):
+    """Copy ``value`` into ``module``'s buffer ``name`` if it has the
+    buffer's shape and dtype, else replace the buffer with it."""
+    buffer = getattr(module, name)
+    if value.shape == buffer.shape and value.dtype == buffer.dtype:
+        buffer.copy_(value)
+    else:
+        setattr(module, name, value.to(buffer.device))
 
 
-@_compiled_per_shape
-def _fake_quant(input, qmap, scale):
-    """Fake-quantize ``input`` against a per-tensor or per-channel scale.
-
-    Args:
-        input: Tensor to quantize.
-        qmap: Lookup table, one entry per bfloat16 bit pattern.
-        scale: Scale, broadcastable to ``input``.
-
-    Returns:
-        The fake-quantized tensor.
-    """
-    scale = scale.to(input.dtype)
-    return vmap(input / scale, qmap) * scale
-
-
-@_compiled_per_shape
-def _mx_fake_quant(
-    input,
-    qmap,
-    axes,
-    block_size,
-    quant_max,
-    power_of_two,
-    scale_qmap,
-    seed,
-    global_scale,
-):
-    """Fake-quantize ``input`` in microscaling blocks.
-
-    Args:
-        input: Tensor to quantize.
-        qmap: Lookup table or codebook the elements are quantized into.
-        axes: Axis or axes the blocks run along.
-        block_size: Elements per block.
-        quant_max: Largest magnitude ``qmap`` represents.
-        power_of_two: Round each block scale to a power of two.
-        scale_qmap: Lookup table the scales are quantized into, or None.
-        seed: int64 scalar keying stochastic rounding, or None to round to
-            the nearest value.
-        global_scale: The tensor's global scale, a 0-d tensor, or None.
-
-    Returns:
-        ``(scale, output)``: the block scales, without the global scale,
-        and the fake-quantized tensor.
-    """
-    scale, output = quantize_mx(
-        input,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        power_of_two,
-        scale_qmap=scale_qmap,
-        seed=seed,
-        global_scale=global_scale,
-    )
-    output = output * expand(scale, output.shape, block_size)
-    if global_scale is not None:
-        output = output * global_scale
-    return scale, output
-
-
-@_compiled_per_shape
-def _group_wise_affine_fake_quant(
-    input, axes, block_size, quant_min, quant_max, scale_qmap
-):
-    """Fake-quantize ``input`` with a scale and zero point per block.
-
-    Each block maps its own ``[min, max]`` onto ``[quant_min, quant_max]``.
-
-    Args:
-        input: Tensor to quantize.
-        axes: Axis or axes the blocks run along.
-        block_size: Elements per block.
-        quant_min: Smallest code.
-        quant_max: Largest code.
-        scale_qmap: Lookup table the scale and zero point are quantized
-            into, or None.
-
-    Returns:
-        ``(scale, zero_point, output)``: the per-block parameters and the
-        fake-quantized tensor.
-    """
-    assert block_size > 0
-
-    # Make sure axes is a list of non-negative numbers
-    axes = [axes] if type(axes) == int else axes
-    axes = [x + input.ndim if x < 0 else x for x in axes]
-
-    # Perform tiling to the hardware vector size
-    reshaped_input, axes, orig_shape, padded_shape = _reshape_to_blocks(
-        input, axes, block_size
-    )
-
-    shared_exp_axes = [x + 1 for x in axes]
-
-    min = torch.amin(reshaped_input, dim=shared_exp_axes)
-    max = torch.amax(reshaped_input, dim=shared_exp_axes)
-
-    sf = (max - min) / (quant_max - quant_min)
-    sf = torch.where(sf > 0.0, sf, 1.0)
-    # Quantize the scale using the codebook; a scale below its range
-    # rounds to zero and the block is one level, as with no range.
-    if scale_qmap is not None:
-        sf = vmap(sf, scale_qmap)
-        sf = torch.where(sf > 0.0, sf, 1.0)
-    zp = -min / sf + quant_min
-    if scale_qmap is not None:
-        zp = vmap(zp, scale_qmap)
-
-    expanded_sf = expand(sf, input.shape, block_size)
-    expanded_zp = expand(zp, input.shape, block_size)
-
-    q = torch.round(input / expanded_sf + expanded_zp)
-    q = torch.clamp(q, quant_min, quant_max)
-    return sf, zp, (q - expanded_zp) * expanded_sf
-
-
-class FakeQuantizeFunction(torch.autograd.Function):
-    """This function quantizes the inputs against an observed scale."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        enabled: bool,
-        qmap: torch.Tensor,
-        scale: torch.Tensor,
-    ) -> torch.Tensor:
-        if not enabled:
-            return input
-        return _fake_quant(input, qmap, scale)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 3
-
-
-class MXFakeQuantizeFunction(torch.autograd.Function):
-    """This function performs MX quantization by calculating the scaling
-    factor using absolute maximum values in the input.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        enabled: bool,
-        scale: torch.Tensor,
-        qmap: torch.Tensor,
-        axes: Union[int, List[int]],
-        block_size: Union[int, List[int]],
-        quant_max: float,
-        force_scale_power_of_two=False,
-        scale_qmap=None,
-        stochastic_rounding=False,
-        global_scale=None,
-    ):
-        if not enabled:
-            return input
-        # Each call rounds under a fresh seed from torch's generator.
-        seed = (
-            torch.randint(SEED_BOUND, (), device=input.device)
-            if stochastic_rounding
-            else None
-        )
-        sf, output = _mx_fake_quant(
-            input,
-            qmap,
-            axes,
-            block_size,
-            quant_max,
-            force_scale_power_of_two,
-            scale_qmap,
-            seed,
-            global_scale,
-        )
-        scale.resize_(sf.shape).copy_(sf)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 10
-
-
-class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        enabled: bool,
-        scale: torch.Tensor,
-        zero_point: torch.Tensor,
-        axes: Union[int, List[int]],
-        block_size: Union[int, List[int]],
-        quant_min: float,
-        quant_max: float,
-        scale_qmap=None,
-    ):
-        if not enabled:
-            return input
-        sf, zp, output = _group_wise_affine_fake_quant(
-            input, axes, block_size, quant_min, quant_max, scale_qmap
-        )
-        scale.resize_(sf.shape).copy_(sf)
-        zero_point.resize_(zp.shape).copy_(zp)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 8
+def _axes(ch_axis: Union[int, List[int]]) -> List[int]:
+    """A block spec's axis or axes as the list the ops take."""
+    return [ch_axis] if isinstance(ch_axis, int) else list(ch_axis)
 
 
 class _FreezableFlags(FakeQuantizeBase):
@@ -436,11 +219,12 @@ class _FreezableFlags(FakeQuantizeBase):
 class _FakeQuantize(_FreezableFlags):
     """The parts every fake-quant scheme shares.
 
-    The dtype's lookup table and the ``scale`` every scheme reports.  A
-    spec is passed whole to the class that implements its scheme, so each
-    class takes the fields it uses and the rest fall through to
-    ``**unused``.  A subclass fake-quantizes in ``forward`` and reports
-    its parameters from ``calculate_qparams``.
+    The dtype's lookup table and a ``scale``, which every scheme but
+    microscaling reports.  A spec is passed whole to the class that
+    implements its scheme, so each class takes the fields it uses and the
+    rest fall through to ``**unused``.  A subclass fake-quantizes in
+    ``forward`` and, unless it keeps none, reports its parameters from
+    ``calculate_qparams``.
 
     Args:
         dtype: Element dtype, as a spec string names it.
@@ -467,19 +251,33 @@ class _FakeQuantize(_FreezableFlags):
 
         codebook = parse_codebook_dtype(dtype)
         self.is_codebook_quantization = codebook is not None
+        qmap = get_quantization_map(dtype, device)
         if self.is_codebook_quantization:
             self.index_bits, self.code_dtype = codebook
-        self.register_buffer(
-            "qmap", get_quantization_map(dtype, device), persistent=False
-        )
+            # A refit writes a codebook's table in place, so it is the
+            # fake-quant's own.
+            qmap = qmap.clone()
+        self.register_buffer("qmap", qmap, persistent=False)
         self.register_buffer("scale", torch.tensor([1.0], **factory_kwargs))
 
     def extra_repr(self):
         return (
             f"fake_quant_enabled={self.fake_quant_enabled}, "
-            f"observer_enabled={self.observer_enabled}, dtype={self.dtype}, "
-            f"scale={self.scale}"
+            f"observer_enabled={self.observer_enabled}, dtype={self.dtype}"
         )
+
+    def install_qmap(self, qmap: torch.Tensor) -> None:
+        """Make ``qmap`` the table the fake-quant rounds to.
+
+        A table of the current one's shape and dtype is copied into it, so
+        whatever holds the current tensor reads the new values; any other
+        replaces it.  Only a codebook's fake-quant owns its table, so only
+        a codebook's is installed.
+
+        Args:
+            qmap: A lookup table, or a codebook grid.
+        """
+        _install(self, "qmap", qmap)
 
     def _load_from_state_dict(
         self,
@@ -508,176 +306,6 @@ class _FakeQuantize(_FreezableFlags):
         )
 
 
-class _QuantizeTransform:
-    """The end of the ``pre`` / ``post`` chain, which leaves its input as is.
-
-    A fake-quant's ``forward`` passes its input through ``pre`` before it
-    quantizes and through ``post`` after.  Each transform mixin acts when
-    its spec field is set and hands on to ``super()``: ``pre`` transforms
-    first, ``post`` last, so mixins listed before a scheme's base nest, the
-    first one outermost.  ``prepare`` applies the same transforms as
-    ``pre``, whether or not fake-quantization is on, without changing state
-    (an outlier comes back as a zero), so a codebook fit sees the values the
-    codebook will quantize.
-    """
-
-    def prepare(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-class RandomHadamardTransform(_QuantizeTransform):
-    """Rotate the input by ``hadamard_matrix`` before it is quantized and
-    rotate it back after, while fake-quantization is on.  The rotated axis
-    keeps ``hadamard_rotate``'s padding, so the GEMM the input feeds runs
-    over the padded axis, as the hardware's does.
-
-    Args:
-        rht_axis: Axis to rotate along, or None.
-        *args: Forwarded to the scheme's base.
-        **kwargs: Forwarded to the scheme's base.
-    """
-
-    rht_matrix: Optional[torch.Tensor]
-
-    def __init__(self, *args, rht_axis: Optional[int] = None, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.rht_axis = rht_axis
-        self.register_buffer(
-            "rht_matrix",
-            (
-                hadamard_matrix(self.scale.device)
-                if rht_axis is not None
-                else None
-            ),
-            persistent=False,
-        )
-
-    def extra_repr(self):
-        return f"{super().extra_repr()}, rht_axis={self.rht_axis}"
-
-    def prepare(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rht_axis is not None:
-            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix)
-        return super().prepare(x)
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rht_axis is not None and self.fake_quant_enabled:
-            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix)
-        return super().pre(x)
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().post(x)
-        if self.rht_axis is not None and self.fake_quant_enabled:
-            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix.T)
-        return x
-
-
-class OutlierFilter(_QuantizeTransform):
-    """Keep outliers out of quantization: zeroed before it, restored after,
-    while fake-quantization is on.
-
-    An outlier is an element whose magnitude reaches the threshold.  The
-    threshold is given, or calibrated while the observer is on as the
-    smallest of the largest ``outlier_pct`` of the elements, the largest
-    any call asked for.
-
-    Args:
-        outlier_threshold: Magnitude from which an element is an outlier.
-        outlier_pct: Fraction of elements to treat as outliers instead.
-        *args: Forwarded to the scheme's base.
-        **kwargs: Forwarded to the scheme's base.
-    """
-
-    def __init__(
-        self,
-        *args,
-        outlier_threshold: Optional[float] = None,
-        outlier_pct: Optional[float] = None,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        assert (
-            outlier_pct is None or outlier_threshold is None
-        ), "Only one of outlier_pct and outlier_threshold can be set."
-        self.outlier_pct = outlier_pct
-        # The largest fraction of outliers any call has held, kept on the
-        # device so that recording it never waits for it.
-        self.register_buffer(
-            "max_outlier_pct",
-            torch.zeros((), device=self.scale.device),
-            persistent=False,
-        )
-        if outlier_pct is not None:
-            self.register_buffer(
-                "outlier_threshold",
-                torch.tensor([], device=self.scale.device, dtype=torch.float),
-            )
-        else:
-            self.outlier_threshold = outlier_threshold
-        # The outlier mask and the input ``pre`` took it from, which
-        # ``post`` restores.
-        self._outliers = None
-
-    def _outlier_mask(self, x: torch.Tensor) -> Optional[torch.Tensor]:
-        """Return which elements reach the threshold, or None without one."""
-        threshold = self.outlier_threshold
-        if threshold is None or (
-            isinstance(threshold, torch.Tensor) and threshold.numel() == 0
-        ):
-            return None
-        return x.abs() >= threshold
-
-    def _calibrate_threshold(self, x: torch.Tensor) -> None:
-        """Raise the threshold to the smallest of ``x``'s largest
-        ``outlier_pct`` magnitudes, if that is larger."""
-        flat = x.abs().flatten()
-        k = max(1, math.ceil(self.outlier_pct * flat.numel()))
-
-        vals = torch.topk(flat, k, largest=True, sorted=False).values
-        threshold = vals.min()
-
-        # The largest threshold any calibration batch asked for, so the
-        # bound holds on every batch seen.
-        if self.outlier_threshold.numel() == 0:
-            self.outlier_threshold.resize_as_(threshold)
-            self.outlier_threshold.copy_(threshold)
-        else:
-            self.outlier_threshold.copy_(
-                torch.maximum(self.outlier_threshold, threshold)
-            )
-
-    def prepare(self, x: torch.Tensor) -> torch.Tensor:
-        skip = self._outlier_mask(x)
-        if skip is not None:
-            x = x.masked_fill(skip, 0.0)
-        return super().prepare(x)
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.outlier_pct is not None and self.observer_enabled:
-            self._calibrate_threshold(x)
-
-        skip = self._outlier_mask(x) if self.fake_quant_enabled else None
-        if skip is not None:
-            self._outliers = (skip, x)
-            x = x.masked_fill(skip, 0.0)
-            self.max_outlier_pct.clamp_min_(skip.float().mean())
-        return super().pre(x)
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().post(x)
-        if self._outliers is not None:
-            skip, original = self._outliers
-            self._outliers = None
-            x = torch.where(skip, original, x)
-        return x
-
-
 class DirectCastFakeQuantize(_FakeQuantize):
     """Fake-quantize by rounding each value to the dtype, with no scale.
 
@@ -698,9 +326,9 @@ class DirectCastFakeQuantize(_FakeQuantize):
         return self.scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FakeQuantizeFunction.apply(
-            x, self.fake_quant_enabled, self.qmap, self.scale
-        )
+        if not self.fake_quant_enabled:
+            return x
+        return ops.fake_quant(x, self.qmap, self.scale)
 
 
 class FusedAmaxObsFakeQuantize(_FakeQuantize):
@@ -813,8 +441,9 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
 
     def extra_repr(self):
         return (
-            f"{super().extra_repr()}, qscheme={self.qscheme}, "
-            f"quant_max={self.quant_max}, ch_axis={self.ch_axis}, "
+            f"{super().extra_repr()}, scale={self.scale}, "
+            f"qscheme={self.qscheme}, quant_max={self.quant_max}, "
+            f"ch_axis={self.ch_axis}, "
             f"amax_history_len={self.amax_history_len}, "
             f"power_2_scale={self.power_2_scale}"
         )
@@ -822,9 +451,9 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.observer_enabled:
             self._update_amax_scale(x)
-        return FakeQuantizeFunction.apply(
-            x, self.fake_quant_enabled, self.qmap, self.scale
-        )
+        if not self.fake_quant_enabled:
+            return x
+        return ops.fake_quant(x, self.qmap, self.scale)
 
 
 class _BlockFakeQuantize(_FakeQuantize):
@@ -874,14 +503,23 @@ class _BlockFakeQuantize(_FakeQuantize):
         )
 
 
-class MXFakeQuantize(
-    RandomHadamardTransform, OutlierFilter, _BlockFakeQuantize
-):
+class MXFakeQuantize(_BlockFakeQuantize):
     """Fake-quantize in microscaling blocks.
 
-    Each block's scale is its absolute maximum over ``quant_max``; ``scale``
-    holds the last call's block scales, without the global scale.  Outliers
-    skip quantization (``OutlierFilter``).
+    Each block's scale is its absolute maximum over ``quant_max``, computed
+    on every call and not kept.  Stochastic rounding searches ``levels``,
+    the table's (``qmap_levels``), taken whenever a table is installed.
+
+    A random Hadamard transform rotates the input by ``hadamard_matrix``
+    along ``rht_axis`` before it is quantized and the result back after.
+    The rotated axis keeps ``hadamard_rotate``'s padding, so the GEMM the
+    input feeds runs over the padded axis, as the hardware's does.
+
+    An outlier filter keeps outliers out of quantization: zeroed before it,
+    restored after.  An outlier is an element whose magnitude reaches the
+    threshold.  The threshold is given, or calibrated while the observer is
+    on as the smallest of the largest ``outlier_pct`` of the elements, the
+    largest any call asked for.
 
     Args:
         power_2_scale: Round each block scale to a power of two.
@@ -890,9 +528,19 @@ class MXFakeQuantize(
         global_scale: Divide the block scales by the tensor's global scale
             (``calculate_global_scale``) before quantizing them to
             ``scale_dtype``, as NVFP4 does.
+        rht_axis: Axis to rotate along, or None.
+        outlier_threshold: Magnitude from which an element is an outlier.
+        outlier_pct: Fraction of elements to treat as outliers instead.
         *args: Forwarded to ``_BlockFakeQuantize``.
         **kwargs: Forwarded to ``_BlockFakeQuantize``.
+
+    Raises:
+        ValueError: Both a rotation and an outlier filter, or both an
+            outlier threshold and an outlier fraction, are asked for.
     """
+
+    levels: Optional[torch.Tensor]
+    rht_matrix: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -900,9 +548,46 @@ class MXFakeQuantize(
         power_2_scale: bool = False,
         stochastic_rounding: bool = False,
         global_scale: bool = False,
+        rht_axis: Optional[int] = None,
+        outlier_threshold: Optional[float] = None,
+        outlier_pct: Optional[float] = None,
         **kwargs,
     ) -> None:
+        filters_outliers = (
+            outlier_threshold is not None or outlier_pct is not None
+        )
+        if rht_axis is not None and filters_outliers:
+            raise ValueError(
+                "A random Hadamard transform cannot be combined with an "
+                "outlier filter: the outliers would have to be zeroed "
+                "between the rotation and the rounding, inside the "
+                "fake-quant op"
+            )
+        if outlier_pct is not None and outlier_threshold is not None:
+            raise ValueError(
+                "Only one of outlier_pct and outlier_threshold can be set"
+            )
         super().__init__(*args, **kwargs)
+        device = self.scale.device
+        self.outlier_pct = outlier_pct
+        # The largest fraction of outliers any call has held, kept on the
+        # device so that recording it never waits for it.
+        self.register_buffer(
+            "max_outlier_pct", torch.zeros((), device=device), persistent=False
+        )
+        if outlier_pct is not None:
+            self.register_buffer(
+                "outlier_threshold",
+                torch.tensor([], device=device, dtype=torch.float),
+            )
+        else:
+            self.outlier_threshold = outlier_threshold
+        self.rht_axis = rht_axis
+        self.register_buffer(
+            "rht_matrix",
+            hadamard_matrix(device) if rht_axis is not None else None,
+            persistent=False,
+        )
         self.power_2_scale = power_2_scale
         self.stochastic_rounding = stochastic_rounding
         self.global_scale = global_scale
@@ -913,38 +598,148 @@ class MXFakeQuantize(
             if global_scale
             else None
         )
+        self.register_buffer(
+            "levels",
+            qmap_levels(self.qmap) if stochastic_rounding else None,
+            persistent=False,
+        )
+
+    def install_qmap(self, qmap: torch.Tensor) -> None:
+        if self.stochastic_rounding and qmap.dim() > 1:
+            raise NotImplementedError(
+                "Stochastic rounding takes one set of levels, not a codebook "
+                "grid"
+            )
+        super().install_qmap(qmap)
+        if self.stochastic_rounding:
+            _install(self, "levels", qmap_levels(self.qmap))
 
     def calculate_qparams(self):
-        return self.scale
+        raise NotImplementedError(
+            "Microscaling block scales are computed on every call, not kept"
+        )
 
     def extra_repr(self):
         return (
-            f"{super().extra_repr()}, power_2_scale={self.power_2_scale}, "
+            f"{super().extra_repr()}, rht_axis={self.rht_axis}, "
+            f"power_2_scale={self.power_2_scale}, "
             f"stochastic_rounding={self.stochastic_rounding}, "
             f"global_scale={self.global_scale}"
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pre(x)
-        global_scale = (
-            calculate_global_scale(x, self.quant_max, self.scale_max)
-            if self.global_scale
+    def _outlier_mask(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return which elements reach the threshold, or None without one."""
+        threshold = self.outlier_threshold
+        if threshold is None or (
+            isinstance(threshold, torch.Tensor) and threshold.numel() == 0
+        ):
+            return None
+        return x.abs() >= threshold
+
+    def _calibrate_threshold(self, x: torch.Tensor) -> None:
+        """Raise the threshold to the smallest of ``x``'s largest
+        ``outlier_pct`` magnitudes, if that is larger."""
+        flat = x.abs().flatten()
+        k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+
+        vals = torch.topk(flat, k, largest=True, sorted=False).values
+        threshold = vals.min()
+
+        # The largest threshold any calibration batch asked for, so the
+        # bound holds on every batch seen.
+        if self.outlier_threshold.numel() == 0:
+            self.outlier_threshold.resize_as_(threshold)
+            self.outlier_threshold.copy_(threshold)
+        else:
+            self.outlier_threshold.copy_(
+                torch.maximum(self.outlier_threshold, threshold)
+            )
+
+    def prepare(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` as the fake-quant quantizes it -- rotated, or with its
+        outliers zeroed -- whether or not fake-quantization is on, and
+        without changing state, so a codebook fit sees the values the
+        codebook will quantize."""
+        if self.rht_axis is not None:
+            return hadamard_rotate(x, self.rht_axis, self.rht_matrix)
+        skip = self._outlier_mask(x)
+        return x if skip is None else x.masked_fill(skip, 0.0)
+
+    def forward(
+        self, x: torch.Tensor, global_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Fake-quantize ``x``.
+
+        A rotation the kernel fuses (``kernels.mx_fake_quant_supported``)
+        runs inside ``quantization::mx_fake_quant``, its global amax taken
+        by ``quantization::hadamard_amax``: the result is laid out as ``x``
+        and the backward passes the gradient through unrotated.  Any other
+        rotation runs here, around the op, and is differentiated.
+
+        Args:
+            x: Tensor to quantize.
+            global_scale: ``x``'s global scale, computed once for every
+                fake-quant of ``x`` (``_share_global_scales``), or None to
+                compute it here if ``global_scale`` is on.
+
+        Returns:
+            The fake-quantized tensor.
+        """
+        if self.outlier_pct is not None and self.observer_enabled:
+            self._calibrate_threshold(x)
+        if not self.fake_quant_enabled:
+            return x
+        skip = self._outlier_mask(x)
+        original = x
+        if skip is not None:
+            x = x.masked_fill(skip, 0.0)
+            self.max_outlier_pct.clamp_min_(skip.float().mean())
+        # Each call rounds under a fresh seed from torch's generator.
+        seed = (
+            torch.randint(SEED_BOUND, (), device=x.device)
+            if self.stochastic_rounding
             else None
         )
-        x = MXFakeQuantizeFunction.apply(
-            x,
-            self.fake_quant_enabled,
-            self.scale,
-            self.qmap,
-            self.ch_axis,
+        args = (
+            self.levels if self.stochastic_rounding else self.qmap,
+            _axes(self.ch_axis),
             self.block_size,
             self.quant_max,
             self.power_2_scale,
             self.scale_qmap,
-            self.stochastic_rounding,
-            global_scale,
+            seed,
         )
-        return self.post(x)
+        hadamard, axis = self.rht_matrix, self.rht_axis
+        # The global scale is left out: the one computed below is in ``x``'s
+        # dtype, as the kernel takes it.
+        fused = (
+            axis is not None
+            and ops.kernels is not None
+            and ops.kernels.mx_fake_quant_supported(
+                x, *args, None, hadamard, axis
+            )
+        )
+        rotate_here = axis is not None and not fused
+        if rotate_here:
+            x = hadamard_rotate(x, axis, hadamard)
+        if self.global_scale and global_scale is None:
+            if fused:
+                # Detached: the scale takes no gradient, and the op has no
+                # backward.
+                amax = ops.hadamard_amax(x.detach(), axis, hadamard)
+                global_scale = calculate_global_scale(
+                    amax, self.quant_max, self.scale_max
+                )
+            else:
+                global_scale = calculate_global_scale(
+                    x, self.quant_max, self.scale_max
+                )
+        if not fused:
+            hadamard = axis = None
+        x = ops.mx_fake_quant(x, *args, global_scale, hadamard, axis)
+        if rotate_here:
+            x = hadamard_rotate(x, self.rht_axis, self.rht_matrix.T)
+        return x if skip is None else torch.where(skip, original, x)
 
 
 class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
@@ -975,20 +770,25 @@ class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
         return self.scale, self.zero_point
 
     def extra_repr(self):
-        return f"{super().extra_repr()}, quant_min={self.quant_min}"
+        return (
+            f"{super().extra_repr()}, quant_min={self.quant_min}, "
+            f"scale={self.scale}"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return GroupWiseAffineFakeQuantFunction.apply(
+        if not self.fake_quant_enabled:
+            return x
+        output, scale, zero_point = ops.group_wise_affine_fake_quant(
             x,
-            self.fake_quant_enabled,
-            self.scale,
-            self.zero_point,
-            self.ch_axis,
+            _axes(self.ch_axis),
             self.block_size,
             self.quant_min,
             self.quant_max,
             self.scale_qmap,
         )
+        self.scale.resize_(scale.shape).copy_(scale)
+        self.zero_point.resize_(zero_point.shape).copy_(zero_point)
+        return output
 
 
 def fake_quantize_class(qscheme):
@@ -1036,9 +836,9 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
         if len(devices) != 1 or next(iter(devices)) != x.device:
             self.to(x.device)
 
-        return FakeQuantizeFunction.apply(
-            x, self.fake_quant_enabled, self.qmap, self.calculate_qparams()
-        )
+        if not self.fake_quant_enabled:
+            return x
+        return ops.fake_quant(x, self.qmap, self.calculate_qparams())
 
     def calculate_qparams(self):
         return self.derive_qparams_fn(self.obs_or_fqs)

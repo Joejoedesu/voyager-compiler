@@ -31,13 +31,11 @@ from typing import NamedTuple
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops import (
-    calculate_mx_qparam,
-    expand,
-    hadamard_rotate,
-)
+from voyager_compiler.ops import hadamard_rotate
+from voyager_compiler.quantization import ops
 from voyager_compiler.quantization.fake_quantize import (
     MXFakeQuantize,
+    _axes,
     calculate_global_scale,
     entry_levels,
 )
@@ -51,18 +49,6 @@ from voyager_compiler.shape_prop import fetch_attr
 logger = logging.getLogger(__name__)
 
 EPS = 1e-12
-
-#: Elements one ``Histogram.add`` converts to float64 at a time.  Widening
-#: an operand and forming the two products is the accumulator's whole
-#: memory cost, and a model's largest weight runs to half a billion
-#: elements, so the pass is taken in slices rather than whole.
-ACCUMULATE_CHUNK = 1 << 25
-
-#: Copies of each bin ``bin_blocks`` spreads its adds over on a GPU.
-#: Neighbouring elements add into different copies, so the many elements of
-#: one bin -- a ReLU output's zeros -- do not queue on one address; the
-#: copies are summed after.
-BIN_COPIES = 512
 
 #: Float64 elements one round of a batched solve holds, per device type: a
 #: chunk of histograms times the candidate pairs each searches.  On a CPU
@@ -101,7 +87,8 @@ def _search_edges(levels, device):
 
     Each edge is the smallest float32 at or above the exact one.  The values
     searched are float32, so a value reaches that edge exactly when it
-    reaches the exact one, and is binned as ``Histogram.add`` bins it.
+    reaches the exact one, and lands in the bin it would against the exact
+    edges.
 
     Args:
         levels: The candidate levels, ascending, as a tuple.
@@ -179,31 +166,6 @@ class Histogram:
             )
             self.weight, self.total, self.square = self.moments
         return self.moments
-
-    def add(self, values, weights):
-        """Accumulate one tensor's normalized values into the bins.
-
-        Args:
-            values: Flat tensor of ``x / blockscale``.
-            weights: Per-element weight, broadcastable to ``values``.
-        """
-        self.sums(values.device)
-        edges = self.edges(values.device)
-        values = values.reshape(-1)
-        weights = weights.reshape(-1).expand_as(values)
-        for start in range(0, values.numel(), ACCUMULATE_CHUNK):
-            # Float64 so that a value is binned against the exact midpoints,
-            # and so that the order the bins are summed in -- which on a GPU
-            # is decided by the scheduler -- cannot move a level.  That same
-            # indifference to order is what lets the pass be sliced.
-            piece = values[start : start + ACCUMULATE_CHUNK].double()
-            share = weights[start : start + ACCUMULATE_CHUNK].double()
-            index = (torch.bucketize(piece, edges, right=True) - 1).clamp_(
-                0, self.bins - 1
-            )
-            self.weight.index_add_(0, index, share)
-            self.total.index_add_(0, index, share * piece)
-            self.square.index_add_(0, index, share * piece * piece)
 
     def cumulative(self):
         """Return the three running sums the segment cost is read from.
@@ -429,7 +391,7 @@ def _contraction_last(tensor, ch_axis):
         The tensor, transposed if its blocks do not already run along the
         last axis.
     """
-    axis = ch_axis[0] if isinstance(ch_axis, (tuple, list)) else ch_axis
+    axis = _axes(ch_axis)[0]
     if axis in (-1, tensor.dim() - 1):
         return tensor
     return tensor.transpose(axis, -1)
@@ -609,8 +571,8 @@ def _accumulate(
     block's share of the output error grows with that scale squared.  An
     outlier arrives as a zero and is binned as one: the pinned zero level
     quantizes it without error, so it adds nothing to any codebook's cost.
-    On a GPU the whole operand, every cell of it, runs as one kernel,
-    ``bin_blocks``, to the same bins.
+    The whole operand, every cell of it, is binned by one call of
+    ``quantization::bin_blocks``.
 
     Args:
         tensor: The operand as its fake-quant quantizes it -- rotated, its
@@ -631,11 +593,12 @@ def _accumulate(
             former, so the latter places the levels against values it
             never sees.
     """
-    cells = _grid_cells(tensor.detach(), counts)
-    first = _contraction_last(cells[0][1], module.ch_axis)
-    if first.numel() < module.block_size:
+    axis = _axes(module.ch_axis)[0]
+    # A grid cell's shape: each axis split into its equal runs.
+    cell = [size // count for size, count in zip(tensor.shape, counts)]
+    if math.prod(cell) < module.block_size:
         return
-    channels = first.shape[-1]
+    channels = cell[axis]
     if energies is not None and any(e.numel() != channels for e in energies):
         raise ValueError(
             f"the partner energy has {energies[0].numel()} channels but the "
@@ -648,56 +611,19 @@ def _accumulate(
     scale_qmap = (
         getattr(module, "scale_qmap", None) if quantized_scale else None
     )
-    if tensor.is_cuda:
-        # Deferred: triton ships only with the CUDA builds of torch.
-        from voyager_compiler.quantization.histogram_kernel import bin_blocks
-
-        axis = module.ch_axis
-        bin_blocks(
-            tensor.detach(),
-            axis[0] if isinstance(axis, (tuple, list)) else axis,
-            module.block_size,
-            module.quant_max,
-            None if energies is None else torch.stack(energies),
-            histograms[0].search_edges(tensor.device),
-            [histogram.sums(tensor.device) for histogram in histograms],
-            counts,
-            BIN_COPIES,
-            power_of_two,
-            scale_qmap,
-            global_scale,
-        )
-        return
-    if energies is None:
-        energies = [None] * len(cells)
-    for (_, slab), energy, histogram in zip(cells, energies, histograms):
-        ordered = _contraction_last(slab, module.ch_axis).float()
-        # One scale serves both the normalization and the squared-scale
-        # weight, so the two halves of the objective refer to the same
-        # number -- the one deployment computes: its blocks pad out along
-        # the contraction axis rather than running past it.
-        scale = calculate_mx_qparam(
-            ordered,
-            axes=-1,
-            block_size=module.block_size,
-            quant_max=module.quant_max,
-            force_scale_power_of_two=power_of_two,
-            scale_qmap=scale_qmap,
-            global_scale=global_scale,
-        )
-        if global_scale is not None:
-            scale = scale * global_scale
-        scale = expand(scale, ordered.shape, module.block_size)
-        normalized = (ordered / scale).reshape(-1)
-        if energy is None:
-            weights = torch.ones_like(normalized)
-        else:
-            # The contraction axis is last, so an element's channel is its
-            # position modulo the channel count -- which is what tiling the
-            # energy across the flattened tensor spells.
-            weights = energy.repeat(normalized.numel() // energy.numel())
-        weights = weights * (scale**2).reshape(-1)
-        histogram.add(normalized, weights)
+    ops.bin_blocks(
+        tensor.detach(),
+        axis,
+        module.block_size,
+        module.quant_max,
+        None if energies is None else torch.stack(energies),
+        histograms[0].search_edges(tensor.device),
+        [histogram.sums(tensor.device) for histogram in histograms],
+        counts,
+        power_of_two,
+        scale_qmap,
+        global_scale,
+    )
 
 
 def _resolve_counts(counts, shape):
@@ -851,11 +777,11 @@ def install_codebook(module, levels, counts=None):
     """
     device = module.qmap.device
     if counts is None:
-        module.qmap = codebook_qmaps([levels], device)[0]
+        qmap = codebook_qmaps([levels], device)[0]
     else:
-        module.qmap = torch.tensor(
-            levels, dtype=torch.float32, device=device
-        ).reshape(*counts, -1)
+        qmap = torch.tensor(levels, dtype=torch.float32, device=device)
+        qmap = qmap.reshape(*counts, -1)
+    module.install_qmap(qmap)
 
 
 #: The op a weight's tap wraps.  A conv's weight contracts over its
@@ -1941,7 +1867,7 @@ class CodebookRefitter:
             fitted.update(zip(names, codebooks))
             device = self.modules[names[0]].qmap.device
             for name, qmap in zip(names, codebook_qmaps(codebooks, device)):
-                self.modules[name].qmap = qmap
+                self.modules[name].install_qmap(qmap)
         return fitted
 
     def _cells(self, name, shape):
@@ -2032,11 +1958,29 @@ class CodebookRefitter:
         )
 
 
+def in_refit_window(step, every, collect):
+    """Whether a training step falls in a codebook refit window.
+
+    A refit comes every ``every`` steps, and the ``collect`` steps before
+    it form its window.
+
+    Args:
+        step: Steps completed before this one.
+        every: Steps between refits.
+        collect: Steps each window spans.
+
+    Returns:
+        True if the step is in a window.
+    """
+    return step % every >= every - collect
+
+
 def refit_window(refitter, step, every, collect):
     """The context a training step runs in, to refit every ``every`` steps.
 
-    The ``collect`` steps before each refit form its window: the first
-    measures and the rest accumulate.  Every other step runs unhooked.
+    The ``collect`` steps before each refit form its window
+    (``in_refit_window``): the first measures and the rest accumulate.
+    Every other step runs unhooked.
 
     Args:
         refitter: The model's ``CodebookRefitter``.
@@ -2047,10 +1991,8 @@ def refit_window(refitter, step, every, collect):
     Returns:
         A context manager.
     """
-    position = step % every
-    start = every - collect
-    if position == start:
+    if not in_refit_window(step, every, collect):
+        return contextlib.nullcontext()
+    if step % every == every - collect:
         return refitter.measure()
-    if position > start:
-        return refitter.accumulate()
-    return contextlib.nullcontext()
+    return refitter.accumulate()

@@ -5,7 +5,9 @@ decomposed quantize / dequantize / microscaling ops, plus the
 hardware-layout forms of the aten operators the data-layout passes
 retarget.  Import it for that side effect before referencing any
 ``torch.ops.quantized_ops.*`` target — the op namespace resolves lazily, so
-a missing registration surfaces at call time, not at import.
+a missing registration surfaces at call time, not at import.  The
+fake-quant and calibration ops are not hardware ops; they live in
+``quantization.ops``.
 """
 
 from voyager_compiler.ops.layout import (
@@ -24,13 +26,16 @@ from voyager_compiler.ops.layout import (
     unproject,
 )
 from voyager_compiler.ops.quantized import (
+    EAGER_NUMERICS,
     HADAMARD_SIZE,
     calculate_mx_qparam,
+    compile_like_eager,
     compiled_on_gpu,
     dequantize,
     expand,
     filter_outlier,
     hadamard_rotate,
+    qmap_levels,
     quantize,
     quantize_mx,
     quantize_mx_outlier,
@@ -44,6 +49,7 @@ from voyager_compiler.ops.quantized import (
 __all__ = [
     "DEFAULT_GEMM_LAYOUT",
     "DEFAULT_TENSOR_LAYOUT",
+    "EAGER_NUMERICS",
     "GEMM_LAYOUTS",
     "GEMM_WEIGHT_LAYOUTS",
     "GEMV_LAYOUTS",
@@ -55,12 +61,14 @@ __all__ = [
     "OIHW_TO_HWIO",
     "TENSOR_LAYOUTS",
     "calculate_mx_qparam",
+    "compile_like_eager",
     "compiled_on_gpu",
     "dequantize",
     "expand",
     "filter_outlier",
     "hadamard_rotate",
     "project",
+    "qmap_levels",
     "quantize",
     "quantize_mx",
     "quantize_mx_outlier",

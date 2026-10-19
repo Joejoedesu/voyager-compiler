@@ -20,6 +20,15 @@ and optimizer setup of Karpathy's build-nanogpt.  The model is built from
 ``pretokenize.py`` writes, read in order in fixed-size batches, so every run
 sees the same tokens and a resumed run continues exactly.
 
+The defaults follow SmolLM2-135M's pretraining recipe
+(``huggingface/smollm``, ``text/pretraining/smollm2/config_smollm2_135M.yaml``):
+2048-token sequences, 1M tokens per step (8 x 64 accumulation x 2048),
+AdamW at 3e-3 with betas (0.9, 0.95) and weight decay 0.01, gradients
+clipped to 1.0, and a warmup-stable-decay schedule that warms up linearly
+over 2000 steps and decays linearly to zero over the last 20%.  The model
+trains with the recipe's RoPE theta of 10000, not the 100000 of the
+released config, which was raised for long-context training afterwards.
+
 The quantization flags pick the mode::
 
     flags                          forward GEMMs  backward GEMMs
@@ -28,16 +37,27 @@ The quantization flags pick the mode::
     --weight --activation          quantized      unquantized
     --weight --activation --error  quantized      quantized
 
-``lm_head`` and attention's QK^T and PV stay unquantized unless
+Quantized GEMMs are fake-quant, run eagerly, unless ``--compile_step``
+compiles the training step -- forward, loss and backward -- as one program
+(``TrainingStep``) that calls the same fake-quants, or ``--gpu_kernels``
+runs them as real FP8 / NVFP4 kernels in that program, lowered by
+``backend/gpu``'s ``lower_training``.  Under ``--compile_step`` each weight
+is quantized once per optimizer step, not once per micro-batch, unless it
+rounds stochastically, and the steps inside a codebook refit window still
+run eagerly.
+``lm_head``, the rotary embedding and attention's QK^T and PV stay
+unquantized unless
 ``--quantize_lm_head`` / ``--quantize_attention``, as do the decoder layers
 ``--bf16_layers_at_start`` / ``--bf16_layers_at_end`` name.  The optimizer
 updates FP32 master weights, from gradients accumulated in FP32 and clipped
 to ``--max_grad_norm``; the model computes in bf16 with ``--bf16``.
+Lookup-table formats (``lut<I>_to_<E>``) are refitted to the training
+tensors every ``--codebook_refit_steps`` steps by ``CodebookRefitter``.
 
 Example::
 
     python examples/language_modeling/run_clm_no_trainer.py \\
-        --data_dir ~/claude/datasets/fineweb-edu-10BT-llama2 \\
+        --data_dir ~/claude/datasets/fineweb-edu-10BT-smollm2 \\
         --output_dir ~/claude/pretrain/mxint8 --max_train_steps 5000 --bf16 \\
         --activation int8,qs=microscaling,bs=32 \\
         --weight int8,qs=microscaling,bs=32 \\
@@ -45,11 +65,14 @@ Example::
 """
 
 import argparse
+import contextlib
+import copy
 import json
 import logging
 import math
 import os
 import time
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -58,14 +81,23 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     get_scheduler,
+    masking_utils,
     set_seed,
 )
 
 from voyager_compiler import (
+    TrainingStep,
     add_experiment_args,
     get_default_quantizer,
     prepare_from_args,
     with_execution_context,
+)
+from voyager_compiler.backend.gpu.training import lower_training
+from voyager_compiler.quantization import (
+    CodebookRefitter,
+    Weighting,
+    in_refit_window,
+    refit_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,8 +114,14 @@ def parse_args():
     )
     parser.add_argument(
         "--config_name",
-        default="amd/AMD-Llama-135m",
+        default="HuggingFaceTB/SmolLM2-135M",
         help="Model config to build the model from, with random weights.",
+    )
+    parser.add_argument(
+        "--rope_theta",
+        type=float,
+        default=10000.0,
+        help="RoPE base frequency, in place of the config's.",
     )
     parser.add_argument(
         "--config_overrides",
@@ -93,29 +131,27 @@ def parse_args():
             '"num_hidden_layers=6,hidden_size=512".'
         ),
     )
-    parser.add_argument("--per_device_train_batch_size", type=int, default=16)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=32)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=64)
     parser.add_argument(
-        "--block_size", type=int, default=1024, help="Tokens per sequence."
+        "--block_size",
+        type=int,
+        default=2048,
+        help="Tokens per sequence, and the model's context length.",
     )
-    parser.add_argument("--learning_rate", type=float, default=6e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--learning_rate", type=float, default=3e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument(
         "--lr_scheduler_type",
-        default="cosine_with_min_lr",
+        default="warmup_stable_decay",
         choices=["cosine_with_min_lr", "warmup_stable_decay"],
     )
-    parser.add_argument(
-        "--num_warmup_steps",
-        type=int,
-        default=715,
-        help="GPT-3's 375M warmup tokens at 0.5M tokens per step.",
-    )
+    parser.add_argument("--num_warmup_steps", type=int, default=2000)
     parser.add_argument(
         "--min_lr_ratio",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Final learning rate as a fraction of --learning_rate.",
     )
     parser.add_argument(
@@ -139,7 +175,16 @@ def parse_args():
         default=None,
         help="Save a checkpoint every this many steps; always at the end.",
     )
-    parser.add_argument("--resume_from_checkpoint", default=None)
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        default=None,
+        help=(
+            "Checkpoint to continue from.  Under the quantization settings "
+            "it was saved with, the run continues exactly; under others it "
+            "branches: weights, optimizer, schedule, data position and RNG "
+            "carry over, and the quantizers start fresh."
+        ),
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -164,9 +209,85 @@ def parse_args():
         default=0,
         help="Number of last decoder layers left unquantized.",
     )
+    parser.add_argument(
+        "--gpu_kernels",
+        action="store_true",
+        help=(
+            "Run the quantized GEMMs as real FP8 / NVFP4 kernels "
+            "(backend/gpu's lower_training) instead of fake-quant; needs "
+            "--error."
+        ),
+    )
+    parser.add_argument(
+        "--compile_step",
+        action="store_true",
+        help=(
+            "Compile the fake-quant training step -- forward, loss and "
+            "backward -- as one program; needs --error.  Steps inside a "
+            "codebook refit window run eagerly."
+        ),
+    )
+    parser.add_argument(
+        "--codebook_refit_steps",
+        type=int,
+        default=0,
+        help="Refit the forward lookup tables every this many steps; 0 never.",
+    )
+    parser.add_argument(
+        "--codebook_collect_steps",
+        type=int,
+        default=4,
+        help="Steps before each refit its statistics are collected over.",
+    )
+    parser.add_argument(
+        "--codebook_weighting",
+        choices=[Weighting.PARTNER.value, Weighting.FISHER_ACTIVATIONS.value],
+        default=Weighting.PARTNER.value,
+        help=(
+            "What weights each sample of a refit: the partner's channel "
+            "energy, or the activations' own loss-gradient Fisher diagonal."
+        ),
+    )
+    parser.add_argument(
+        "--codebook_refit_gradients",
+        action="store_true",
+        help="Refit the gradients' lookup tables too.",
+    )
     add_experiment_args(parser)
     parser.set_defaults(log_level="INFO")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.gpu_kernels and args.error is None:
+        parser.error("--gpu_kernels lowers a quantized training step: --error")
+    if args.gpu_kernels and args.codebook_refit_steps:
+        parser.error("a codebook refit hooks fake-quants: no --gpu_kernels")
+    if args.compile_step and args.error is None:
+        parser.error("--compile_step compiles a quantized step: --error")
+    if args.compile_step and args.gpu_kernels:
+        parser.error("--gpu_kernels compiles the step too: no --compile_step")
+    return args
+
+
+@contextlib.contextmanager
+def causal_sdpa():
+    """Capture SDPA attention as ``is_causal`` instead of a causal mask.
+
+    transformers builds the mask whenever it is tracing, since a baked-in
+    flag would be wrong for a graph of variable length or with packed
+    sequences.  Training batches have one fixed length and no padding.
+    """
+
+    def skip(padding_mask, query_length, kv_length, *args, **kwargs):
+        return query_length == kv_length and (
+            padding_mask is None or bool(padding_mask.all())
+        )
+
+    with (
+        patch.object(masking_utils, "_ignore_causal_mask_sdpa", skip),
+        patch.object(
+            masking_utils, "find_packed_sequence_indices", lambda ids: None
+        ),
+    ):
+        yield
 
 
 class TokenStream:
@@ -216,27 +337,45 @@ def build_quantizer(args, num_layers):
         error=args.error,
         random_hadamard_transform=args.random_hadamard_transform,
     )
+    quantizer.set_module_name("rotary_emb", None)
     if not args.quantize_lm_head:
         quantizer.set_module_name("lm_head", None)
     if not args.quantize_attention:
-        quantizer.set_module_name_object_type(
-            r"self_attn$", torch.ops.aten.matmul.default, None
-        )
+        for op in (
+            torch.ops.aten.matmul.default,
+            torch.ops.aten.scaled_dot_product_attention.default,
+        ):
+            quantizer.set_module_name_object_type(r"self_attn$", op, None)
     end = num_layers - args.bf16_layers_at_end
     for layer in [*range(args.bf16_layers_at_start), *range(end, num_layers)]:
         quantizer.set_module_name(rf"layers\.{layer}$", None)
     return quantizer
 
 
-def evaluate(model, stream, num_batches, device):
-    """Mean loss of ``model`` over ``stream``'s next ``num_batches``."""
+def evaluate(model, loss_of, stream, num_batches, device):
+    """Mean loss over ``stream``'s next ``num_batches``.
+
+    The quantizers' state, such as a delayed scaling's amax history, is put
+    back afterwards, so evaluating leaves training as it was.
+
+    Args:
+        model: The module training runs, switched to eval mode meanwhile.
+        loss_of: Called with a batch of token ids; returns its loss.
+        stream: Token stream to read the batches from.
+        num_batches: Batches to average over.
+        device: Device the batches go to.
+    """
+    quantizers = getattr(model, "training_quantizers", None)
+    if quantizers is not None:
+        saved = copy.deepcopy(quantizers.state_dict())
     model.eval()
     total = 0.0
     with torch.no_grad():
         for _ in range(num_batches):
-            batch = stream.next_batch().to(device)
-            total += model(input_ids=batch, labels=batch).loss.item()
+            total += loss_of(stream.next_batch().to(device)).item()
     model.train()
+    if quantizers is not None:
+        quantizers.load_state_dict(saved)
     return total / num_batches
 
 
@@ -262,9 +401,14 @@ def main(args):
     config = AutoConfig.from_pretrained(args.config_name)
     if args.config_overrides is not None:
         config.update_from_string(args.config_overrides)
+    config.rope_parameters["rope_theta"] = args.rope_theta
+    config.max_position_embeddings = args.block_size
     config.use_cache = False
+    # Quantizing QK^T and PV needs them as matmuls; otherwise attention runs
+    # fused, which never materializes the score matrix.
     model = AutoModelForCausalLM.from_config(
-        config, attn_implementation="eager"
+        config,
+        attn_implementation="eager" if args.quantize_attention else "sdpa",
     )
     if args.bf16:
         model.bfloat16()
@@ -272,17 +416,38 @@ def main(args):
     logger.info(f"#Params: {sum(p.numel() for p in model.parameters())}")
     logger.info(f"Tokens: {meta['tokenizer']} ids from {args.data_dir}")
 
-    if args.activation is not None or args.weight is not None:
-        example = torch.zeros(shape, dtype=torch.long, device=device)
-        model = prepare_from_args(
+    example = torch.zeros(shape, dtype=torch.long, device=device)
+    example = {"input_ids": example, "labels": example}
+    specs = (args.activation, args.weight, args.error)
+    if any(spec is not None for spec in specs):
+        with causal_sdpa():
+            model = prepare_from_args(
+                model,
+                args,
+                (),
+                example,
+                quantizer=build_quantizer(args, config.num_hidden_layers),
+            )
+    step = TrainingStep(
+        model,
+        compile=args.compile_step or args.gpu_kernels,
+        lower=lower_training if args.gpu_kernels else None,
+    )
+
+    def loss_of(batch):
+        return model(input_ids=batch, labels=batch).loss
+
+    refitter = None
+    if args.codebook_refit_steps:
+        refitter = CodebookRefitter(
             model,
-            args,
-            (),
-            {"input_ids": example, "labels": example},
-            quantizer=build_quantizer(args, config.num_hidden_layers),
+            weighting=Weighting(args.codebook_weighting),
+            refit_gradients=args.codebook_refit_gradients,
         )
 
-    params = [p for p in model.parameters() if p.requires_grad]
+    names, params = zip(
+        *((n, p) for n, p in model.named_parameters() if p.requires_grad)
+    )
     masters = [p.detach().to(torch.float32, copy=True) for p in params]
     for master in masters:
         master.grad = torch.zeros_like(master)
@@ -305,6 +470,7 @@ def main(args):
     if args.lr_scheduler_type == "warmup_stable_decay":
         schedule_kwargs = {
             "num_decay_steps": round(args.decay_ratio * args.max_train_steps),
+            "decay_type": "linear",
             "min_lr_ratio": args.min_lr_ratio,
         }
     else:
@@ -317,14 +483,47 @@ def main(args):
         scheduler_specific_kwargs=schedule_kwargs,
     )
 
+    # What the GEMMs are quantized to: a checkpoint saved under the same
+    # settings resumes exactly, under others it starts a branch.
+    quantization = {
+        key: getattr(args, key)
+        for key in (
+            "activation",
+            "weight",
+            "error",
+            "bias",
+            "random_hadamard_transform",
+            "quantize_lm_head",
+            "quantize_attention",
+            "bf16_layers_at_start",
+            "bf16_layers_at_end",
+        )
+    }
     completed_steps = 0
     if args.resume_from_checkpoint is not None:
         state = torch.load(
             args.resume_from_checkpoint, map_location=device, weights_only=False
         )
-        model.load_state_dict(state["model"])
-        for master, saved in zip(masters, state["masters"]):
-            master.copy_(saved)
+        if set(state["masters"]) != set(names):
+            raise ValueError(
+                f"{args.resume_from_checkpoint} holds other parameters"
+            )
+        for name, master in zip(names, masters):
+            master.copy_(state["masters"][name])
+        if state["quantization"] == quantization:
+            model.load_state_dict(state["model"])
+            # The tables are not in the state dict.
+            if refitter is not None:
+                for name, table in state["codebooks"].items():
+                    refitter.modules[name].install_qmap(table)
+        else:
+            with torch.no_grad():
+                for param, master in zip(params, masters):
+                    param.copy_(master)
+            logger.info(
+                f"Branching from a checkpoint quantized as "
+                f"{state['quantization']}"
+            )
         optimizer.load_state_dict(state["optimizer"])
         lr_scheduler.load_state_dict(state["lr_scheduler"])
         train_stream.shard, train_stream.offset = state["stream"]
@@ -342,14 +541,22 @@ def main(args):
     total_loss = 0.0
     start = time.time()
     while completed_steps < args.max_train_steps:
-        for _ in range(args.gradient_accumulation_steps):
-            batch = train_stream.next_batch().to(device)
-            loss = model(input_ids=batch, labels=batch).loss
-            (loss / args.gradient_accumulation_steps).backward()
-            total_loss += loss.detach().float()
-            for param, master in zip(params, masters):
-                master.grad += param.grad
-                param.grad = None
+        # A refit window hooks the fake-quants, which only an eager step runs.
+        if refitter is not None:
+            every = args.codebook_refit_steps
+            collect = args.codebook_collect_steps
+            window = refit_window(refitter, completed_steps, every, collect)
+            eager = in_refit_window(completed_steps, every, collect)
+        else:
+            window, eager = contextlib.nullcontext(), False
+        # The weights change only between optimizer steps.
+        with window, step.fixed_weights():
+            for _ in range(args.gradient_accumulation_steps):
+                batch = train_stream.next_batch().to(device)
+                loss, grads = step(input_ids=batch, labels=batch, eager=eager)
+                total_loss += loss.float()
+                for master, grad in zip(masters, grads):
+                    master.grad += grad / args.gradient_accumulation_steps
         grad_norm = torch.nn.utils.clip_grad_norm_(masters, args.max_grad_norm)
         optimizer.step()
         lr_scheduler.step()
@@ -358,6 +565,14 @@ def main(args):
             for param, master in zip(params, masters):
                 param.copy_(master)
         completed_steps += 1
+        if (
+            refitter is not None
+            and completed_steps % args.codebook_refit_steps == 0
+        ):
+            fitted = refitter.refit()
+            logger.info(
+                f"refit {len(fitted)} codebooks at step {completed_steps}"
+            )
 
         metrics = {}
         if completed_steps % args.logging_steps == 0:
@@ -373,7 +588,9 @@ def main(args):
         last = completed_steps == args.max_train_steps
         if completed_steps % args.eval_steps == 0 or last:
             val_stream = TokenStream(files[:1], meta["dtype"], *shape)
-            val_loss = evaluate(model, val_stream, args.eval_batches, device)
+            val_loss = evaluate(
+                model, loss_of, val_stream, args.eval_batches, device
+            )
             metrics["val_loss"] = val_loss
             metrics["val_perplexity"] = math.exp(val_loss)
         if metrics:
@@ -390,7 +607,16 @@ def main(args):
             torch.save(
                 {
                     "model": model.state_dict(),
-                    "masters": masters,
+                    "masters": dict(zip(names, masters)),
+                    "quantization": quantization,
+                    "codebooks": (
+                        {
+                            name: refitter.modules[name].qmap
+                            for name in refitter.tables
+                        }
+                        if refitter is not None
+                        else None
+                    ),
                     "optimizer": optimizer.state_dict(),
                     "lr_scheduler": lr_scheduler.state_dict(),
                     "stream": (train_stream.shard, train_stream.offset),

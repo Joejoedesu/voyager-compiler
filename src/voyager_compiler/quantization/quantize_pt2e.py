@@ -32,7 +32,6 @@ from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
-    RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
     calculate_global_scale,
     get_quantization_map,
@@ -1601,10 +1600,7 @@ def convert_pt2e(
         assert mod is not None
         if not isinstance(mod, FakeQuantizeBase):
             continue
-        if (
-            isinstance(mod, RandomHadamardTransform)
-            and mod.rht_axis is not None
-        ):
+        if isinstance(mod, MXFakeQuantize) and mod.rht_axis is not None:
             raise NotImplementedError(
                 "The random Hadamard transform has no lowering yet"
             )
