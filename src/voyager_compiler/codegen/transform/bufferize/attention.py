@@ -116,8 +116,10 @@ def plan_gqa_fold(q, k, v, mask, out_shape, num_q_blocks):
         mb = tuple(mask.shape[:-2])
         m_skv = mask.shape[-1]
         m_head = mb[-1] if mb else 1
-        if m_head == batch[-1]:  # per-query-head mask: reshapes like q
-            mask_fold_shape = kbatch + (sq_eff, m_skv)
+        if m_head == batch[-1]:
+            # A per-query-head mask reshapes like q, keeping its own batch
+            # dims, which may broadcast over the query's.
+            mask_fold_shape = mb[:-1] + kbatch[-1:] + (sq_eff, m_skv)
         elif m_head == 1:  # head-broadcast mask: expands the group
             mask_broadcast = True
             mask_fold_shape = mb + (sq_eff, m_skv)
