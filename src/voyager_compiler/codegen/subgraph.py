@@ -20,6 +20,7 @@ from voyager_compiler.codegen.iteration_space import (
 )
 from voyager_compiler.codegen.node_info import (
     NORM_OPS,
+    get_arg_value,
     is_gemm_op,
     is_nop,
     is_reshape_op,
@@ -192,13 +193,17 @@ def get_unique_node_name(node: Node):
     Generate a unique and meaningful name for the node based on its parameter.
     """
     if (pos := OP_PARAM_ARG_INDEX.get(node.target)) is not None:
-        weight_node = node.args[pos]
+        # A norm without an affine has no weight to name it by.
+        weight_node = get_arg_value(node, pos, "weight")
         # There are cases where weights are sliced. Trace up to find the
         # get_attr node and use the parameter name
-        while weight_node.target == torch.ops.aten.slice.Tensor:
+        while (
+            isinstance(weight_node, Node)
+            and weight_node.target == torch.ops.aten.slice.Tensor
+        ):
             weight_node = weight_node.args[0]
 
-        if weight_node.op == "get_attr":
+        if isinstance(weight_node, Node) and weight_node.op == "get_attr":
             return weight_node.name.split("_weight")[0]
 
     return node.name

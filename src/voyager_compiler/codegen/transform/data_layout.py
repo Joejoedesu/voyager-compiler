@@ -156,45 +156,80 @@ def _permute_inputs(
     node: Node, model: GraphModule, nhwc_nodes: List[Node]
 ) -> Optional[Node]:
     """Bring one input of the NHWC group into that layout, and return the node
-    whose value it left stale for the caller to restamp."""
+    whose value it left stale for the caller to restamp.
+
+    A conv's weight (or weight scale) is permuted in place, and a 4-D
+    activation goes through a permute.  An operand the group's elementwise
+    ops broadcast onto its activations (a per-channel scale ``[C, 1, 1]``,
+    a spatial mask ``[1, 1, H, W]``) is ranked up to 4-D first, and a
+    constant one is relaid once, into a buffer of its own."""
     graph = model.graph
 
     # Case A: Input is a weight (Parameter) or weight scale.
-    if node.op == "get_attr":
-        user = next((n for n in node.users if is_conv2d(n)), None)
-        if user is None or is_depthwise_conv(user):
+    conv = next((n for n in node.users if is_conv2d(n)), None)
+    if node.op == "get_attr" and conv is not None:
+        if is_depthwise_conv(conv):
             return None
 
-        w = get_arg_value(user, 1, "weight")
-        ws = user.kwargs.get("weight_scale")
+        w = get_arg_value(conv, 1, "weight")
+        ws = conv.kwargs.get("weight_scale")
         if node not in [w, ws]:
             return None
 
-        logger.debug(f"Permuting {user} parameter: {node}")
+        logger.debug(f"Permuting {conv} parameter: {node}")
         param = fetch_attr(model, node.target)
         param.data = param.data.permute(2, 3, 1, 0)
 
         node.meta["dims"] = OIHW_TO_HWIO
         return node
 
-    # Case B: Input is an activation flowing into the group from outside
-    if len(node.shape) == 4:
-        logger.debug(f"Insert permute after {node} with dims {NCHW_TO_NHWC}")
-        with graph.inserting_after(node):
-            permute_node = graph.call_function(
-                torch.ops.aten.permute.default,
-                (node, NCHW_TO_NHWC),
+    # Case B: an activation flowing into the group from outside, or a
+    # broadcast operand of its aten elementwise ops (a quantize's scales
+    # follow its axis argument instead)
+    readers = [u for u in node.users if u in nhwc_nodes]
+    rank = len(node.shape)
+    broadcast = (
+        0 < rank <= 4
+        and node.value.numel() > 1
+        and all(
+            is_elementwise_op(u) and u.target.namespace == "aten"
+            for u in readers
+        )
+    )
+    constant = node.op == "get_attr" and node.target not in written_buffers(
+        graph
+    )
+    if not broadcast and (rank != 4 or constant):
+        return None
+
+    full = (1,) * (4 - rank) + tuple(node.shape)
+    logger.debug(f"Relaying {node} {full} with dims {NCHW_TO_NHWC}")
+    with graph.inserting_after(node):
+        if constant:
+            relaid = create_getattr_from_value(
+                model,
+                graph,
+                node.name + "_nhwc",
+                _relaid(node.value, full, NCHW_TO_NHWC),
+                derived_producer(node, _relaid, full, NCHW_TO_NHWC),
             )
+        else:
+            view = node
+            if rank < 4:
+                view = graph.call_function(
+                    torch.ops.aten.reshape.default, (node, full)
+                )
+                view.meta["dtype"] = node.meta.get("dtype")
+                propagate_shape(view, model)
+            relaid = graph.call_function(
+                torch.ops.aten.permute.default, (view, NCHW_TO_NHWC)
+            )
+            relaid.meta["dtype"] = node.meta.get("dtype")
 
-        permute_node.meta["dims"] = NCHW_TO_NHWC
-        permute_node.meta["dtype"] = node.meta.get("dtype")
-
-        for user in list(node.users.keys()):
-            if user in nhwc_nodes:
-                user.replace_input_with(node, permute_node)
-        return permute_node
-
-    return None
+    relaid.meta["dims"] = NCHW_TO_NHWC
+    for user in readers:
+        user.replace_input_with(node, relaid)
+    return relaid
 
 
 def _rewrite_node_args_for_layout(node: Node) -> None:
