@@ -126,7 +126,10 @@ _LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
 _LLM_SPMM_DB = _LLM_SPMM + " " + _DB
-_LLM_TRAIN = "--training --context_length 1024 --num_hidden_layers 1 " + _FP16
+_LLM_TRAIN = (
+    "--training --context_length 1024 --num_hidden_layers 1 "
+    "--accumulate_fp32 " + _FP16
+)
 
 
 @dataclass(frozen=True)
@@ -309,16 +312,22 @@ def _compare(label, status, run_dir, prev_run):
     """
     if status in ("error", "no_output"):
         return "FAILED", ""
-    if prev_run is None:
+    previous = set() if prev_run is None else set(_programs(prev_run / label))
+    if not previous:
         return "NEW", ""
 
-    diff = []
-    for program in _programs(run_dir / label):
-        prev_path = prev_run / label / program
-        if not prev_path.exists():
-            return "NEW", ""
+    programs = set(_programs(run_dir / label))
+    diff = [
+        f"only in {run.name}/{label}: {program}"
+        for run, only in (
+            (prev_run, previous - programs),
+            (run_dir, programs - previous),
+        )
+        for program in sorted(only)
+    ]
+    for program in sorted(programs & previous):
         diff += difflib.unified_diff(
-            prev_path.read_text().splitlines(),
+            (prev_run / label / program).read_text().splitlines(),
             (run_dir / label / program).read_text().splitlines(),
             fromfile=f"{prev_run.name}/{label}/{program}",
             tofile=f"{run_dir.name}/{label}/{program}",

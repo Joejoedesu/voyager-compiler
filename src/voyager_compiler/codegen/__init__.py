@@ -22,7 +22,6 @@ from voyager_compiler.codegen.transform.padding import (
     pad_vit_embeddings_output,
 )
 from voyager_compiler.codegen.transform.quant_folding import (
-    fuse_dequantize_quantize,
     fuse_quantize_dequantize_with_producer,
     quantizes_kv_cache,
     sink_cache_folds,
@@ -55,7 +54,6 @@ __all__ = [
     "eliminate_reshape_with_no_effect",
     "extract_input_preprocessor",
     "fold_constant_generators",
-    "fuse_dequantize_quantize",
     "fuse_operator",
     "fuse_patterns",
     "fuse_quantize_dequantize_with_producer",

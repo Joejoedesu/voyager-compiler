@@ -24,9 +24,9 @@ from torch.library import triton_op
 from voyager_compiler.ops import (
     calculate_mx_qparam,
     compile_like_eager,
-    expand,
     hadamard_rotate,
     quantize_mx,
+    repeat_per_block,
     vmap,
 )
 from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
@@ -149,8 +149,8 @@ def _group_wise_affine_fake_quant_reference(
     if scale_qmap is not None:
         zp = vmap(zp, scale_qmap)
 
-    expanded_sf = expand(sf, input.shape, block_size)
-    expanded_zp = expand(zp, input.shape, block_size)
+    expanded_sf = repeat_per_block(sf, input, block_size)
+    expanded_zp = repeat_per_block(zp, input, block_size)
 
     q = torch.round(input / expanded_sf + expanded_zp)
     q = torch.clamp(q, quant_min, quant_max)
@@ -191,7 +191,7 @@ def _quantize_mx_and_back(
         seed=seed,
         global_scale=global_scale,
     )
-    output = output * expand(scale, output.shape, block_size)
+    output = output * repeat_per_block(scale, output, block_size)
     if global_scale is not None:
         output = output * global_scale
     return output
@@ -322,8 +322,8 @@ def mx_fake_quant(
         hadamard_axis: The axis ``hadamard`` rotates along.
 
     Returns:
-        The fake-quantized tensor, laid out as ``input`` when the kernel
-        computes it with its rotation.
+        The fake-quantized tensor, laid out as ``input`` unless rotated, or
+        when the kernel computes it with its rotation.
     """
     return _run_mx_fake_quant(
         _quantize_mx_and_back,
@@ -440,7 +440,7 @@ def _bin_blocks_reference(
         )
         if global_scale is not None:
             scale = scale * global_scale
-        scale = expand(scale, ordered.shape, block_size)
+        scale = repeat_per_block(scale, ordered, block_size)
         values = (ordered / scale).reshape(-1)
         if cell_energy is None:
             weights = torch.ones_like(values)

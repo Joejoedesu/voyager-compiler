@@ -367,10 +367,11 @@ def _annotate_sdpa(
     value the weight spec.  The key is passed ``[keys, head_dim]`` and
     contracts along its last axis, so its blocks go there rather than on
     the axis the spec names for a ``[contraction, out]`` operand; the value
-    contracts along the keys, as the spec says.  The probabilities are
-    quantized inside the attention kernel with the query's spec.  A fused
-    attention's backward reads its forward's query, key and value, and,
-    annotated alike, reads them through the forward's fake-quants."""
+    contracts along the keys, as the spec says.  ``sdpa_mx`` quantizes the
+    probabilities inside the kernel with the query's spec; a fused attention
+    in a training graph leaves them unquantized.  Its backward reads its
+    forward's query, key and value, and, annotated alike, reads them
+    through the forward's fake-quants."""
     annotated_partitions = []
     input_act_qspec = quantization_config.input_activation
     output_act_qspec = quantization_config.output_activation

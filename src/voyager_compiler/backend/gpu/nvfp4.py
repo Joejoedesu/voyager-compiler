@@ -39,7 +39,7 @@ from torchao.prototype.mx_formats.kernels import (
 from torchao.prototype.mx_formats.utils import from_blocked, to_blocked
 
 from voyager_compiler.codegen.node_info import get_arg_value
-from voyager_compiler.ops import expand, hadamard_rotate
+from voyager_compiler.ops import hadamard_rotate
 from voyager_compiler.ops.quantized import (
     PHILOX_ROUNDS,
     _random_bytes,
@@ -1063,7 +1063,8 @@ def pack_nvfp4(
         up to 128 rows and ``K / 16`` up to 4 columns, zero-padded.
     """
     rows, length = values.shape
-    scales = expand(scales, (rows, length // BLOCK_SIZE), BLOCK_SIZE)
+    if scales.shape[0] != rows:
+        scales = scales.repeat_interleave(BLOCK_SIZE, 0)[:rows]
     codes = pack_uint4(f32_to_f4_unpacked(values.float()))
     scales = to_blocked(scales.to(torch.float8_e4m3fn).view(torch.uint8))
     return codes, scales

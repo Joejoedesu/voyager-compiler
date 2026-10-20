@@ -107,20 +107,31 @@ from voyager_compiler.ops.layout import (  # noqa: E402
 )
 
 
-def expand(input, shape, block_size):
-    while input.ndim < len(shape):
-        input = input.unsqueeze(0)
+def repeat_per_block(scale, input, block_size):
+    """``scale`` repeated over its blocks, in ``input``'s shape and layout.
 
-    # Repeat the input along each dimension to match the target shape
-    for dim in range(len(shape)):
-        if input.shape[dim] != shape[dim]:
-            input = torch.repeat_interleave(input, block_size, dim)
+    ``scale`` holds one value per block of ``block_size`` elements along each
+    axis where its size differs from ``input``'s, a partial block counting as
+    one; it may have fewer leading axes.
+    """
+    while scale.ndim < input.ndim:
+        scale = scale.unsqueeze(0)
 
-    # If the shape is not a multiple of block_size, we may need to slice
-    if list(input.shape) != list(shape):
-        slices = [slice(0, x) for x in shape]
-        input = input[slices]
-    return input
+    # Repeated in the input's memory order, the result takes its layout; an
+    # input that is not densely packed, as a broadcast one, has none.
+    order = sorted(range(input.ndim), key=input.stride, reverse=True)
+    if not input.permute(order).is_contiguous():
+        order = list(range(input.ndim))
+    scale = scale.permute(order)
+    shape = [input.shape[dim] for dim in order]
+    for dim, size in enumerate(shape):
+        if scale.shape[dim] != size:
+            scale = torch.repeat_interleave(scale, block_size, dim)
+
+    # A partial block repeats past the input's end.
+    if list(scale.shape) != shape:
+        scale = scale[tuple(slice(size) for size in shape)]
+    return scale.permute([order.index(dim) for dim in range(input.ndim)])
 
 
 quantized_ops_lib.define("vmap(Tensor self, Tensor other) -> Tensor")
@@ -143,9 +154,16 @@ def vmap(
         output = qmap[indices.to(torch.int32) & 0xFFFF].to(input.dtype)
         return output.to(input_dtype)
 
-    output = torch.empty_like(input, memory_format=torch.contiguous_format)
-    indices_flat = indices.reshape(-1)
-    output_flat = output.view(-1)
+    # Walked in memory order, the output keeps the input's layout; an input
+    # that is not densely packed, as a broadcast one, has none.
+    order = sorted(range(input.ndim), key=input.stride, reverse=True)
+    if input.permute(order).is_contiguous():
+        output = torch.empty_like(input)
+    else:
+        order = list(range(input.ndim))
+        output = torch.empty_like(input, memory_format=torch.contiguous_format)
+    indices_flat = indices.permute(order).reshape(-1)
+    output_flat = output.permute(order).view(-1)
 
     for start in range(0, indices_flat.numel(), chunk_size):
         end = min(start + chunk_size, indices_flat.numel())
@@ -463,9 +481,9 @@ def quantize(
         function arguments instead
     """
     if block_size is not None:
-        scale = expand(scale, input.shape, block_size)
+        scale = repeat_per_block(scale, input, block_size)
         if zero_point is not None:
-            zero_point = expand(zero_point, input.shape, block_size)
+            zero_point = repeat_per_block(zero_point, input, block_size)
 
     if zero_point is None:
         input = input / scale
@@ -525,9 +543,9 @@ def dequantize(
         input = vmap(input, input_qmap)
 
     if block_size is not None:
-        scale = expand(scale, input.shape, block_size)
+        scale = repeat_per_block(scale, input, block_size)
         if zero_point is not None:
-            zero_point = expand(zero_point, input.shape, block_size)
+            zero_point = repeat_per_block(zero_point, input, block_size)
 
     if zero_point is None:
         dequantized = input * scale
@@ -556,7 +574,7 @@ def _decode_and_scale(input, scale, code, block_size):
     if code is not None:
         input = decode(input, code)
     if scale is not None:
-        input = input * expand(scale, input.shape, block_size)
+        input = input * repeat_per_block(scale, input, block_size)
     return input
 
 
@@ -1559,7 +1577,7 @@ def spmm_csr(
     if B_code is not None:
         B = decode(B, B_code)
     if B_scale is not None:
-        B = B * expand(B_scale, B.shape, block_size)
+        B = B * repeat_per_block(B_scale, B, block_size)
 
     # A KC-stored B is [out, contraction]; the sparse mm needs
     # [contraction, out], so transpose it.  A CK-stored B is already

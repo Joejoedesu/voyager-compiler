@@ -385,7 +385,7 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
         propagate_shape(input.args[0])
         propagate_shape(input)
         propagate_shape(scale)
-        _propagate_readers(model, input.args[0])
+        _slice_readers(model, input.args[0])
     else:
         node.replace_input_with(node_to_pad, new_input)
 
@@ -396,24 +396,33 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
             )
 
 
-def _propagate_readers(model, node):
-    """Re-propagate the shapes of the ops reading ``node`` after its input
-    was padded, down to the GEMMs reading them, which pad themselves.
+def _slice_readers(model, quantize_mx):
+    """Slice the pad back off for the readers of a padded ``quantize_mx``
+    other than GEMMs, so they read its values unpadded.
 
-    A quantized tensor another reader shares, such as a QAT backward GEMM
-    reading a weight's ``quantize_mx`` through ``dequantize_mx``, grows with
-    the pad.
+    A QAT backward GEMM reads a forward operand's ``quantize_mx`` through
+    ``dequantize_mx``; the views after it keep their traced shapes, and a
+    padded output channel would widen the GEMM's result.  A GEMM reading
+    the ``quantize_mx`` pads its own operands.
     """
-    reached, pending = set(), [*node.users]
-    while pending:
-        user = pending.pop()
-        if user in reached or is_gemm_op(user):
-            continue
-        reached.add(user)
-        pending.extend(user.users)
-    order = {n: i for i, n in enumerate(model.graph.nodes)}
-    for user in sorted(reached, key=order.__getitem__):
-        propagate_shape(user)
+    for output in list(quantize_mx.users):
+        for reader in list(output.users):
+            if is_gemm_op(reader):
+                continue
+            shape, users = reader.shape, list(reader.users)
+            propagate_shape(reader)
+            sliced = reader
+            for dim, size in enumerate(shape):
+                if reader.shape[dim] == size:
+                    continue
+                with model.graph.inserting_after(sliced):
+                    sliced = model.graph.call_function(
+                        torch.ops.aten.slice.Tensor, (sliced, dim, 0, size)
+                    )
+                propagate_shape(sliced)
+                sliced.meta["dtype"] = reader.meta.get("dtype")
+            for user in users:
+                user.replace_input_with(reader, sliced)
 
 
 def _crossable(node, user, slice_args):

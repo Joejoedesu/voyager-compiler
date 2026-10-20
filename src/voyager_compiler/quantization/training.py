@@ -39,6 +39,7 @@ import copy
 import operator
 import types
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -171,19 +172,6 @@ def _fake_quantize(
     global scale ``_share_global_scales`` shares, if any.
     """
     return fake_quant(x, **kwargs)
-
-
-def _with_layout(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
-    """``x`` in ``like``'s memory layout.
-
-    A fake-quant returns a contiguous tensor.  A fused attention lays its
-    output out as its query is laid out, and the views after it were traced
-    with the query's layout, so its fake-quantized operands take that layout
-    back.
-    """
-    if x.stride() == like.stride():
-        return x
-    return torch.empty_like(like, dtype=x.dtype).copy_(x)
 
 
 class TrainingQuantizers(nn.Module):
@@ -980,10 +968,14 @@ def prepare_training(
                     )
             _share_quantized_views(joint)
             torchao_prepare._get_obs_or_fq_map = _get_obs_or_fq_map
-            torchao_prepare._maybe_insert_input_observers_for_node = (
-                _maybe_insert_input_observers_for_node
-            )
-            with unset_fake_temporarily():
+            with (
+                patch.object(
+                    torchao_prepare,
+                    "_maybe_insert_input_observers_for_node",
+                    _maybe_insert_input_observers_for_node,
+                ),
+                unset_fake_temporarily(),
+            ):
                 prepared = torchao_prepare.prepare(joint, {}, True)
             graph = prepared.graph
             for node in list(graph.nodes):
@@ -1003,15 +995,6 @@ def prepare_training(
                 call.meta["val"] = operand.meta["val"]
                 node.replace_all_uses_with(call)
                 graph.erase_node(node)
-                for reader in list(call.users):
-                    if reader.target not in (*FUSED_SDPA, *FUSED_SDPA_BACKWARD):
-                        continue
-                    with graph.inserting_before(reader):
-                        laid_out = graph.call_function(
-                            _with_layout, (call, operand)
-                        )
-                    laid_out.meta["val"] = operand.meta["val"]
-                    reader.replace_input_with(call, laid_out)
             prepared.recompile()
             return prepared
 

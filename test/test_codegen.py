@@ -1,6 +1,5 @@
 import argparse
 import logging
-from contextlib import nullcontext
 
 import torch
 from torch.testing import assert_close
@@ -261,6 +260,8 @@ def main():
         parser.error("--training compiles bert or llama_prefill")
     if args.training and args.report:
         parser.error("--report takes one graph; --training compiles two")
+    if args.training and args.attn_implementation == "sdpa":
+        parser.error("--training has no fused attention backward: use eager")
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -385,13 +386,9 @@ def main():
             quantizer.set_module_name_object_type_order(
                 llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
             )
-            # As inference: sdpa attention runs ``is_causal``, with no
-            # mask tensor.
-            sdpa = args.attn_implementation == "sdpa"
-            with llama._sdpa_is_causal() if sdpa else nullcontext():
-                gm, old_output, new_output = compile_training_step(
-                    model, inputs, FUSION_PATTERNS, args, quantizer
-                )
+            gm, old_output, new_output = compile_training_step(
+                model, inputs, FUSION_PATTERNS, args, quantizer
+            )
         else:
             gm, old_output, new_output = llama.quantize_and_dump_model(
                 model=model,
