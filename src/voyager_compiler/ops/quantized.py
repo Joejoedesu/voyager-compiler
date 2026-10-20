@@ -116,22 +116,18 @@ def repeat_per_block(scale, input, block_size):
     """
     while scale.ndim < input.ndim:
         scale = scale.unsqueeze(0)
-
-    # Repeated in the input's memory order, the result takes its layout; an
-    # input that is not densely packed, as a broadcast one, has none.
-    order = sorted(range(input.ndim), key=input.stride, reverse=True)
-    if not input.permute(order).is_contiguous():
-        order = list(range(input.ndim))
-    scale = scale.permute(order)
-    shape = [input.shape[dim] for dim in order]
-    for dim, size in enumerate(shape):
+    for dim, size in enumerate(input.shape):
         if scale.shape[dim] != size:
             scale = torch.repeat_interleave(scale, block_size, dim)
 
     # A partial block repeats past the input's end.
-    if list(scale.shape) != shape:
-        scale = scale[tuple(slice(size) for size in shape)]
-    return scale.permute([order.index(dim) for dim in range(input.ndim)])
+    if list(scale.shape) != list(input.shape):
+        scale = scale[tuple(slice(size) for size in input.shape)]
+    if input.is_contiguous():
+        return scale
+    # Copied into the input's layout; an input that is not densely packed,
+    # as a broadcast one, has none.
+    return torch.empty_like(input, dtype=scale.dtype).copy_(scale)
 
 
 quantized_ops_lib.define("vmap(Tensor self, Tensor other) -> Tensor")

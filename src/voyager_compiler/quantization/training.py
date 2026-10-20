@@ -78,7 +78,6 @@ from voyager_compiler.ops import EAGER_NUMERICS, HADAMARD_SIZE
 from voyager_compiler.quantization.fake_quantize import (
     SEED_BOUND,
     FusedAmaxObsFakeQuantize,
-    GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
     _DerivedObserverOrFakeQuantize,
     calculate_global_scale,
@@ -2008,12 +2007,6 @@ class TrainingStep:
         lower: Rewrites the program's quantized GEMMs as real kernels in
             place, such as ``backend.gpu.lower_training``; None keeps the
             fake-quants.
-
-    Raises:
-        NotImplementedError: A fake-quant the compiled program keeps changes
-            its state on every call: delayed scaling, group-wise affine,
-            which writes its scale and zero point, or an outlier filter
-            calibrating its threshold.
     """
 
     def __init__(
@@ -2030,28 +2023,6 @@ class TrainingStep:
         self.fixed = False
         if not compile:
             return
-        if lower is None:
-            # The fake-quants the program keeps must not update state.
-            for module in model.modules():
-                if isinstance(module, FusedAmaxObsFakeQuantize):
-                    raise NotImplementedError(
-                        "Delayed scaling updates its state on every call; "
-                        "compile the step lowered to real kernels instead"
-                    )
-                if isinstance(module, GroupWiseAffineFakeQuantize):
-                    raise NotImplementedError(
-                        "Group-wise affine writes its scale and zero point "
-                        "on every call; run the step eagerly instead"
-                    )
-                if (
-                    isinstance(module, MXFakeQuantize)
-                    and module.outlier_pct is not None
-                    and module.observer_enabled
-                ):
-                    raise NotImplementedError(
-                        "An outlier filter calibrating its threshold updates "
-                        "it on every call; disable its observer to compile"
-                    )
         program = gradient_program(model, lower_fake_quants=lower is not None)
         if lower is not None:
             lower(program)

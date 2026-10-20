@@ -370,6 +370,7 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
             )
 
         propagate_shape(reshape_node)
+        reshape_node.meta["dtype"] = group[-1].meta.get("dtype")
 
         group[-1].replace_all_uses_with(reshape_node)
 

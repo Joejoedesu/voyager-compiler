@@ -420,9 +420,7 @@ def main(args):
             for entry in windows:
                 graph(*entry)
         empty = [
-            name
-            for name, module in filtered
-            if module.outlier_threshold.numel() == 0
+            name for name, module in filtered if module.outlier_threshold == 0
         ]
         if empty:
             raise RuntimeError(f"never calibrated: {empty[:5]}")

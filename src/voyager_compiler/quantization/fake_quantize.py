@@ -495,6 +495,11 @@ class _BlockFakeQuantize(_FakeQuantize):
         )
         self.register_buffer("scale_qmap", scale_qmap, persistent=False)
 
+    def calculate_qparams(self):
+        raise NotImplementedError(
+            "Block parameters are computed on every call, not kept"
+        )
+
     def extra_repr(self):
         return (
             f"{super().extra_repr()}, quant_max={self.quant_max}, "
@@ -576,9 +581,9 @@ class MXFakeQuantize(_BlockFakeQuantize):
             "max_outlier_pct", torch.zeros((), device=device), persistent=False
         )
         if outlier_pct is not None:
+            # Zero until calibrated, when it filters nothing.
             self.register_buffer(
-                "outlier_threshold",
-                torch.tensor([], device=device, dtype=torch.float),
+                "outlier_threshold", torch.zeros((), device=device)
             )
         else:
             self.outlier_threshold = outlier_threshold
@@ -614,11 +619,6 @@ class MXFakeQuantize(_BlockFakeQuantize):
         if self.stochastic_rounding:
             _install(self, "levels", qmap_levels(self.qmap))
 
-    def calculate_qparams(self):
-        raise NotImplementedError(
-            "Microscaling block scales are computed on every call, not kept"
-        )
-
     def extra_repr(self):
         return (
             f"{super().extra_repr()}, rht_axis={self.rht_axis}, "
@@ -630,11 +630,9 @@ class MXFakeQuantize(_BlockFakeQuantize):
     def _outlier_mask(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """Return which elements reach the threshold, or None without one."""
         threshold = self.outlier_threshold
-        if threshold is None or (
-            isinstance(threshold, torch.Tensor) and threshold.numel() == 0
-        ):
+        if threshold is None:
             return None
-        return x.abs() >= threshold
+        return (x.abs() >= threshold) & (threshold > 0)
 
     def _calibrate_threshold(self, x: torch.Tensor) -> None:
         """Raise the threshold to the smallest of ``x``'s largest
@@ -647,13 +645,9 @@ class MXFakeQuantize(_BlockFakeQuantize):
 
         # The largest threshold any calibration batch asked for, so the
         # bound holds on every batch seen.
-        if self.outlier_threshold.numel() == 0:
-            self.outlier_threshold.resize_as_(threshold)
-            self.outlier_threshold.copy_(threshold)
-        else:
-            self.outlier_threshold.copy_(
-                torch.maximum(self.outlier_threshold, threshold)
-            )
+        self.outlier_threshold.copy_(
+            torch.maximum(self.outlier_threshold, threshold)
+        )
 
     def prepare(self, x: torch.Tensor) -> torch.Tensor:
         """``x`` as the fake-quant quantizes it -- rotated, or with its
@@ -745,8 +739,7 @@ class MXFakeQuantize(_BlockFakeQuantize):
 class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
     """Fake-quantize with a scale and a zero point per block.
 
-    Each block maps its own ``[min, max]`` onto ``[quant_min, quant_max]``;
-    ``scale`` and ``zero_point`` hold the last call's.
+    Each block maps its own ``[min, max]`` onto ``[quant_min, quant_max]``.
 
     Args:
         quant_min: Smallest code the blocks map onto.
@@ -754,41 +747,24 @@ class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
         **kwargs: Forwarded to ``_BlockFakeQuantize``.
     """
 
-    zero_point: torch.Tensor
-
-    _lazily_sized = ("scale", "zero_point")
-
     def __init__(self, *args, quant_min: float, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.quant_min = quant_min
-        self.register_buffer(
-            "zero_point",
-            torch.tensor([1.0], device=self.scale.device, dtype=torch.float),
-        )
-
-    def calculate_qparams(self):
-        return self.scale, self.zero_point
 
     def extra_repr(self):
-        return (
-            f"{super().extra_repr()}, quant_min={self.quant_min}, "
-            f"scale={self.scale}"
-        )
+        return f"{super().extra_repr()}, quant_min={self.quant_min}"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.fake_quant_enabled:
             return x
-        output, scale, zero_point = ops.group_wise_affine_fake_quant(
+        return ops.group_wise_affine_fake_quant(
             x,
             _axes(self.ch_axis),
             self.block_size,
             self.quant_min,
             self.quant_max,
             self.scale_qmap,
-        )
-        self.scale.resize_(scale.shape).copy_(scale)
-        self.zero_point.resize_(zero_point.shape).copy_(zero_point)
-        return output
+        )[0]
 
 
 def fake_quantize_class(qscheme):

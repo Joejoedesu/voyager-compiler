@@ -381,11 +381,12 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
     )
 
     if pad_quantize_mx_input:
-        input.args[0].replace_input_with(node_to_pad, new_input)
-        propagate_shape(input.args[0])
-        propagate_shape(input)
-        propagate_shape(scale)
-        _slice_readers(model, input.args[0])
+        quantize_mx = input.args[0]
+        shapes = {output: output.shape for output in quantize_mx.users}
+        quantize_mx.replace_input_with(node_to_pad, new_input)
+        for n in (quantize_mx, *shapes):
+            propagate_shape(n)
+        _slice_readers(model, shapes)
     else:
         node.replace_input_with(node_to_pad, new_input)
 
@@ -396,33 +397,32 @@ def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
             )
 
 
-def _slice_readers(model, quantize_mx):
-    """Slice the pad back off for the readers of a padded ``quantize_mx``
-    other than GEMMs, so they read its values unpadded.
+def _slice_readers(model, shapes):
+    """Slice the pad back off the outputs of a padded ``quantize_mx`` for
+    their readers other than GEMMs, so they read each output at its traced
+    shape in ``shapes``.
 
     A QAT backward GEMM reads a forward operand's ``quantize_mx`` through
     ``dequantize_mx``; the views after it keep their traced shapes, and a
     padded output channel would widen the GEMM's result.  A GEMM reading
     the ``quantize_mx`` pads its own operands.
     """
-    for output in list(quantize_mx.users):
-        for reader in list(output.users):
-            if is_gemm_op(reader):
+    for output, shape in shapes.items():
+        readers = [r for r in output.users if not is_gemm_op(r)]
+        if not readers:
+            continue
+        sliced = output
+        for dim, size in enumerate(shape):
+            if output.shape[dim] == size:
                 continue
-            shape, users = reader.shape, list(reader.users)
-            propagate_shape(reader)
-            sliced = reader
-            for dim, size in enumerate(shape):
-                if reader.shape[dim] == size:
-                    continue
-                with model.graph.inserting_after(sliced):
-                    sliced = model.graph.call_function(
-                        torch.ops.aten.slice.Tensor, (sliced, dim, 0, size)
-                    )
-                propagate_shape(sliced)
-                sliced.meta["dtype"] = reader.meta.get("dtype")
-            for user in users:
-                user.replace_input_with(reader, sliced)
+            with model.graph.inserting_after(sliced):
+                sliced = model.graph.call_function(
+                    torch.ops.aten.slice.Tensor, (sliced, dim, 0, size)
+                )
+            propagate_shape(sliced)
+            sliced.meta["dtype"] = output.meta.get("dtype")
+        for reader in readers:
+            reader.replace_input_with(output, sliced)
 
 
 def _crossable(node, user, slice_args):

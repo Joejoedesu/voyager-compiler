@@ -28,6 +28,7 @@ from voyager_compiler.export_utils import (
     create_getattr_from_value,
     export_model,
 )
+from voyager_compiler.quantization import ops
 from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
     GroupWiseAffineFakeQuantize,
@@ -1091,8 +1092,14 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
         model, input_node
     ):
         param = fetch_attr(model, input_node.target)
-        activation_post_process(param.data)
-        scale, zero_point = activation_post_process.calculate_qparams()
+        _, scale, zero_point = ops.group_wise_affine_fake_quant(
+            param.data,
+            list(activation_post_process.ch_axis),
+            activation_post_process.block_size,
+            activation_post_process.quant_min,
+            activation_post_process.quant_max,
+            activation_post_process.scale_qmap,
+        )
         scale = scale.to(param.data.dtype)
         zero_point = zero_point.to(param.data.dtype)
 

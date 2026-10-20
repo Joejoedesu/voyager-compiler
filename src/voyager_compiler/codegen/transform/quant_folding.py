@@ -18,7 +18,6 @@ quantizer that produced the graph.
 
 import copy
 import logging
-import math
 import operator
 import re
 from dataclasses import dataclass
@@ -38,7 +37,6 @@ from voyager_compiler.codegen.node_info import (
     is_mha_qkv_permute,
     is_nop,
     is_reshape_op,
-    reshape_preserves_full_blocks,
 )
 from voyager_compiler.codegen.subgraph import get_new_node_name_with_prefix
 from voyager_compiler.export_utils import create_getattr_from_value
@@ -91,19 +89,37 @@ _HOISTABLE_OPS = (
 _REGROUP_OPS = (
     _RESHAPE,
     torch.ops.aten.view.default,
+    torch.ops.aten._unsafe_view.default,
 )
 
 _REPEAT_OPS = (_UNSQUEEZE, _EXPAND, *_REGROUP_OPS)
 
-# What a stored tensor's dequantize -> quantize chain may cross: ops that
-# move its elements without computing any.
-_PAIR_RELAYOUT_OPS = (
+_SQUEEZE = torch.ops.aten.squeeze.default
+
+# What a quantize or a dequantize may cross (``_map_block_axes``): ops that
+# re-address a tensor's elements without changing any, and the slices,
+# selects and repeats a cache or GQA read takes of them.
+_RELAYOUT_OPS = (
     *_REPEAT_OPS,
-    torch.ops.aten.transpose.int,
+    _SQUEEZE,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.dims,
+    torch.ops.aten.flatten.using_ints,
+    torch.ops.aten.unflatten.int,
     torch.ops.aten.permute.default,
-    _SLICE,
-    torch.ops.aten.contiguous.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.t.default,
+    torch.ops.aten.movedim.int,
+    torch.ops.aten.swapaxes.default,
+    torch.ops.aten.swapdims.default,
     torch.ops.aten.alias.default,
+    torch.ops.aten.detach.default,
+    torch.ops.aten.clone.default,
+    torch.ops.aten.contiguous.default,
+    torch.ops.aten.lift_fresh_copy.default,
+    _SLICE,
+    torch.ops.aten.select.int,
+    torch.ops.aten.repeat.default,
 )
 
 # MHA head splitting rejoins the per-head results with one of these, so a
@@ -138,89 +154,94 @@ def _is_relayout(node) -> bool:
     )
 
 
-def _axes_above(
-    node: Node, axes: Tuple[int, ...], block_size: Optional[int]
+def _on_meta(node: Node):
+    """``(input, output)`` of ``node``'s op run on an empty contiguous input
+    of its input's shape, on the ``meta`` device."""
+    x = torch.empty(_shape_of(node.args[0]), device="meta")
+    return x, node.target(x, *node.args[1:], **node.kwargs)
+
+
+def _map_block_axes(
+    node: Node, axes, block_size: Optional[int], from_output=True
 ) -> Optional[Tuple[int, ...]]:
-    """``axes`` -- the axes a microscaling quantize blocks along, read against
-    ``node``'s output -- restated against its input.  ``None`` if the blocks do
-    not survive ``node``, which is then as far as the quantize can be lifted.
+    """Map a blocked quantization's axes across op ``node``.
 
-    Axes count from the end, so an op that only rearranges dims to the *left*
-    of a block axis leaves it alone: that covers every op on the ``repeat_kv``
-    path (``unsqueeze``, ``expand``, the head-flattening ``reshape``).  A
-    transpose or a permute genuinely moves the axis, so it is remapped.  A
-    reshape that regroups the block axis itself still passes if the blocks come
-    out the same set of elements.  A per-tensor quantize passes ``()`` and is
-    unaffected.
+    The quantization groups ``block_size`` consecutive elements along each of
+    ``axes`` (one size for all; ``None`` means one group per index, as per
+    channel).  With ``from_output``, ``axes`` are on ``node``'s output and are
+    mapped to its input; otherwise the reverse.  The block size itself does
+    not change.  A reshape may regroup a blocked dim when its size on both
+    sides is a multiple of ``block_size``; a slice may cut one, mapping to the
+    output only, when it starts and ends on block boundaries.
+
+    Returns:
+        The mapped axes, counted from the end (-1 is the last dim), or None if
+        ``node`` splits a block.
     """
-    out_shape = tuple(node.value.shape)
-    in_shape = tuple(node.args[0].value.shape)
-    rank = len(out_shape)
-    axes = tuple(a - rank if a >= 0 else a for a in axes)
-
-    if node.target is torch.ops.aten.transpose.int:
-        a, b = (int(d) % rank - rank for d in node.args[1:3])
-        swap = {a: b, b: a}
-        return tuple(swap.get(x, x) for x in axes)
-
-    if node.target is torch.ops.aten.permute.default:
-        perm = [int(p) % rank for p in node.args[1]]  # out dim i <- in perm[i]
-        return tuple(perm[x + rank] - rank for x in axes)
-
-    if any(in_shape[x:] != out_shape[x:] for x in axes):
-        # A reshape regrouping the block axis is still crossable if the blocks
-        # come out the same sets of elements.
-        if node.target not in _REGROUP_OPS or len(axes) != 1:
+    if node.target not in _RELAYOUT_OPS or len(node.all_input_nodes) != 1:
+        return None
+    # On a contiguous input, a dim carried whole keeps its size and stride.
+    x, y = _on_meta(node)
+    src, dst = (y, x) if from_output else (x, y)
+    block = block_size or 1
+    restated = []
+    for a in axes:
+        size, stride = src.shape[a], src.stride(a)
+        dims = [
+            d
+            for d in range(dst.ndim)
+            if dst.stride(d) == stride and (dst.shape[d] > 1) == (size > 1)
+        ]
+        if not dims:
+            if size == 1:
+                continue
             return None
-        a = axes[0]
-        if block_size is None or len(in_shape) < -a or len(out_shape) < -a:
-            return None
-        if not reshape_preserves_full_blocks(
-            in_shape,
-            a + len(in_shape),
-            out_shape,
-            a + len(out_shape),
-            block_size,
-        ):
-            return None
-    return axes
+        d = dims[0]
+        sizes = sorted((size, dst.shape[d]))
+        if sizes[0] != sizes[1]:
+            start = y.storage_offset() // stride
+            regrouped = (
+                node.target in _REGROUP_OPS
+                and block_size is not None
+                and sizes[0] % block_size == 0
+                and sizes[1] % block_size == 0
+            )
+            cut = (
+                not from_output
+                and node.target is _SLICE
+                and d == a % src.ndim
+                and start % block == 0
+                and (sizes[0] % block == 0 or start + sizes[0] == sizes[1])
+            )
+            if not (regrouped or cut):
+                return None
+        restated.append(d - dst.ndim)
+    return tuple(restated)
 
 
 def _relayout_path(
-    start,
+    src,
     axes: Tuple[int, ...],
     block_size: Optional[int],
     keep_head_permute=False,
 ):
-    """Walk up from ``start`` over relayout ops, restating ``axes`` at each.
+    """Walk up from ``src`` over relayout ops that keep the blocks along
+    ``axes`` whole (``_map_block_axes``) and have no other reader.
 
-    Returns ``(src, path, src_axes)``: ``path`` is the ops crossed, nearest
-    ``start`` first; ``src`` the node that actually computed the data;
-    ``src_axes`` the block axes as seen at ``src``.  The walk stops at the
-    first node that computes, that someone else also reads, or that the blocks
-    would not survive.
-
-    ``keep_head_permute`` also stops it at an MHA head permute -- a *fusable*
-    reshape, one the GEMM below can store straight through
-    (``fuse_reshape_with_output``).  That is exactly where a multi-output
-    quantize wants to sit: fused as the last op of that group, quantizing the
-    tile on its way out.  Lifted past it, it would leave a ``getitem`` between
-    the two and neither could fuse.  A single-output quantize has no ``getitem``
-    and steps over freely.
+    Returns ``(src, path, src_axes)``: the first node not crossed, the ops
+    crossed (nearest the start first) and the block axes at ``src``.  With
+    ``keep_head_permute`` it also stops at an MHA head permute, where a
+    multi-output quantize fuses with the GEMM that stores through it.
     """
     path = []
-    src = start
-    while (
-        _is_relayout(src)
-        and len(src.users) == 1
-        and not (keep_head_permute and is_mha_qkv_permute(src))
-    ):
-        above = _axes_above(src, axes, block_size)
+    while len(src.users) == 1:
+        if keep_head_permute and is_mha_qkv_permute(src):
+            break
+        above = _map_block_axes(src, axes, block_size)
         if above is None:
             break
         path.append(src)
-        axes = above
-        src = src.args[0]
+        src, axes = src.args[0], above
     return src, path, axes
 
 
@@ -255,37 +276,41 @@ def _replay_relayout(
     """Copy relayout ``node`` onto ``src``, resized to ``extents``.
 
     ``extents`` maps an axis of ``node``'s output to its extent on ``src``.  A
-    reshape or view restates its shape with them; an expand names only the
-    dims it grows (``-1`` keeps one), so it needs none.
+    reshape or view restates its shape with them, and so does a bare squeeze,
+    as a reshape, since it would also drop a dim ``src`` holds one block of.
+    An expand names only the dims it grows (``-1`` keeps one), so it needs
+    none.
     """
     new = graph.node_copy(node, lambda n: src if n is node.args[0] else n)
     out_shape = _shape_of(node)
-    if node.target in _REGROUP_OPS:
+    in_shape = _shape_of(node.args[0])
+    if node.target in _REGROUP_OPS or node.target is _SQUEEZE:
         shape = list(out_shape)
         for a, extent in extents.items():
             shape[a] = extent
+        new.target = _RESHAPE if node.target is _SQUEEZE else node.target
         new.args = (src, shape)
     elif node.target is _EXPAND:
-        in_shape = _shape_of(node.args[0])
+        lead = len(out_shape) - len(in_shape)
         new.args = (
             src,
-            [o if o != i else -1 for o, i in zip(out_shape, in_shape)],
+            [
+                o if k < lead or o != in_shape[k - lead] else -1
+                for k, o in enumerate(out_shape)
+            ],
         )
     return new
 
 
 def _replay_path(model, src, path, axes, block_size: int, dtype) -> Node:
-    """``src``, a per-block qparam, carried through relayouts ``path``.
-
-    ``path`` runs oldest first; ``axes`` are the block axes at its end.  Along
-    a block axis a copy takes the dim's extent over ``block_size``, rounded up:
-    an axis shorter than a block (a 128-wide head under a 256 block) is one
-    block, as ``_reshape_to_blocks`` pads it.  ``_axes_above`` proved the
-    other dims untouched.
+    """``src``, a per-block qparam, carried through relayouts ``path``
+    (oldest first; ``axes`` are the block axes at its end).  A block axis
+    takes its extent over ``block_size``, rounded up, as
+    ``_reshape_to_blocks`` pads a partial block.
     """
     axes_at = [axes]  # at each relayout's output
     for n in reversed(path[1:]):
-        axes_at.insert(0, _axes_above(n, axes_at[0], block_size))
+        axes_at.insert(0, _map_block_axes(n, axes_at[0], block_size))
     for n, n_axes in zip(path, axes_at):
         shape = _shape_of(n)
         extents = {a: -(-shape[a] // block_size) for a in n_axes}
@@ -395,69 +420,27 @@ def _typed(model: GraphModule, node: Node, dtype) -> Node:
     return node
 
 
-def validate_and_map_group_axes_for_reshape(old_shape, new_shape, axes):
+def _map_dim_to_output(node: Node, dim: int) -> Optional[int]:
+    """Map input dim ``dim`` of op ``node`` to the output dim that holds it.
+
+    A dim merged with inner dims maps to the merged dim; a dim split into
+    several maps to the first of them.  A slice over the full range keeps it.
+
+    Returns:
+        The output dim, counted from the start, or None if ``node`` removes
+        ``dim`` (squeeze, select), cuts it (a slice along it) or merges it as
+        an inner factor.
     """
-    Check if a reshape preserves group membership for arbitrary group axes.
-    Returns True if safe, else False.
-    """
-    axes = tuple(sorted(axes))
-    groups = [
-        old_shape[i:j] for i, j in zip((0,) + axes, axes + (len(old_shape),))
-    ]
-    block_size = [math.prod(g) for g in groups]
-
-    numel = 1
-    idx = 0
-    new_dims = []
-    for i, s in enumerate(new_shape):
-        numel *= s
-        if numel == block_size[idx]:
-            numel = 1
-            idx += 1
-            new_dims.append(i + 1)
-            if idx == len(block_size):
-                if (
-                    i < len(new_shape) - 1
-                    and math.prod(new_shape[i + 1 :]) != 1
-                ):
-                    logger.warning("Extra trailing dimensions after last group")
-                    return None
-                break
-        elif numel > block_size[idx]:
-            logger.warning(f"Overshot group {idx} at new axis {i}")
-            return None
-
-    if idx != len(block_size):
-        logger.warning("Not all groups matched")
+    if len(node.all_input_nodes) != 1:
         return None
-
-    return new_dims[:-1]
-
-
-def _axis_through(node: Node, axis: int):
-    """Where input dim ``axis`` of relayout ``node`` lands in its output, or
-    ``None`` when the op moves, merges or cuts it.  A quantize, dequantize,
-    ``getitem`` or ``expand`` keeps every dim in place."""
-    target = node.target
-    if target is operator.getitem or target in QUANTIZE_FAMILY_OPS:
-        return axis
-    rank = len(_shape_of(node.args[0]))
-    if target is _UNSQUEEZE:
-        dim = node.args[1] % (rank + 1)
-        return axis + 1 if axis >= dim else axis
-    if target is torch.ops.aten.transpose.int:
-        a0, a1 = (d % rank for d in node.args[1:3])
-        return a1 if axis == a0 else a0 if axis == a1 else axis
-    if target is torch.ops.aten.permute.default:
-        return [d % rank for d in node.args[1]].index(axis)
-    if target in _REGROUP_OPS:
-        mapped = validate_and_map_group_axes_for_reshape(
-            _shape_of(node.args[0]), _shape_of(node), [axis]
-        )
-        return mapped[0] if mapped else None
-    if target is _SLICE and node.args[1] % rank == axis:
-        return None
-    return axis
+    # On a contiguous input a dim spans stride x size elements, and so does
+    # the output dim holding it, alone or as its outer factor.
+    x, y = _on_meta(node)
+    extent = x.stride(dim) * x.shape[dim]
+    for d in range(y.ndim):
+        if y.shape[d] > 1 and y.stride(d) * y.shape[d] == extent:
+            return d
+    return None
 
 
 def _attention_cone(idx: Node):
@@ -513,14 +496,10 @@ def _stamp_fake(node: Node, fake_mode, like: Optional[Node] = None) -> None:
 
 
 def _fold_chunk(model, cache, dim, idx, offsets, pred, after, fake_mode):
-    """The fold, after the attention has read the main cache: on the step
-    that completes a chunk, copy the residual into it.  Spelled without a
-    branch -- chunk ``c`` is rewritten every step, with the residual on
-    the completing step and with what it already holds otherwise -- so
-    the graph stays plain tensor ops (a CUDA graph can replay it) and the
-    lowering turns the pattern into a real conditional.  The cache is
-    reached through its own ``get_attr`` so that an observer on the read
-    never sits between the fold and the buffer.
+    """After the attention reads the main cache, copy the residual into it on
+    the step that completes a chunk.  Spelled without a branch, as a
+    write-back of the residual or of what the chunk already holds, so the
+    graph stays plain tensor ops; the lowering makes it a conditional.
 
     Args:
         model: The graph module.
@@ -696,7 +675,7 @@ def _split_one_cache(
         axis_of = {idx: dim}
         for n in relayouts:
             src = next(a for a in n.all_input_nodes if a in axis_of)
-            axis_of[n] = _axis_through(n, axis_of[src])
+            axis_of[n] = _map_dim_to_output(n, axis_of[src])
             if axis_of[n] is None:
                 raise ValueError(
                     f"{cache.target}: {n} loses the cache's position axis"
@@ -951,7 +930,7 @@ def split_kv_cache(
     return count
 
 
-def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
+def _fold_quantize_into_cache(model: GraphModule, node: Node) -> Optional[Node]:
     """Fold a dynamic quantize over a KV cache write into the cache itself.
 
     The write puts one token in; the quantize then sweeps all of it, every
@@ -966,15 +945,18 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
     Only when the blocked axis is not the one the write indexes.  Otherwise a
     token lands mid-block and its block's qparams depend on tokens not yet
     written -- that is what ``split_kv_cache``'s residual is for.
+
+    Returns:
+        The quantize the token now takes, or ``None`` if nothing folded.
     """
 
     graph = model.graph
     idx, prelude = _cache_write_below(node)
     if idx is None:
-        return False
+        return None
 
     if any(u.target is not operator.getitem for u in node.users):
-        return False
+        return None
     outs = {u.args[1]: u for u in node.users}
 
     rank = len(node.args[0].value.shape)
@@ -983,7 +965,7 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
         # Blocked along the written axis a token lands mid-block, so the
         # cache cannot be baked whole.
         logger.debug(f"Skip folding {node}: blocked along the written axis.")
-        return False
+        return None
 
     cache = idx.args[0]
     q_args = node.args[1:]
@@ -1010,7 +992,7 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
             token = graph.call_function(op.target, (token, *op.args[1:]))
             propagate_shape(token, model)
 
-        new_q = graph.call_function(node.target, (token, *q_args))
+        new_q = graph.call_function(node.target, (token, *q_args), node.kwargs)
         new_q.meta = {
             k: copy.deepcopy(v) if k != "val" else v
             for k, v in node.meta.items()
@@ -1036,7 +1018,7 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
     for n in [*outs.values(), node, *prelude, idx, cache]:
         if not n.users:
             graph.erase_node(n)
-    return True
+    return new_q
 
 
 class _FoldBranch:
@@ -1182,23 +1164,17 @@ class _FoldBranch:
 
 @dataclass
 class _Fold:
-    """A split KV cache's fold, as the lowering rebuilds it.
+    """A split KV cache's write, as the lowering rebuilds it: ``branch``, a
+    ``torch.cond`` that quantizes the residual on the completing step.
 
-    ``split_kv_cache`` spells the fold as a masked write-back of chunk
-    ``p // R`` of the residual into the main cache.  The lowering keeps
-    the main cache baked in its quantized form and turns the write-back
-    into ``branch``, a ``torch.cond`` on the completing-step predicate
-    whose ``true`` branch quantizes the residual and stores the outputs
-    into the baked buffers.  ``parts`` are the branch-side outputs of that
-    quantize, by output index; ``stores`` the branch's ``index_copy_`` of
-    each into its baked buffer, by output index, until a re-encode replaces
-    it; ``scale_qmap`` the table that quantize rounds its scale through (a
-    top-level ``get_attr``), or ``None`` when the qparams keep the cache's
-    dtype.
+    ``op`` is that quantize's op; ``parts`` its outputs and ``stores`` the
+    ``index_copy_`` of each into its baked buffer, both by output index;
+    ``scale_qmap`` the table its scale rounds through, or ``None``.
     """
 
     cache: str
     dim: int
+    op: object
     branch: _FoldBranch
     parts: dict
     stores: dict
@@ -1362,6 +1338,7 @@ def _fold_quantize_into_split_cache(
     fold = _Fold(
         cache=cache.target,
         dim=dim,
+        op=node.target,
         branch=branch,
         parts=parts,
         stores={},
@@ -1441,7 +1418,9 @@ def sink_cache_folds(model: GraphModule) -> GraphModule:
     return model
 
 
-def _hoist_microscaling(model: GraphModule, node: Node) -> Optional[Node]:
+def _hoist_microscaling(
+    model: GraphModule, node: Node, folds: dict
+) -> Optional[Node]:
     """Lift a ``quantize_mx`` over the relayout ops feeding it, so it quantizes
     the tensor they re-address rather than the one they hand on.
 
@@ -1449,15 +1428,19 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> Optional[Node]:
     on less data -- and what they were going to do (broadcast a KV head, lay a
     tile out for the MXU) the consumer folds into its addressing rather than
     materializing.  Two things halt the walk: an op the quantization blocks do
-    not survive (``_axes_above``), and an MHA head permute, where the quantize
-    wants to stop -- the GEMM below stores straight through that permute, and
-    the quantize fuses onto the end of it (``fuse_reshape_with_output``).
+    not survive (``_map_block_axes``), and an MHA head permute, where the
+    quantize wants to stop -- the GEMM below stores straight through that
+    permute, and the quantize fuses onto the end of it
+    (``fuse_reshape_with_output``).
 
     The op returns its qparams beside the value (``_OUTPUT_NAMES``): the
     value keeps the relayout ops it was lifted over and each qparam gets a
     replayed copy of them.  It is never forked: a
     concat can move the axis it blocks along, and head splitting -- the only
     thing that forks -- never runs where microscaling is used.
+
+    A cache a plain quantize was folded into (``folds``) still counts as
+    that quantize, a fusable anchor.
 
     Returns:
         The quantize lifted above the relayouts, or None if it stays.
@@ -1467,8 +1450,10 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> Optional[Node]:
     if any(u.target is not operator.getitem for u in node.users):
         return None
     outs = {u.args[1]: u for u in node.users}
-
     value_index = len(_OUTPUT_NAMES[node.target]) - 1
+    if value_index not in outs:
+        return None
+
     block_size = node.args[3]
     src, path, src_axes = _relayout_path(
         node.args[0], node.args[2], block_size, keep_head_permute=True
@@ -1479,11 +1464,13 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> Optional[Node]:
     # TODO: we only move quantize_mx when there is a fusable anchor or the
     # op/param gets repeated in the memory. However this check is not robust.
     # In the future we should move this into operator fusion.
+    fold = folds.get(src.target)
     if (
         not is_compute_op(src)
         and not is_mha_qkv_permute(src)
         and not any(n.target in _BROADCAST_OPS for n in path)
         and not _is_split_cache(graph, src)
+        and (fold is None or fold.op is not _QUANTIZE)
     ):
         logger.debug(f"Skip moving {node} because there is no fusable anchor.")
         return None
@@ -1538,9 +1525,15 @@ def _run(model: GraphModule, node: Node, *args):
 
 def _per_block(t, axes, block_size):
     """One entry of ``t`` per block of ``block_size`` along each of
-    ``axes``; a single entry when ``block_size`` is ``None``."""
+    ``axes``.  When ``block_size`` is ``None``, one entry per channel
+    along ``axes`` (size 1 along the other dims), or a single entry when
+    there are none."""
     if block_size is None:
-        return t.reshape(-1)[0]
+        if not axes:
+            return t.reshape(-1)[0]
+        return t[
+            tuple(slice(None) if a in axes else slice(1) for a in range(t.ndim))
+        ]
     return t[
         tuple(
             slice(None, None, block_size) if a in axes else slice(None)
@@ -1571,7 +1564,7 @@ def _gqa_repeat(path):
             return None
         head = grown[0] - 1
         for m in path[k + 1 :]:
-            head = _axis_through(m, head)
+            head = _map_dim_to_output(m, head)
             if head is None:
                 return None
         return head, _shape_of(n)[grown[0]]
@@ -1583,7 +1576,11 @@ def _stored_per_kv_head(model, prefix, value, dtype, gqa) -> Node:
     exactly over each group of ``gqa = (head axis, group)`` heads, it is
     stored once per KV head and broadcast back by
     ``unsqueeze -> expand -> reshape``."""
-    if gqa is not None and value.ndim > gqa[0]:
+    if (
+        gqa is not None
+        and value.ndim > gqa[0]
+        and value.shape[gqa[0]] % gqa[1] == 0
+    ):
         head, group = gqa
         grouped = value.unflatten(head, (-1, group))
         base = grouped.narrow(head + 1, 0, 1)
@@ -1653,7 +1650,7 @@ def _fold_reencode(model, fold, d, q, axes, column, buffers) -> None:
             unit = _stored(
                 model,
                 f"{fold.cache}_unit_scale",
-                torch.ones(1, dtype=torch.bfloat16),
+                fetch_attr(model, buffers[0].target).new_ones(1),
                 None,
             )
         fused = branch.call(
@@ -1742,7 +1739,7 @@ def _qparams_in_cache_layout(model, d, q, fold, q_axes, block_size):
     fused = scale / repeat_per_block(block_scale, scale, block_size)
     if fold.scale_qmap is not None:
         table = fetch_attr(model, fold.scale_qmap.target)
-        fused = _QUANTIZE(fused, torch.ones(1, dtype=fused.dtype), qmap=table)
+        fused = _QUANTIZE(fused, fused.new_ones(1), qmap=table)
     qparams = {"scale": fused, "zero_point": zero_point}
     return qparams, block_scale, cache_axes, column
 
@@ -1750,6 +1747,11 @@ def _qparams_in_cache_layout(model, d, q, fold, q_axes, block_size):
 def _fuse_pair(model: GraphModule, q: Node, folds: dict) -> bool:
     """Fuse quantize ``q`` with the dequantize of a stored tensor it reads,
     through relayouts, into one dequantize, when the two can be.
+
+    A quantize with a zero point of its own is left alone.  Over a split
+    cache's baked codes (``folds``), a plain quantize fuses with a plain
+    fold, whose scale is constant, and a ``quantize_mx`` with an affine fold,
+    which it then extends; no other pair over a fold does.
 
     A broadcast qparam (GQA's ``repeat_kv``) is stored once per KV head rather
     than once per query head, with the repeat put back as graph ops: a smaller
@@ -1773,9 +1775,10 @@ def _fuse_pair(model: GraphModule, q: Node, folds: dict) -> bool:
         Whether it fused ``q``.
     """
     path, d = [], q.args[0]
-    while d.target in _PAIR_RELAYOUT_OPS and len(d.users) == 1:
+    while len(d.users) == 1 and _map_block_axes(d, (), None) is not None:
         path.insert(0, d)
         d = d.args[0]
+    mx = q.target is _QUANTIZE_MX
     if (
         d.target is not _DEQUANTIZE
         or d.args[0].op != "get_attr"
@@ -1786,10 +1789,18 @@ def _fuse_pair(model: GraphModule, q: Node, folds: dict) -> bool:
         )
     ):
         return False
-    mx = q.target is _QUANTIZE_MX
-    block_size = get_arg_value(d, 4, "block_size")
-    if block_size != (q.args[3] if mx else get_arg_value(q, 4, "block_size")):
+    if not mx and get_arg_value(q, 2, "zero_point") is not None:
+        logger.warning(
+            f"Not fusing {d} into {q}: a quantize with its own zero point is "
+            "not supported yet"
+        )
         return False
+    block_size = get_arg_value(d, 4, "block_size") or 1
+    q_block_size = q.args[3] if mx else get_arg_value(q, 4, "block_size")
+    if block_size != (q_block_size or 1):
+        return False
+    # One element per block is no blocking at all.
+    block_size = block_size if block_size > 1 else None
 
     # The axes each side groups along, in q's input layout; the fused
     # dequantize groups along those both do.
@@ -1798,19 +1809,28 @@ def _fuse_pair(model: GraphModule, q: Node, folds: dict) -> bool:
     rank = len(_shape_of(q.args[0]))
     q_axes = q.args[2] if mx else get_arg_value(q, 3, "axes")
     q_axes = {a % rank for a in q_axes or ()}
-    d_axes = [a % codes.ndim for a in get_arg_value(d, 3, "axes") or ()]
+    d_axes = get_arg_value(d, 3, "axes") or ()
     for n in path:
-        d_axes = [
-            a if n.target is _SLICE else _axis_through(n, a) for a in d_axes
-        ]
-        if None in d_axes:
+        d_axes = _map_block_axes(n, d_axes, block_size, from_output=False)
+        if d_axes is None:
             return False
-    shared = q_axes & set(d_axes)
-    if shared not in (q_axes, set(d_axes)):
+    d_axes = {a % rank for a in d_axes}
+    # One side's groups must nest in the other's, or the fused scale would
+    # be one per element; a size-1 axis groups nothing either way.
+    wide = {a for a, size in enumerate(_shape_of(q.args[0])) if size > 1}
+    if not (q_axes & wide <= d_axes or d_axes & wide <= q_axes):
         return False
-    axes = tuple(sorted(shared))
+    axes = tuple(sorted(q_axes & d_axes))
 
-    fold = folds.get(codes_node.target) if mx else None
+    fold = folds.get(codes_node.target)
+    if fold is not None and fold.op is _QUANTIZE and not mx:
+        fold = None
+    elif fold is not None and not (fold.op is _QUANTIZE_AFFINE and mx):
+        logger.warning(
+            f"Not fusing {d} into {q}: fusing with a {fold.op} cache write is "
+            "not supported yet"
+        )
+        return False
     if fold is None:
         found = _qparams_in_input_layout(model, d, q, path, axes, block_size)
         if found is None:
@@ -1884,30 +1904,26 @@ def _fuse_pair(model: GraphModule, q: Node, folds: dict) -> bool:
 
 
 def fuse_quantize_dequantize_with_producer(model: GraphModule):
-    """Move each quantize / dequantize up the graph to sit directly after the
-    op that computed its input, so the two can fuse into one kernel.
+    """Take quantization work off the run time by moving each quantize or
+    dequantize next to the op it belongs with.
 
-    Everything it is lifted over only relayouts data -- a reshape, a transpose,
-    the ``stack`` MHA splitting leaves behind, the ``expand`` of GQA's
-    ``repeat_kv`` -- so quantizing above them is the same arithmetic on less
-    data.  A dynamic quantize (``quantize_mx``, ``quantize_affine``) also
-    blocks along an axis and returns its qparams beside its value, so it takes
-    the ``_hoist_microscaling`` route; the rest share the walk but fork over a
-    concat.
+    Each one is visited once, in graph order, and the first step that applies
+    is taken:
 
-    One walk in graph order handles each quantize / dequantize.  A
-    ``quantize_affine`` on a KV cache is folded into the cache: a split cache
-    (``split_kv_cache``) is baked quantized and its chunks are quantized on
-    their fold, a cache written token by token is baked and quantized on the
-    write.  The cache's quantize sits above every read of it, so the walk
-    reaches it first.  A read of the baked cache, ``get_attr -> dequantize ->
-    relayouts -> quantize_mx``, is collapsed into one dequantize
-    (``_fuse_pair``) -- extending a split cache's fold with the qparams that
-    dequantize reads -- before the hoist would lift the re-encode above the
-    relayouts.  Any other quantize is hoisted, then the quantize it became is
-    folded into a cache it writes: a ``quantize_mx``, or a plain ``quantize``
-    over a split cache, which ``convert_pt2e`` leaves in the graph because the
-    graph writes the cache.
+    1. Cache write: a quantize on a KV cache moves into the cache write, so the
+       cache is stored quantized and only new tokens are quantized at run time
+       (``_fold_quantize_into_split_cache``, ``_fold_quantize_into_cache``).
+    2. Pair fusion: a quantize that reads a stored tensor's dequantize,
+       through shape-only ops, becomes one dequantize with the combined scale
+       (``_fuse_pair``).
+    3. Hoist: the quantize moves up over shape-only ops to sit right after the
+       op that computed its input, so the two fuse into one kernel
+       (``_hoist_microscaling`` for a blocked quantize, ``_hoist_forked`` for
+       a per-tensor one, which also forks over a concat).  If it then sits on
+       a KV cache, step 1 applies.
+
+    A blocked or per-channel plain quantize and ``quantize_mx_outlier`` stay
+    where they are.
 
     Args:
         model: The graph module to rewrite in place.
@@ -1916,6 +1932,8 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
         ``model``, rewritten in place.
     """
     graph = model.graph
+    # A dead reader would stop the walks below.
+    graph.eliminate_dead_code()
     folds = {}
     for node in list(graph.nodes):
         if node.target not in QUANTIZE_FAMILY_OPS:
@@ -1923,8 +1941,9 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
         if node.target is _QUANTIZE_AFFINE:
             if _fold_quantize_into_split_cache(model, node, folds):
                 continue
-            if _fold_quantize_into_cache(model, node):
-                continue
+            # Folded into a cache written token by token, the quantize
+            # moves onto the token and is hoisted from there.
+            node = _fold_quantize_into_cache(model, node) or node
         elif node.target in (_QUANTIZE, _QUANTIZE_MX):
             if _fuse_pair(model, node, folds):
                 continue
@@ -1934,11 +1953,14 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
             continue
 
         if node.target in _OUTPUT_NAMES:
-            quantizes = [_hoist_microscaling(model, node) or node]
-        elif (get_arg_value(node, 4, "block_size") or 1) > 1:
-            # A blocked plain quantize would need the same axis bookkeeping
-            # as quantize_mx, which it does not have; only per-tensor is
-            # lifted.
+            quantizes = [_hoist_microscaling(model, node, folds) or node]
+        elif (
+            get_arg_value(node, 3, "axes")
+            or (get_arg_value(node, 4, "block_size") or 1) > 1
+        ):
+            # A blocked or per-channel plain quantize would need the same
+            # axis bookkeeping as quantize_mx, which it does not have; only
+            # per-tensor is lifted.
             quantizes = [node]
         else:
             quantizes = _hoist_forked(model, node) or [node]
