@@ -33,6 +33,7 @@ from transformers import (
     StaticCache,
     masking_utils,
 )
+from transformers.cache_utils import StaticLayer, StaticSlidingWindowLayer
 from transformers.integrations.executorch import convert_and_export_with_cache
 
 from voyager_compiler import (
@@ -171,11 +172,14 @@ def _sdpa_is_causal():
     refuses the ``is_causal`` skip, since a baked-in flag would be wrong for
     a variable-length graph, and it cannot run the check that the batch
     holds no packed sequences.  A fixed-length, single-sequence prefill
-    export wants the flag and has no packing."""
+    export wants the flag and has no packing.  A sliding-window layer whose
+    window is shorter than the sequence keeps its mask."""
 
-    def skip(padding_mask, query_length, kv_length, *args, **kwargs):
-        return query_length == kv_length and (
-            padding_mask is None or bool(padding_mask.all())
+    def skip(padding_mask, query_length, kv_length, kv_offset, window=None):
+        return (
+            query_length == kv_length
+            and (window is None or kv_length < window)
+            and (padding_mask is None or bool(padding_mask.all()))
         )
 
     with (
@@ -259,6 +263,11 @@ def build_decode(model, tokenizer, args, config, tokens):
         max_cache_len=max_cache_len(args, config),
         dtype=model.dtype,
     )
+    # The export holds a sliding-window layer's cache whole, as a plain
+    # StaticLayer, and windows it with the mask; so must this prefill.
+    for i, layer in enumerate(cache.layers):
+        if isinstance(layer, StaticSlidingWindowLayer):
+            cache.layers[i] = StaticLayer(max_cache_len(args, config))
     model(prompt, past_key_values=cache, use_cache=True)
     for i, layer in enumerate(cache.layers):
         getattr(gm, f"key_cache_{i}").copy_(layer.keys)
