@@ -3,11 +3,11 @@
 ``voyager_compiler.ops`` holds the ops the hardware runs; these emulate
 quantization in training and calibrate it.  Each op's reference is written
 in torch ops: it is the op's CPU kernel and the oracle its CUDA kernel is
-tested against.  On a GPU, ``mx_fake_quant``, ``hadamard_amax`` and
-``bin_blocks`` run their Triton kernels (``kernels``) where those compute
-the call exactly -- ``bin_blocks``' does any call; ``fake_quant`` and
-``group_wise_affine_fake_quant`` have none.  The other calls run the
-reference, a fake-quant's compiled, as eager GPU code runs.  The
+tested against.  On a GPU, ``mx_fake_quant`` and ``hadamard_amax`` run
+their Triton kernels (``kernels``) on the calls those take, and
+``bin_blocks`` its kernel on any call; ``fake_quant`` and
+``group_wise_affine_fake_quant`` have none and run their references
+compiled, as eager GPU code runs.  The other calls run the reference.  The
 fake-quants are ``triton_op``s, so that ``torch.compile`` traces their
 bodies -- a kernel's launch, or the reference -- into the compiled program
 rather than calling them as opaque kernels.  Each takes the
@@ -18,7 +18,6 @@ import importlib.util
 from typing import List, Optional, Tuple
 
 import torch
-from torch._library.triton import set_wrap_triton_enabled
 from torch.library import triton_op
 
 from voyager_compiler.ops import (
@@ -100,6 +99,11 @@ fake_quant = triton_op(
 fake_quant.register_autograd(
     _straight_through, setup_context=_setup_straight_through
 )
+# On a GPU the reference runs compiled, as eager GPU code runs.
+if kernels is not None:
+    fake_quant.register_kernel("cuda")(
+        compile_like_eager(_fake_quant_reference, dynamic=False)
+    )
 
 
 def _group_wise_affine_fake_quant_reference(
@@ -165,36 +169,13 @@ group_wise_affine_fake_quant = triton_op(
 group_wise_affine_fake_quant.register_autograd(
     _straight_through, setup_context=_setup_straight_through
 )
-
-
-def _quantize_mx_and_back(
-    input,
-    qmap,
-    axes,
-    block_size,
-    quant_max,
-    power_of_two,
-    scale_qmap,
-    seed,
-    global_scale,
-):
-    """``input`` quantized by ``quantize_mx`` and scaled back: the part of
-    ``mx_fake_quant`` between its rotations, taking its arguments."""
-    scale, output = quantize_mx(
-        input,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        power_of_two,
-        scale_qmap=scale_qmap,
-        seed=seed,
-        global_scale=global_scale,
+# On a GPU the reference runs compiled, as eager GPU code runs.
+if kernels is not None:
+    group_wise_affine_fake_quant.register_kernel("cuda")(
+        compile_like_eager(
+            _group_wise_affine_fake_quant_reference, dynamic=False
+        )
     )
-    output = output * repeat_per_block(scale, output, block_size)
-    if global_scale is not None:
-        output = output * global_scale
-    return output
 
 
 def _mx_fake_quant_reference(
@@ -213,70 +194,23 @@ def _mx_fake_quant_reference(
     """``mx_fake_quant`` in torch ops."""
     if hadamard is not None:
         input = hadamard_rotate(input, hadamard_axis, hadamard)
-    output = _quantize_mx_and_back(
+    scale, output = quantize_mx(
         input,
         qmap,
         axes,
         block_size,
         quant_max,
         power_of_two,
-        scale_qmap,
-        seed,
-        global_scale,
+        scale_qmap=scale_qmap,
+        seed=seed,
+        global_scale=global_scale,
     )
+    output = output * repeat_per_block(scale, output, block_size)
+    if global_scale is not None:
+        output = output * global_scale
     if hadamard is not None:
         output = hadamard_rotate(output, hadamard_axis, hadamard.T)
     return output
-
-
-def _run_mx_fake_quant(
-    quantize,
-    input,
-    qmap,
-    axes,
-    block_size,
-    quant_max,
-    power_of_two,
-    scale_qmap,
-    seed,
-    global_scale,
-    hadamard,
-    hadamard_axis,
-):
-    """``mx_fake_quant`` of a GPU call or of one being traced.
-
-    The kernel computes a call it takes; a rotation it cannot fuse runs as
-    torch ops around this function's own call on the rotated tensor; any
-    other call runs ``quantize``.
-
-    Args:
-        quantize: Fake-quantizes a call that neither the kernel nor a
-            rotation around it takes: ``_quantize_mx_and_back`` or its
-            compiled form.
-        input: Tensor to quantize; it and the arguments after it are the
-            op's.
-    """
-    args = (
-        input,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        power_of_two,
-        scale_qmap,
-        seed,
-        global_scale,
-    )
-    if kernels is not None and kernels.mx_fake_quant_supported(
-        *args, hadamard, hadamard_axis
-    ):
-        return kernels.mx_fake_quant(*args, hadamard, hadamard_axis)
-    if hadamard is None:
-        return quantize(*args)
-    rotated = hadamard_rotate(input, hadamard_axis, hadamard)
-    # Unrotated, the kernel may still take the rotated tensor.
-    output = _run_mx_fake_quant(quantize, rotated, *args[1:], None, None)
-    return hadamard_rotate(output, hadamard_axis, hadamard.T)
 
 
 @triton_op("quantization::mx_fake_quant", mutates_args=())
@@ -301,8 +235,9 @@ def mx_fake_quant(
     and scaled back.  With ``hadamard`` the input is first rotated along
     ``hadamard_axis`` (``hadamard_rotate``) and the result rotated back by
     the transpose, the rotated axis keeping its padding; the backward
-    passes the gradient through unrotated, less the padding.  This body is
-    what ``torch.compile`` traces (``_run_mx_fake_quant``).
+    passes the gradient through unrotated, less the padding.  A CUDA call
+    the Triton kernel takes (``kernels.mx_fake_quant_supported``) runs it,
+    any other the reference.
 
     Args:
         input: Tensor to quantize.
@@ -325,23 +260,13 @@ def mx_fake_quant(
         The fake-quantized tensor, laid out as ``input`` unless rotated, or
         when the kernel computes it with its rotation.
     """
-    return _run_mx_fake_quant(
-        _quantize_mx_and_back,
-        input,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        power_of_two,
-        scale_qmap,
-        seed,
-        global_scale,
-        hadamard,
-        hadamard_axis,
-    )
+    args = (input, qmap, axes, block_size, quant_max, power_of_two)
+    args += (scale_qmap, seed, global_scale, hadamard, hadamard_axis)
+    if kernels is not None and kernels.mx_fake_quant_supported(*args):
+        return kernels.mx_fake_quant(*args)
+    return _mx_fake_quant_reference(*args)
 
 
-mx_fake_quant.register_kernel("cpu")(_mx_fake_quant_reference)
 mx_fake_quant.register_autograd(
     _straight_through, setup_context=_setup_straight_through
 )
@@ -473,34 +398,5 @@ def _(*args) -> None:
     return None
 
 
-# On a GPU a fake-quant's reference, or the part of ``mx_fake_quant`` its
-# kernel does not take, runs compiled, as eager GPU code runs; a rotation
-# around it stays eager matmuls.  ``bin_blocks`` runs its kernel, and
-# ``hadamard_amax``'s body serves a GPU call as it is.
 if kernels is not None:
-    fake_quant.register_kernel("cuda")(
-        compile_like_eager(_fake_quant_reference, dynamic=False)
-    )
-    group_wise_affine_fake_quant.register_kernel("cuda")(
-        compile_like_eager(
-            _group_wise_affine_fake_quant_reference, dynamic=False
-        )
-    )
-    _compiled_quantize_mx_and_back = compile_like_eager(
-        _quantize_mx_and_back, dynamic=False
-    )
-
-    @mx_fake_quant.register_kernel("cuda")
-    def _(*args):
-        """``mx_fake_quant`` of CUDA tensors, its kernel launched directly
-        as a ``triton_op``'s own eager kernel launches it.  The tensors are
-        detached, so that whether they take a gradient never enters the
-        compiled fallback's guards."""
-        args = [
-            arg.detach() if isinstance(arg, torch.Tensor) else arg
-            for arg in args
-        ]
-        with set_wrap_triton_enabled(False):
-            return _run_mx_fake_quant(_compiled_quantize_mx_and_back, *args)
-
     bin_blocks.register_kernel("cuda")(kernels.bin_blocks)

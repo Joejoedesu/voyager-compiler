@@ -96,6 +96,19 @@ _OPS_DYNAMIC = None
 
 quantized_ops_lib = Library("quantized_ops", "DEF")
 
+
+def compiled_cuda_kernel(fn):
+    """Register ``fn`` compiled (``compile_like_eager``) as the CUDA kernel of
+    the op it is named after, and return ``fn`` unchanged for the op's other
+    kernels.  On a GPU the op then runs as a few fused kernels instead of a
+    pass over the tensor per aten op; fake and meta tensors never reach the
+    CUDA key and keep the plain function."""
+    quantized_ops_lib.impl(
+        fn.__name__, compile_like_eager(fn, _OPS_DYNAMIC), "CUDA"
+    )
+    return fn
+
+
 # Registers the hardware-layout ops (the conv2d / max_pool2d /
 # adaptive_avg_pool2d twins, linear / matmul) into the namespace just
 # created, before any importer references them.
@@ -439,6 +452,7 @@ quantized_ops_lib.define(
 
 
 @impl(quantized_ops_lib, "quantize", "CompositeExplicitAutograd")
+@compiled_cuda_kernel
 def quantize(
     input: torch.Tensor,
     scale: torch.Tensor,
@@ -507,6 +521,7 @@ quantized_ops_lib.define(
 
 
 @impl(quantized_ops_lib, "dequantize", "CompositeExplicitAutograd")
+@compiled_cuda_kernel
 def dequantize(
     input: torch.Tensor,
     scale: torch.Tensor,
@@ -1057,6 +1072,7 @@ quantized_ops_lib.define(
 
 
 @impl(quantized_ops_lib, "quantize_mx", "CompositeExplicitAutograd")
+@compiled_cuda_kernel
 def quantize_mx(
     input: torch.Tensor,
     qmap: torch.Tensor,
@@ -1203,6 +1219,7 @@ quantized_ops_lib.define(
 
 
 @impl(quantized_ops_lib, "quantize_affine", "CompositeExplicitAutograd")
+@compiled_cuda_kernel
 def quantize_affine(
     input: torch.Tensor,
     qmap: torch.Tensor,
@@ -1260,15 +1277,6 @@ def quantize_affine(
 
     value = quantize(input, scale, zero_point, axes, block_size, qmap)
     return scale, zero_point, value
-
-
-# On a GPU these ops run compiled: a few fused kernels instead of a pass
-# over the tensor per aten op.  The CUDA key alone takes the compiled
-# kernel, so fake and meta tensors keep the plain one.
-for _op in (quantize, dequantize, quantize_mx, quantize_affine):
-    quantized_ops_lib.impl(
-        _op.__name__, compile_like_eager(_op, _OPS_DYNAMIC), "CUDA"
-    )
 
 
 quantized_ops_lib.define(
