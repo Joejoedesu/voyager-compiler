@@ -14,16 +14,24 @@ what they share:
   time before quantizing each chunk;
 - a DMA, which moves a tile in as few ``dma_copy`` instructions as access
   patterns walk (``_dma_count``), a load of ``STREAM_BYTES`` or more in one
-  per piece of its 128-row blocks (``stream_blocks``): each its issue, then
-  the rows' bytes, packet overhead included, at the core's DMA bandwidth;
+  per piece of its 128-row blocks (``stream_blocks``): each copy the longer
+  of its issue and its rows' bytes, packet overhead included, at the core's
+  DMA bandwidth -- half of it for a copy within half the partitions --
+  plus the rings' time between copies; a store issues from ScalarE's queue;
+  a vector op's one-row tile lies as the translator lays it out
+  (``TrainiumVector``);
 - an MX (microscaling) tile, stored contraction-major: 4 consecutive
   contraction elements per 32-bit word, a 512-element chunk per 128
   partitions, chunks side by side on the free dim, and one E8M0 scale byte
   per 32 elements in a tile of the same layout, filled only on each
   quadrant's first 4 partitions;
 - a sweep: the engines run concurrently, so a step costs its busiest
-  engine, and the shared schedule overlaps a step's DMAs with the compute
-  around it (``sweep_cycles``).
+  engine, and its slots' refills overlap the compute around it, each with
+  its first copy's issue to spare (``sweep_ns``); a kernel's first loads
+  overlap the kernel before it unless they are exposed
+  (``gemm.first_load_exposed``); a GEMV's one-row tiles move beside its
+  weight stream, and its last step's compute runs behind the last piece
+  of its weight tile (``TrainiumGemv.cost``).
 
 Times are nanoseconds here and TensorE cycles to the search.
 """
@@ -55,11 +63,12 @@ from voyager_compiler.codegen.transform.tiling.runtime_model import (
     MatrixSpace,
     RuntimeModel,
 )
-from voyager_compiler.codegen.transform.tiling.traversal import sweep_cycles
+from voyager_compiler.codegen.transform.tiling.traversal import step_classes
 
 from .attention import TrainiumAttention
 from .gemm import TrainiumGemm, TrainiumGemv
 from .utils import (
+    HOISTED_SBUF,
     MX_PACK,
     QUADRANT,
     QUADRANT_SCALES,
@@ -131,6 +140,10 @@ class TrainiumModel(RuntimeModel):
         attention_space: How a flash attention is cut: query and key tiles
             in whole partitions, the head unpadded, since it lies on the
             partitions QKᵀ contracts over or is P·V's moving free dim.
+
+    Both weigh a near-tie in latency against bytes share for share
+    (``relative_ties``): a step pays a kernel's latency, so a slower tiling
+    wins only by saving a larger share of bytes than it adds of time.
     """
 
     def __init__(self, config, accumulate_fp32):
@@ -172,9 +185,9 @@ class TrainiumModel(RuntimeModel):
             schedule_data["schedule_hint"], schedule_data["partition_loops"]
         )
         self.matrix_space = MatrixSpace(architecture, schedule)
-        self.grid_space = GridSpace(lanes=1, ranked=True)
+        self.grid_space = GridSpace(lanes=1, ranked=True, relative_ties=True)
         self.attention_space = AttentionSpace(
-            unit=config.partitions, head_multiple=1
+            unit=config.partitions, head_multiple=1, relative_ties=True
         )
 
     def prepare(self, node):
@@ -228,15 +241,36 @@ class TrainiumModel(RuntimeModel):
     def dma_ns(self, rows, cols, bits, count=1, load=False):
         """A ``rows x cols`` tile of ``bits``-wide elements moved in
         ``count`` ``dma_copy`` instructions; a ``load`` moved in one is cut
-        into one per piece of its 128-row blocks (``stream_blocks``)."""
+        into one per piece of its 128-row blocks (``stream_blocks``).  The
+        rings move a copy's rows while the next copy issues, so each copy
+        takes the longer of its issue and its rows' bytes, packet overhead
+        included, at the core's DMA bandwidth -- half of it for a copy on
+        ``dma_half_rate_partitions`` partitions or fewer -- plus the rings'
+        time between copies: ``dma_copy_ns``, and ``dma_copy_idle_ns`` for a
+        copy no longer than its issue, falling off in proportion as it is
+        longer."""
         config = self.config
         row_bytes = math.ceil(cols * bits / 8)
+        parts = min(rows, config.partitions)
         if load and count == 1:
-            parts = min(rows, config.partitions)
             blocks = math.ceil(rows / parts)
             count = math.ceil(blocks / stream_blocks(blocks, parts * row_bytes))
+        bandwidth = config.dram_bandwidth
+        if parts <= config.dma_half_rate_partitions:
+            bandwidth /= 2
         moved = rows * (row_bytes + config.dma_row_overhead_bytes)
-        return count * config.dma_issue_ns + moved / config.dram_bandwidth
+        issue = config.dma_issue_ns
+        copy = moved / bandwidth / count
+        idle = config.dma_copy_idle_ns * min(1.0, issue / copy)
+        return count * max(issue, copy + config.dma_copy_ns + idle)
+
+    def store_issue_ns(self, stores, steps):
+        """ScalarE's time per step issuing ``stores`` output stores over a
+        sweep of ``steps`` steps: the step compile issues a store's
+        ``dma_copy`` from ScalarE's queue, ``dma_store_issue_ns`` each,
+        while a load's issue takes a queue of its own (``dma_ns``).  The
+        last store's issue is the sweep's end (``sweep_ns``)."""
+        return self.config.dma_store_issue_ns * (stores - 1) / steps
 
     def _mx_layout(self, depth, other):
         """``(partitions, words)`` of an MX tile contracting ``depth`` beside
@@ -275,23 +309,27 @@ class TrainiumModel(RuntimeModel):
             for s, bits in output_buffers(shape, n)
         )
 
-    def buffer_dma_ns(self, n, shape, mx, load):
+    def buffer_dma_ns(self, n, shape, mx, load, parts=1, spread=False):
         """One transfer of buffer ``n``'s tile ``shape``, a ``load`` or a
         store: each output's ``dma_copy`` instructions (``_dma_count``), or
-        the MX layout's transfers."""
+        the MX layout's transfers.  A one-row tile lies on ``parts``
+        partitions, as the translator lays out a vector op's
+        (``TrainiumVector.row_parts``): its row cut evenly across them when
+        ``spread``, else, loaded, a copy of it on each."""
         if n in mx:
             return sum(self.mx_dma_ns(*array) for array in mx[n])
         values = n.value if isinstance(n.value, (tuple, list)) else [n.value]
         p = self.config.partitions
-        return sum(
-            self.dma_ns(
-                *rows_cols(s),
-                bits,
-                _dma_count(tuple(s), value.shape, p),
-                load,
-            )
-            for (s, bits), value in zip(output_buffers(shape, n), values)
-        )
+        total = 0.0
+        for (s, bits), value in zip(output_buffers(shape, n), values):
+            rows, cols = rows_cols(s)
+            if rows == 1 and spread:
+                rows, cols = parts, cols // parts
+            elif rows == 1 and load:
+                rows = parts
+            count = _dma_count(tuple(s), value.shape, p)
+            total += self.dma_ns(rows, cols, bits, count, load)
+        return total
 
     def quantize_mx_busy(self, rows, cols):
         """Each engine's busy time quantizing a ``rows x cols`` tile, rows on
@@ -320,17 +358,113 @@ class TrainiumModel(RuntimeModel):
             busy[engine] += row_chunks * self.engine_ns(engine, elements, bits)
         return busy
 
-    def sweep_ns(self, dmas, steps, compute):
-        """A sweep of ``steps`` grid steps of ``compute`` each, moving
-        ``dmas`` -- ``(ns, transfers)`` per buffer, the output first --
-        overlapped by the shared schedule when double-buffered; the first
-        DMA's latency and the kernel's fixed cost come on top."""
+    def step_ns(self, owed, compute, refill):
+        """A double-buffered step of ``compute`` that reloads ``owed`` of
+        DMA.  A slot's refill starts as the step before it frees the slot
+        and moves no row for ``refill`` after, so it hides under the step's
+        compute only with that latency to spare: the step takes ``compute``
+        up to ``compute - refill`` of DMA, ``owed`` from ``compute + refill``
+        on, when the queue runs ahead of the compute, and the mean of the
+        two and the latency between."""
+        if not owed:
+            return compute
+        return max(compute, owed, (compute + owed + refill) / 2)
+
+    def last_piece_share(self, rows, cols, bits):
+        """The share of a load of a ``rows x cols`` tile of ``bits``-wide
+        elements that its last ``dma_copy`` moves (``stream_blocks``): what
+        an op reading the tile as its pieces land has left once the last
+        one does."""
+        p = self.config.partitions
+        blocks = math.ceil(rows / p)
+        per = stream_blocks(blocks, p * math.ceil(cols * bits / 8))
+        return (blocks - (math.ceil(blocks / per) - 1) * per) / blocks
+
+    def sweep_ns(
+        self,
+        dmas,
+        steps,
+        compute,
+        first_load=True,
+        apart=(),
+        last=None,
+        held=False,
+    ):
+        """A double-buffered sweep of ``steps`` grid steps of ``compute``
+        each, moving ``dmas`` -- ``(ns, transfers)`` per buffer, the output
+        first.  ``step_classes`` sorts the steps by what each reloads, each
+        priced by ``step_ns``, and the ends are priced on their own as
+        ``sweep_cycles`` prices them: the first loads overlap no compute of
+        the kernel's, the first compute stores nothing and the last loads
+        nothing, and the last store waits on it.  The first loads and the
+        first DMA's latency are paid when ``first_load``; else the loads run
+        under the kernel before (``gemm.first_load_exposed``) for as long as
+        the DMA takes to fill the SBUF a kernel leaves them
+        (``HOISTED_SBUF``), and only the rest is paid.  The kernel's fixed
+        cost comes on top.
+
+        ``apart`` holds the positions in ``dmas`` of the buffers that move
+        on DMA queues of their own (a GEMV's one-row activation and output,
+        ``TrainiumGemv.cost``): the steps owe only the others, the first
+        loads take the longer of the two queues, and the sweep lasts at
+        least as long as their transfers.  ``last`` is the compute a step
+        has left once its last load lands, when it reads its tiles piece by
+        piece as they land (``TrainiumGemv.cost``): a sweep the DMA binds
+        ends that compute and ``dram_access_latency`` after its last load
+        lands, one the compute binds ends a whole step's compute later, and
+        one in between ends as much later as the compute falls behind the
+        loads.
+
+        A slot's refill issues its first copy (``dma_issue_ns``) when the
+        step reading the slot frees it.  ``held`` is a step whose matmuls
+        read the tiles it reloads until its compute ends (a GEMM's), so the
+        refill's rows also start to move only ``dram_access_latency`` after
+        that; otherwise the issue alone counts."""
         config = self.config
-        if config.double_buffered_l2:
-            sweep = sweep_cycles(dmas, steps, compute)
+        latency = config.dram_access_latency
+        refill = config.dma_issue_ns + (latency if held else 0.0)
+        store = dmas[0][0]
+        queue = [
+            (0.0 if i in apart else ns, t) for i, (ns, t) in enumerate(dmas)
+        ]
+        loads = sum(ns for ns, _ in queue[1:])
+        first = max(
+            loads,
+            sum(ns for i, (ns, _) in enumerate(dmas) if i and i in apart),
+        )
+        fixed = config.kernel_overhead_ns
+        if first_load:
+            fixed += first + latency
         else:
-            sweep = sum(ns * count for ns, count in dmas) + steps * compute
-        return sweep + config.dram_access_latency + config.kernel_overhead_ns
+            hoisted = config.partitions * HOISTED_SBUF / config.dram_bandwidth
+            fixed += max(0.0, first - hoisted)
+        if steps == 1:
+            return fixed + compute + store
+        total = sum(
+            count * self.step_ns(owed, compute, refill)
+            for owed, count in step_classes(queue, steps)
+        )
+        # What a step past the first reloads, and the same without the
+        # store, as ``sweep_cycles`` counts them.
+        recur = sum(ns for ns, t in queue if steps // t == 1)
+        held = sum(ns for ns, t in queue[1:] if steps // t == 1)
+        if last is None:
+            end = self.step_ns(queue[0][0], compute, refill)
+        else:
+            end = max(last + latency, min(compute, 2 * compute - held))
+        sweep = (
+            total
+            - self.step_ns(loads + queue[0][0], compute, refill)
+            - self.step_ns(recur, compute, refill)
+            + self.step_ns(held, compute, refill)
+            + end
+            + store
+            + fixed
+        )
+        if not apart:
+            return sweep
+        beside = sum(ns * t for i, (ns, t) in enumerate(dmas) if i in apart)
+        return max(sweep, beside + latency)
 
 
 def kernel_nodes(gm):

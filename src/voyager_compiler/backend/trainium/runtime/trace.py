@@ -34,10 +34,11 @@ from safetensors.torch import save_file
 
 MARKERS = {"start": ModuleMarkerStartWrapper(), "end": ModuleMarkerEndWrapper()}
 
-# The torch type a kernel takes a tensor of each IR type as (``check.py``).
+# The torch type a kernel takes a weight of each IR type as (``check.py``).
+# A boolean stays one: the trace cannot hand an integer parameter to a
+# kernel, so the program's cast to uint8 hands over its bytes.
 KERNEL_TYPES = {
     "int64": torch.int32,
-    "bool": torch.uint8,
     "fp8_e4m3": torch.float8_e4m3fn,
     "fp8_e4m3_ieee": torch.float8_e4m3fn,
     "fp8_e5m2": torch.float8_e5m2,
@@ -106,7 +107,9 @@ class Step(torch.nn.Module):
         return outputs
 
     def call_kernel(self, name, *args):
-        """Kernel ``name``'s results, as a tuple even when there is one."""
+        """Kernel ``name``'s results, as a tuple even when there is one.  A
+        kernel takes no 0-d tensor: a scalar goes as one element."""
+        args = [a.reshape(1) if a.dim() == 0 else a for a in args]
         results = getattr(self.kernels, name)(*args)
         if isinstance(results, (list, tuple)):
             return tuple(results)
@@ -155,12 +158,26 @@ def checkpoint_sources(params, model):
     A parameter's name is the checkpoint key with ``.`` as ``_``, behind any
     number of ``model_`` scopes, and a ``_t`` suffix when it is that tensor
     transposed (``model_layers_0_self_attn_q_proj_weight_t`` is
-    ``model.layers.0.self_attn.q_proj.weight``, transposed).
+    ``model.layers.0.self_attn.q_proj.weight``, transposed); ``lm_head``
+    is the input embedding in a checkpoint storing only that.
     """
     path = snapshot_download(model, allow_patterns=["*.json"])
-    with open(os.path.join(path, "model.safetensors.index.json")) as f:
-        files = json.load(f)["weight_map"]
+    index = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index) as f:
+            files = json.load(f)["weight_map"]
+    else:
+        # An unsharded checkpoint is one file, with no index.
+        single = "model.safetensors"
+        path = snapshot_download(model, allow_patterns=[single])
+        with safe_open(os.path.join(path, single), "pt") as f:
+            files = dict.fromkeys(f.keys(), single)
     keys = {key.replace(".", "_"): key for key in files}
+    # A checkpoint tying its output projection to the input embedding
+    # stores only the embedding.
+    embedding = [k for k in files if k.endswith("embed_tokens.weight")]
+    if "lm_head_weight" not in keys and embedding:
+        keys["lm_head_weight"] = embedding[0]
     sources = {}
     for name, tensor in params.items():
         transposed = name.endswith("_t")

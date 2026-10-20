@@ -34,10 +34,21 @@ from voyager_compiler.codegen.transform.tiling.traversal import operand_roles
 
 # SBUF partitions: TensorE's rows, the same on every core.
 PARTITIONS = 128
+# neuronx-cc takes a ``double_row`` matmul operand ``[128, 2, X]`` only with
+# its two 128-row chunks a multiple of this many elements apart.
+DOUBLE_ROW_STEP = 16
+# The largest step of an access pattern's free dim: neuronx-cc holds it in an
+# int16.
+AP_STEP_MAX = 2**15 - 1
+# Bytes of each SBUF partition a kernel leaves free for the loads of the
+# kernels after it, which the step compile starts under it: without them
+# the step spills tiles of both.
+HOISTED_SBUF = 48 << 10
 # The memory levels a kernel's buffers are placed in: SBUF and PSUM.
 SRAM, LOCAL = int(MemoryLevel.SRAM), int(MemoryLevel.LOCAL)
 
 QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+SDPA_KMAJOR = torch.ops.quantized_ops.sdpa_kmajor.default
 
 # An MX word packs this many consecutive contraction elements
 # (``float8_e4m3fn_x4``), so one ``nc_matmul_mx`` contracts the partitions
@@ -215,6 +226,42 @@ def extents(n, size):
     return [min(size, n - start) for start in range(0, n, size)]
 
 
+def pair_distance(steps):
+    """Chunks apart the two 128-deep chunks of a ``double_row`` matmul are,
+    its operand tiles holding consecutive chunks ``steps`` elements apart:
+    the fewest that put each operand's pair a multiple of
+    ``DOUBLE_ROW_STEP`` elements apart, ``None`` when a pair that far apart
+    is more than ``AP_STEP_MAX`` elements apart."""
+    distance = max(
+        DOUBLE_ROW_STEP // math.gcd(s, DOUBLE_ROW_STEP) for s in steps
+    )
+    if max(abs(s) for s in steps) * distance > AP_STEP_MAX:
+        return None
+    return distance
+
+
+def contraction_runs(depth, distance):
+    """The 128-deep chunks, ``(start, stop)``, each ``nc_matmul`` contracts
+    along a contraction of ``depth``: given a ``distance`` (FP8 operands,
+    ``pair_distance``), one ``double_row`` matmul per chunk of the first
+    half of each whole block of ``2 * distance`` chunks, with the chunk
+    ``distance`` after it; every other chunk, and every chunk without a
+    ``distance``, alone."""
+    chunks = [
+        (lo, min(depth, lo + PARTITIONS)) for lo in range(0, depth, PARTITIONS)
+    ]
+    if distance is None:
+        return [[c] for c in chunks]
+    block = 2 * distance
+    paired = depth // (block * PARTITIONS) * block
+    pairs = [
+        [chunks[b + c], chunks[b + c + distance]]
+        for b in range(0, paired, block)
+        for c in range(distance)
+    ]
+    return pairs + [[c] for c in chunks[paired:]]
+
+
 def rows_cols(shape):
     """A tile shape as ``(rows, cols)``: its last dim is free, and every
     leading dim stacks onto the partitions."""
@@ -276,6 +323,12 @@ F32, BF16 = torch.float32, torch.bfloat16
 # A column of one value per row, ``[128, 1]`` float32: a scalar read from
 # DRAM, a column read as another type, a reciprocal.
 SCALAR_COLUMNS = ("sc", 1, F32, 2, SRAM)
+
+
+def spread_partitions(cols):
+    """The partitions a flat row of ``cols`` elements is cut across: the
+    most, up to 128, that cut it evenly (``translate.Layout.spread``)."""
+    return max(p for p in range(1, PARTITIONS + 1) if cols % p == 0)
 
 
 def scratch_name(kind, cols):

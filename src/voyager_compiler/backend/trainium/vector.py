@@ -6,6 +6,12 @@ built by the shared builders.
   for a transcendental and on VectorE otherwise; a K-major RMS norm squares
   its blocks on ScalarE, sums them across the partitions on TensorE and
   scales them on VectorE, 512 columns at a time (``rms_norm_kmajor_busy``).
+- A vector op on one row lays it out as the translator does: a flat op --
+  an elementwise chain, or an RMS norm alone -- cuts the row across the
+  partitions (``spread_partitions``) and runs on every one, a norm summing
+  its partitions' squares by a ones-matmul (``rms_norm_spread_busy``); any
+  other op runs on one partition, a one-row operand copied onto each
+  partition the op's rows take.
 - A 2-D max pool puts one output row on each partition: partition ``p``
   holds the ``kH`` input rows output row ``p`` reads side by side on its
   free axis, loaded as one strip, and VectorE takes ``kH - 1`` vertical
@@ -38,6 +44,7 @@ from .utils import (
     LOCAL,
     PARTITIONS,
     QUANTIZE_MX,
+    RMS_NORM_OPS,
     ROW_OPS,
     ROW_PASS_BITS,
     SRAM,
@@ -56,6 +63,7 @@ from .utils import (
     sbuf_bytes,
     sbuf_placed_bytes,
     scratch_regions,
+    spread_partitions,
     target_engines,
     widest_bits,
 )
@@ -116,6 +124,50 @@ def rms_norm_kmajor_busy(model, rows, cols, hidden):
     return busy
 
 
+# Ops the translator runs alone, not as an elementwise chain
+# (``translate.Kernel._compute``).
+NOT_FLAT = (
+    torch.ops.aten.amax.default,
+    torch.ops.aten.sum.dim_IntList,
+    torch.ops.aten.eye.default,
+    QUANTIZE_MX,
+    RMS_NORM_KMAJOR,
+)
+
+
+def rms_norm_spread_tiles(free):
+    """The tiles the translator computes an RMS norm of a row cut ``free``
+    elements to a partition in (``translate.Kernel._rms_norm_spread``): a
+    float32 ones tile and the PSUM column the partitions' total lands in,
+    the squares, each partition's sum and the rstd."""
+    return {
+        ("one", PARTITIONS, F32, 1, SRAM),
+        ("acc", 1, F32, 2, LOCAL),
+        ("sq", free, F32, 2, SRAM),
+        ("ss", 1, F32, 2, SRAM),
+        ("rs", 1, F32, 2, SRAM),
+    }
+
+
+def rms_norm_spread_busy(model, free):
+    """Each engine's busy time on an RMS norm of a row cut ``free`` elements
+    to a partition: ScalarE squares each partition's elements, summing
+    them on the way, TensorE totals the sums onto every partition by a
+    ones-matmul, VectorE takes the mean square plus ``eps``, ScalarE its
+    rsqrt, and VectorE scales the row by it and the weight.  Each waits on
+    the one before."""
+    config = model.config
+    return Counter(
+        {
+            "scalar": model.engine_ns("scalar", free, ROW_PASS_BITS)
+            + model.engine_ns("scalar", 1, ROW_PASS_BITS),
+            "tensor": (1 + config.tensor_overhead_cycles) / config.frequency,
+            "vector": model.engine_ns("vector", 1, ROW_PASS_BITS)
+            + model.engine_ns("vector", free, ROW_PASS_BITS),
+        }
+    )
+
+
 def _op_passes(node):
     """``(engine, share, bits)`` per pass a vector op's arithmetic makes over
     its tile: ``share`` is the fraction of the tile's columns it covers (an
@@ -161,6 +213,9 @@ class TrainiumVector(TrainiumGrid):
         kmajor_dtype: That RMS norm's element type.
         kmajor_post: The chain (``chain_ops``) after that RMS norm.
         group: The group of ops the translator runs (``group_ops``).
+        flat: The translator cuts a one-row tile of the group across the
+            partitions (``row_parts``): it is an elementwise chain, or an
+            RMS norm alone.
     """
 
     def __init__(self, node, model):
@@ -178,6 +233,22 @@ class TrainiumVector(TrainiumGrid):
             ops = [n for n in submod.graph.nodes if n.op == "call_function"]
         self.kmajor_post = chain_ops(ops[ops.index(norm) + 1 :]) if norm else ()
         self.group = group_ops(ops)
+        row_op = self.group[1]
+        self.flat = not any(op.target in NOT_FLAT for op in ops) and (
+            row_op is None or (row_op in RMS_NORM_OPS and len(ops) == 1)
+        )
+
+    def row_parts(self, out_tile):
+        """``(parts, spread)`` for an output tile ``out_tile``: the
+        partitions the translator lays the kernel's one-row tiles on, and
+        whether it cuts each row across them.  A flat op on one row cuts it
+        evenly across the most partitions it can (``spread_partitions``),
+        an operand of one element copied onto each; any other copies a
+        one-row operand onto each partition its rows take."""
+        rows, cols = rows_cols(out_tile)
+        if self.flat and rows == 1 and spread_partitions(cols) > 1:
+            return spread_partitions(cols), True
+        return min(rows, PARTITIONS), False
 
     def placement(self, tiling, shapes, moves):
         """The kernel's ``TrainiumPlacement``, its tiles cut into ``shapes``
@@ -193,7 +264,9 @@ class TrainiumVector(TrainiumGrid):
         """The regions the translator computes the op in, for an output tile
         ``out_tile`` (one per output for several), as the op group ``op``'s
         (``scratch_regions``): a K-major RMS norm's
-        (``rms_norm_kmajor_tiles``), or the group's over the tile's rows
+        (``rms_norm_kmajor_tiles``), an RMS norm's of a row cut across the
+        partitions (``rms_norm_spread_tiles``), or the group's over the
+        tile's rows, a row so cut ``row_parts`` times narrower
         (``group_tiles``)."""
         if self.kmajor_hidden:
             tiles = rms_norm_kmajor_tiles(
@@ -207,7 +280,12 @@ class TrainiumVector(TrainiumGrid):
             if out_tile and isinstance(out_tile[0], (tuple, list)):
                 # A quantize_mx's output: (scales, codes).
                 out_tile = out_tile[-1]
-            tiles = group_tiles(self.group, out_tile[-1])
+            parts, spread = self.row_parts(out_tile)
+            cols = out_tile[-1] // parts if spread else out_tile[-1]
+            if spread and self.group[1] is not None:
+                tiles = rms_norm_spread_tiles(cols)
+            else:
+                tiles = group_tiles(self.group, cols)
         return scratch_regions("op", tiles)
 
     def operand_shapes(self, tiling):
@@ -221,27 +299,50 @@ class TrainiumVector(TrainiumGrid):
         return vector_transfers(self.node, shapes, tiling.grid)
 
     def cost(self, tiling, placement):
-        """The tile sweep in TensorE cycles, and its DRAM bytes.
-        ``placement`` is the contract's."""
+        """The tile sweep in TensorE cycles, and its DRAM bytes, a one-row
+        tile laid out as ``row_parts`` says: an RMS norm of a row cut across
+        the partitions makes its instructions one after another
+        (``rms_norm_spread_busy``).  ``placement`` is the contract's."""
         model = self.model
         shapes = self.operand_shapes(tiling)
         buffers = [b for n, s in shapes.items() for b in output_buffers(s, n)]
         rows, cols = max((rows_cols(s) for s, _ in buffers), key=math.prod)
-        busy = model.passes_busy(self.passes, rows, cols)
-        if self.quantizes_mx:
-            busy.update(model.quantize_mx_busy(rows, cols))
-        if self.kmajor_hidden:
-            busy.update(
-                rms_norm_kmajor_busy(model, rows, cols, self.kmajor_hidden)
-            )
+        out_tile = output_buffers(shapes[self.node], self.node)[-1][0]
+        parts, spread = self.row_parts(out_tile)
+        if spread:
+            rows, cols = parts, cols // parts
         mx = self._mx_tiles(shapes)
         moves = self.transfers(shapes, tiling)
+        steps = math.prod(tiling.grid)
+        stores = sum(c for n, _, c in moves if n is self.node)
+        if spread and self.group[1] is not None:
+            busy = rms_norm_spread_busy(model, cols)
+            busy["scalar"] += model.store_issue_ns(stores, steps)
+            compute = sum(busy.values())
+        else:
+            busy = model.passes_busy(self.passes, rows, cols)
+            if self.quantizes_mx:
+                busy.update(model.quantize_mx_busy(rows, cols))
+            if self.kmajor_hidden:
+                busy.update(
+                    rms_norm_kmajor_busy(model, rows, cols, self.kmajor_hidden)
+                )
+            busy["scalar"] += model.store_issue_ns(stores, steps)
+            compute = max(busy.values())
         dmas = [
-            (model.buffer_dma_ns(n, s, mx, n is not self.node), c)
+            (
+                model.buffer_dma_ns(
+                    n,
+                    s,
+                    mx,
+                    n is not self.node,
+                    parts,
+                    spread and math.prod(s) > 1,
+                ),
+                c,
+            )
             for n, s, c in moves
         ]
-        compute = max(busy.values(), default=0.0)
-        steps = math.prod(tiling.grid)
         latency = model.sweep_ns(dmas, steps, compute)
         return Cost(latency * model.config.frequency, moved_bytes(moves))
 

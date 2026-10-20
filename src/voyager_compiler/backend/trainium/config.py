@@ -4,7 +4,8 @@
 tile search and memory planner read -- plus what Trainium's runtime model
 (``TrainiumModel``) needs: the other engines' clocks and rates, the matmul's
 moving-operand limit and DMA overheads.  ``TRN2`` and ``TRN3`` are AWS's
-documented figures for one core:
+documented figures for one core, and the Trn2 profiles' where those are
+missing or differ:
 
 - NKI architecture guides (``nki/guides/architecture/trainium2_arch``):
   SBUF 128 partitions x 224 KiB (28 MiB) on NeuronCore-v3, TensorE 128 x 128
@@ -19,12 +20,25 @@ documented figures for one core:
 - NKI DMA bandwidth guide: 16 DMA engines per core at 23 B/ns (TRN2) or
   33 B/ns (TRN3), about 1300 ns from semaphore to transfer start, and
   transfers under 2 KiB per partition bound by per-packet overhead.
-- About 600 ns for each descriptor-generated DMA instruction (TRN2 guide).
+- Trn2 profiles: back to back, a matmul or transpose streams its moving
+  columns plus ``tensor_overhead_cycles``; GpSimd issues a ``dma_copy`` in
+  about 650 ns; each of the 16 DMA rings moves about 27 B/ns, a row of a
+  transfer costing ``dma_row_overhead_bytes`` more and a copy
+  ``dma_copy_ns`` more, and idles between copies (``dma_copy_idle_ns``); a
+  copy on 64 partitions or fewer moves at about half the rate (190-199
+  GB/s against 438 for 342 and 171 KB copies on 32 and 64 partitions);
+  a store issues from ScalarE's queue, in about 550 ns of ScalarE's time
+  (a prefill step's attention, ``o_proj`` and ``gate_proj``).
+- A step's compile log: neuronx-cc pins ``STEP_PINNED_SBUF`` bytes of each
+  partition for its own DMA scratch, and starts a kernel's loads under the
+  kernel before it, spilling them when the two do not fit
+  (``HOISTED_SBUF``).
 
 The shared compiler sees a 128 x 128 array clocked at TensorE's rate, SBUF as
-an unbanked scratchpad with nothing reserved, since every buffer a kernel
-uses is in its tile result's placement and the plan, and lanes of 1, since a
-tile's rows go on the partitions and its last dim is free.
+an unbanked scratchpad less what the step keeps (``scratchpad_offset``), since
+every buffer a kernel uses is in its tile result's placement and the plan,
+and lanes of 1, since a tile's rows go on the partitions and its last dim is
+free.
 """
 
 from dataclasses import dataclass
@@ -40,7 +54,12 @@ from voyager_compiler.hardware_config import AcceleratorConfig
 from .attention import SDPA_KMAJOR, build_attention
 from .gemm import build_gemm
 from .model import TrainiumModel
-from .utils import PARTITIONS
+from .utils import HOISTED_SBUF, PARTITIONS
+
+# Bytes of each SBUF partition a step's neuronx-cc compile pins for itself:
+# its dynamic DMA scratch (``--dynamic-dma-scratch-size-per-partition``,
+# 16 KiB) and 8 more.  A kernel's buffers beside them would be spilled.
+STEP_PINNED_SBUF = 16392
 
 # A dense GEMM -- ``linear``, ``matmul`` and their MX forms -- and a K-major
 # flash attention lower by Trainium's own builders.
@@ -87,8 +106,16 @@ class TrainiumConfig(AcceleratorConfig):
         fp32_transpose_rate: TensorE's FP32 transpose rate over its 16-bit
             rate.
         dma_issue_ns: Time to issue one ``dma_copy``.
-        dma_row_overhead_bytes: Per-partition packet overhead, so a row of
-            ``b`` bytes moves at the rate of ``b + dma_row_overhead_bytes``.
+        dma_row_overhead_bytes: Per-row packet overhead, so a row of ``b``
+            bytes moves at the rate of ``b + dma_row_overhead_bytes``.
+        dma_copy_ns: Ring time each ``dma_copy`` adds beyond its rows.
+        dma_copy_idle_ns: Further ring idle each ``dma_copy`` adds when its
+            rows take ``dma_issue_ns`` or less, falling off in proportion as
+            they take longer.
+        dma_half_rate_partitions: A ``dma_copy`` on this many partitions or
+            fewer moves at half the DMA bandwidth.
+        dma_store_issue_ns: ScalarE's time issuing one store's
+            ``dma_copy``.
         kernel_overhead_ns: Fixed time per kernel, beyond its sweep.
     """
 
@@ -100,14 +127,18 @@ class TrainiumConfig(AcceleratorConfig):
     vector_elements_16: int = 2
     vector_elements_32: int = 1
     scalar_elements: int = 1
-    tensor_overhead_cycles: int = 64
+    tensor_overhead_cycles: int = 6
     vector_overhead_ns: float = 160.0
     scalar_overhead_ns: float = 270.0
     fp8_matmul_speedup: float = 2.0
     fp32_matmul_rate: float = 0.25
     fp32_transpose_rate: float = 0.5
-    dma_issue_ns: float = 600.0
-    dma_row_overhead_bytes: int = 512
+    dma_issue_ns: float = 650.0
+    dma_row_overhead_bytes: int = 200
+    dma_copy_ns: float = 31.0
+    dma_copy_idle_ns: float = 80.0
+    dma_half_rate_partitions: int = 64
+    dma_store_issue_ns: float = 550.0
     kernel_overhead_ns: float = 0.0
 
     @property
@@ -142,14 +173,16 @@ class TrainiumConfig(AcceleratorConfig):
 
 
 def _core(target, sbuf_bytes, dram_bandwidth):
-    """A core of ``target``: ``sbuf_bytes`` of SBUF and ``dram_bandwidth``
-    GB/s of DMA."""
+    """A core of ``target``: ``sbuf_bytes`` of SBUF, less ``STEP_PINNED_SBUF``
+    and ``HOISTED_SBUF`` of each partition, and ``dram_bandwidth`` GB/s of
+    DMA."""
     return TrainiumConfig(
         target=target,
         pe_array_size=(PARTITIONS, 128),
         vector_unit_width=1,
         frequency=2.4,
         scratchpad_size=sbuf_bytes,
+        scratchpad_offset=PARTITIONS * (STEP_PINNED_SBUF + HOISTED_SBUF),
         double_buffered_l2=True,
         async_pipeline=False,
         dram_size=12.0,
@@ -170,5 +203,5 @@ LAYOUT = {
     "gemv_layout": "xc,ck",
 }
 
-TRN2 = _core("trn2", 28 << 20, 16 * 23.0)
+TRN2 = _core("trn2", 28 << 20, 16 * 27.0)
 TRN3 = _core("trn3", 30 << 20, 16 * 33.0)

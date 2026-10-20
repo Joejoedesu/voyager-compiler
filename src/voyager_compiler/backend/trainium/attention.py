@@ -91,6 +91,7 @@ from .utils import (
     LOCAL,
     PARTITIONS,
     ROW_PASS_BITS,
+    SDPA_KMAJOR,
     SRAM,
     TrainiumPlacement,
     chain_tiles,
@@ -106,7 +107,6 @@ from .utils import (
 
 voyager = torch.ops.voyager
 
-SDPA_KMAJOR = torch.ops.quantized_ops.sdpa_kmajor.default
 # The op groups the translator computes [F] and [E] in, each with its
 # scratch regions (``attention_scratch``).
 RESCALE_GROUP, FINALIZE_GROUP = "rescale", "finalize"
@@ -138,16 +138,19 @@ class TrainiumAttention(OpModel):
     adds one -- under ``is_causal`` only a pair crossing the diagonal
     (``attention_crosses``) -- transposes P one 128-key block at a time and runs
     P·V, each Pᵀ block stationary and the value moving.  Per 128 rows VectorE
-    evicts the scores scaled with their row max in one pass and takes ``-max(M,
-    R)``; ScalarE takes the exponentials with their row sum, the sum's read-out
-    and Pᵀ's copies out of PSUM, a bank per copy.  Over every 128 rows' columns
-    at once VectorE takes alpha's exponent, ``M`` and ``l = alpha·l + rowsum``
-    and ScalarE alpha.  A step past a sweep's first rescales the output, ``o =
-    alpha·(o + pv)``, in two VectorE passes, P·V's result read from PSUM.  A
-    sweep's first resets m and l and finalizes the tile before it: ``o += pv``,
-    ``o / l`` and ``o = 0`` on VectorE, then, for an output stored transposed,
-    Oᵀ's TensorE transposes and their copies out of PSUM.  Every pass over the
-    scores or the output reads float32.  A query of one token (not
+    evicts the scores scaled with their row max a PSUM bank at a time, takes
+    the banks' max over several and ``-max(M, R)``; ScalarE takes the
+    exponentials with their row sum and the sum's read-out.  Pᵀ's copies out
+    of PSUM, half a bank per copy, go to VectorE or ScalarE as the step
+    compile places them, which balances the two.  Over every 128 rows'
+    columns at once VectorE takes alpha's exponent, ``M`` and ``l = alpha·l +
+    rowsum`` and ScalarE alpha.  A step past a sweep's first rescales the
+    output, ``o = alpha·(o + pv)``, in two VectorE passes, P·V's result read
+    from PSUM.  A sweep's first finalizes the tile before it, ``o += pv``
+    and ``o / l`` on VectorE, then, for an output stored transposed, Oᵀ's
+    TensorE transposes and their copies out of PSUM; its resets of m, l and
+    o are GpSimd fills, short beside a step, so they are not charged.  Every
+    pass over the scores or the output reads float32.  A query of one token (not
     ``query_kmajor``, a decode step's) lands row-major, its tile spanning the
     head group's rows, and a sweep's first transposes it on TensorE and copies
     it out of PSUM.
@@ -327,8 +330,12 @@ class TrainiumAttention(OpModel):
         costs its busiest engine, a sweep's first its finalize too, and the
         key, value and mask tiles' DMAs on every step -- a mask loaded once
         (``_mask_once``) once -- and the query and output tiles' once per
-        sweep overlap the compute around them (``sweep_ns``).
-        ``placement`` is the contract's."""
+        sweep overlap the compute around them (``sweep_ns``).  A step takes
+        at least its softmax's chain: a 128-row block's passes, each waiting
+        on the one before, then the columns' passes, which wait on every
+        block's.  Only the other blocks' passes and the other engines' work
+        run beside the chain, so a step of one block -- a decode step's --
+        takes the whole chain.  ``placement`` is the contract's."""
         model = self.model
         config = model.config
         p, free = config.partitions, config.moving_free_max
@@ -372,6 +379,17 @@ class TrainiumAttention(OpModel):
                 [(e, 1.0, ROW_PASS_BITS) for e in engines], tq, cols
             )
 
+        def balanced(busy):
+            """``busy`` with the step's copies out of PSUM, which the step
+            compile places on VectorE or ScalarE, split between the two
+            so the busier one is least busy."""
+            vector, scalar = busy["vector"], busy["scalar"]
+            to_scalar = min(max(0.0, (vector + copies - scalar) / 2), copies)
+            return busy + Counter(vector=copies - to_scalar, scalar=to_scalar)
+
+        def engine_ns(engine, cols):
+            return model.engine_ns(engine, cols, ROW_PASS_BITS)
+
         kv_blocks, head_blocks = math.ceil(tkv / p), math.ceil(d / p)
         step = Counter()
         # The moving columns of QKᵀ's matmuls, P's transposes and P·V's, and
@@ -384,27 +402,42 @@ class TrainiumAttention(OpModel):
         step["tensor"] += (
             masked / steps * tensor_ns(len(rows) * extents(tkv, free))
         )
-        # Per 128 rows: the eviction with the row max and the exponentials,
-        # then -max(M, R) and the row sum's read-out; over the columns of
-        # every 128 rows, alpha's exponent, M and l's two, then alpha.
-        step.update(passes(("vector", "scalar"), tkv))
-        step.update(passes(("vector", "scalar"), 1))
-        engines = ("vector",) * 4 + ("scalar",)
-        columns = [(e, 1.0, ROW_PASS_BITS) for e in engines]
-        step.update(model.passes_busy(columns, p, len(rows)))
+        # Per 128 rows: the scores evicted scaled with their row max a bank
+        # at a time, over several banks the banks' max, and -max(M, R) on
+        # VectorE; the exponentials with their row sum, and the sum's
+        # read-out, on ScalarE.  Then over the columns of every 128 rows,
+        # alpha's exponent, M and l's two on VectorE and alpha on ScalarE.
+        banks = extents(tkv, free)
+        block = Counter(
+            vector=sum(engine_ns("vector", w) for w in banks)
+            + (engine_ns("vector", len(banks)) if len(banks) > 1 else 0.0)
+            + engine_ns("vector", 1),
+            scalar=engine_ns("scalar", tkv) + engine_ns("scalar", 1),
+        )
+        columns = Counter(
+            vector=4 * engine_ns("vector", len(rows)),
+            scalar=engine_ns("scalar", len(rows)),
+        )
+        step.update({e: len(rows) * ns for e, ns in block.items()})
+        step.update(columns)
+        # Each pass waits on the one before: a block's, and the columns'
+        # on every block's.  Only another block's passes run beside them.
+        chain = sum(block.values()) + sum(columns.values())
         q_dtype, v_dtype, out_dtype = self.dtypes
-        for r in rows:
-            step["scalar"] += copies_ns(
+        copies = sum(
+            copies_ns(
                 "scalar",
                 kv_blocks,
                 r,
                 v_dtype,
                 half_bank_blocks(config, v_bits),
             )
-        rescale = step + passes(("vector",) * 2, d)
-        boundary = (
-            step + passes(("vector",) * 2, 1) + passes(("vector",) * 3, d)
+            for r in rows
         )
+        # The output stores' issue, on ScalarE's queue.
+        step["scalar"] += model.store_issue_ns(sweeps, steps)
+        rescale = step + passes(("vector",) * 2, d)
+        boundary = step + passes(("vector",) * 2, d)
         if self.transposed_output:
             boundary["tensor"] += head_blocks * tensor_ns(rows)
             boundary["vector"] += head_blocks * copies_ns(
@@ -416,7 +449,8 @@ class TrainiumAttention(OpModel):
             boundary["vector"] += head_blocks * copies_ns(
                 "vector", len(rows), min(tq, p), q_dtype, len(rows)
             )
-        interior = max(rescale.values())
+        interior = max(*balanced(rescale).values(), chain)
+        boundary_ns = max(*balanced(boundary).values(), chain)
 
         out_tile = self._out_tile(tq)
         moves = [
@@ -433,7 +467,7 @@ class TrainiumAttention(OpModel):
             for i, (tile, bits, n) in enumerate(moves)
         ]
         latency = model.sweep_ns(dmas, steps, interior)
-        latency += sweeps * (max(boundary.values()) - interior)
+        latency += sweeps * (boundary_ns - interior)
         traffic = sum(
             n * math.ceil(math.prod(tile) * bits / 8) for tile, bits, n in moves
         )

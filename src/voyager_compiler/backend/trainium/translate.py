@@ -10,8 +10,13 @@ their dependences, so the semaphores and waits are dropped.
 
 A tile in SBUF has its rows -- every dim but the last, flattened -- on the
 partitions, 128 at a time, and its last dim free: a slot of ``B`` row blocks
-of ``C`` columns is an NKI tensor ``[P, B * C]``.  A one-row tile read as an
-elementwise operand is replicated across the partitions when it is loaded.
+of ``C`` columns is an NKI tensor ``[P, B * C]``.  A flat row -- a one-row
+tile every op of the kernel touching it reads or writes as a row of its
+own, elementwise or an RMS norm, and TensorE never reads -- is cut across
+the partitions, each op on it running there (``Layout.spread``): HBM still
+holds the row as a row.  Any other one-row tile read as an elementwise
+operand is copied onto each partition the op reading it takes when it is
+loaded.
 Every access is an ``.ap()`` access pattern, found by mapping each element's
 logical coordinates to its offset and factoring the offsets into one nesting
 per instruction (``fit``), so views and relayouts fused into a kernel need
@@ -38,8 +43,9 @@ transpose, a K-major GEMM or an MX one alone writing such a box is one
 builder formed as a fused pattern (``patterns.py``) is the instruction the
 pattern names (``PATTERN_HANDLERS``); an ``eye`` is a ``memset`` and an
 ``affine_select``.  Each is emitted per 128 rows -- a matmul also per 512
-columns of its result and per 128-deep (512-deep MX) chunk of its
-contraction, a transpose per 128 x 128 block.
+columns of its result and per 128-deep chunk of its contraction (two whole
+ones in an FP8 ``double_row`` matmul, ``_nc_matmul``; 512-deep MX), a
+transpose per 128 x 128 block.
 
 A GEMM on a K-major activation (its ``layout`` ``"cx,ck"``, ``[..., K, M]``)
 reads it as stored, its contraction already on the partitions: the
@@ -86,7 +92,16 @@ from .patterns import (
     TENSOR_SCALAR,
     TENSOR_SCALAR_REDUCE,
 )
-from .utils import CHUNK_FREE, PARTITIONS, STATS_FREE, scratch_name
+from .utils import (
+    CHUNK_FREE,
+    DOUBLE_ROW_STEP,
+    PARTITIONS,
+    STATS_FREE,
+    contraction_runs,
+    pair_distance,
+    scratch_name,
+    spread_partitions,
+)
 from .vector import SQUARE_BLOCKS
 
 IMMEDIATE = ir.MEMORY_LEVEL_IMMEDIATE
@@ -152,6 +167,7 @@ BINARY_OPS = {
     "aten::eq": "nl.equal",
     "aten::ne": "nl.not_equal",
     "aten::maximum": "nl.maximum",
+    "aten::__and__": "nl.logical_and",
 }
 # Reductions over a tile's last dim: target -> NKI ALU op.
 REDUCTIONS = {"aten::amax": "nl.maximum", "aten::sum": "nl.add"}
@@ -259,9 +275,12 @@ class Box:
 @dataclass
 class Layout:
     """A box's slot on chip: ``parts`` partitions by ``blocks`` row blocks of
-    ``cols`` columns, row ``r`` on partition ``r % span`` of block ``r //
-    span``, its elements ``spacing`` apart; a ``replicated`` one-row box on
-    every partition.  A box with ``span`` 1 is all on one partition."""
+    room for ``cols`` columns (at least the box's), row ``r`` on partition
+    ``r % span`` of block ``r // span``, its elements ``spacing`` apart; a
+    ``replicated`` one-row box on each of its ``parts`` partitions.  A box
+    with ``span`` 1 is all on one partition.  A ``spread`` one-row box is
+    its row cut across the partitions, ``cols`` elements to each, element
+    ``c`` on partition ``c // cols``."""
 
     parts: int
     blocks: int
@@ -269,10 +288,35 @@ class Layout:
     replicated: bool
     span: int = PARTITIONS
     spacing: int = 1
+    spread: bool = False
 
     @property
     def free(self):
         return self.blocks * self.cols * self.spacing
+
+
+@dataclass
+class OpUse:
+    """What a compute op does with the kernel's on-chip boxes, as the
+    analysis walk records it (``Kernel._lay_out``).
+
+    Attributes:
+        flat: The op can run on a row cut across the partitions: an
+            elementwise chain or an RMS norm alone, whose result and every
+            operand are one row of ``cols`` elements in SBUF or a single
+            element.
+        parts: The partitions the op's rows take otherwise.
+        cols: The elements of its result.
+        rows: The boxes it holds as rows of its result: its result and
+            the operands of its result's size.
+        touched: Every on-chip box it reads or writes.
+    """
+
+    flat: bool
+    parts: int
+    cols: int
+    rows: frozenset
+    touched: frozenset
 
 
 @dataclass
@@ -667,6 +711,7 @@ class Kernel:
         self.reads, self.writes = [], []
         self.windows = {}
         self.uses = {}
+        self.op_uses = []
         self.lines = []
         # How many times each scratch region has been taken (``temp``).
         self.turns = {}
@@ -781,32 +826,79 @@ class Kernel:
             self.uses.setdefault(box.name, set()).add(role)
 
     def _lay_out(self):
-        """Every on-chip box's layout: rows on the partitions, a one-row box
-        only ever read as an elementwise operand replicated, and a pool
-        input as its windows (``windows``).  PSUM holds an 8-bit element in
-        two bytes, the way TensorE writes an FP8 transpose."""
+        """Every on-chip box's layout: rows on the partitions, a flat row cut
+        across them (``_spread_ops``), any other one-row box only ever
+        read as an elementwise operand copied onto each partition an op
+        reading it takes, and a pool input as its windows (``windows``).
+        PSUM holds an 8-bit element in two bytes, the way TensorE writes an
+        FP8 transpose, and starts each row block on a 4-byte boundary, where
+        an instruction's PSUM access must start."""
+        spread_ops = self._spread_ops()
+        spread = {name for use in spread_ops for name in use.rows}
         for box in self.boxes.values():
             if box.level not in ON_CHIP or box.name in self.mx_tiles:
                 continue
             uses = self.uses.get(box.name, set())
             spacing = 2 if box.level == LOCAL and _fp8(box.dtype) else 1
+            cols = box.cols
+            if box.level == LOCAL:
+                width = spacing * _element_bytes(box.dtype)
+                cols = math.ceil(cols * width / 4) * 4 // width
             if box.name in self.one_partition:
                 self.layouts[box.name] = Layout(
-                    1, box.rows, box.cols, False, span=1, spacing=spacing
+                    1, box.rows, cols, False, span=1, spacing=spacing
+                )
+                continue
+            if box.name in spread:
+                parts = spread_partitions(box.cols)
+                self.layouts[box.name] = Layout(
+                    parts, 1, box.cols // parts, False, spread=True
                 )
                 continue
             replicated = (
                 box.rows == 1 and "operand" in uses and "dst" not in uses
             )
-            parts = PARTITIONS if replicated else min(box.rows, PARTITIONS)
+            if replicated:
+                parts = max(
+                    (
+                        (
+                            spread_partitions(use.cols)
+                            if use in spread_ops
+                            else use.parts
+                        )
+                        for use in self.op_uses
+                        if box.name in use.touched
+                    ),
+                    default=PARTITIONS,
+                )
+            else:
+                parts = min(box.rows, PARTITIONS)
             blocks = math.ceil(box.rows / PARTITIONS)
             self.layouts[box.name] = Layout(
-                parts, blocks, box.cols, replicated, spacing=spacing
+                parts, blocks, cols, replicated, spacing=spacing
             )
         # A pool input holds output row p's kH input rows on partition p.
         for name, (kh, _, _, out_rows, _) in self.windows.items():
             cols = kh * self.boxes[name].cols
             self.layouts[name] = Layout(out_rows, 1, cols, False)
+
+    def _spread_ops(self):
+        """The ops that run on rows cut across the partitions: the flat ones
+        (``OpUse.flat``) whose rows no other op touches, TensorE never reads
+        and none lies on one partition -- an op that cannot holds its rows
+        against the flat ops sharing them, until none is left out."""
+        spread = [use for use in self.op_uses if use.flat]
+        while True:
+            held = set(self.one_partition) | {
+                name for name, uses in self.uses.items() if "gemm" in uses
+            }
+            for use in self.op_uses:
+                if use not in spread:
+                    held |= use.touched
+            kept = [use for use in spread if not use.rows & held]
+            if len(kept) == len(spread):
+                return spread
+            spread = kept
 
     def _view(self, ref):
         """``View`` of a ``TensorBoxRef``; a window of a pipelined box leads
@@ -867,7 +959,8 @@ class Kernel:
 
     def flat(self, view, linear, partitions=None):
         """Flat offsets in its tensor of ``view``'s elements at positions
-        ``linear``; a replicated box is read on ``partitions``."""
+        ``linear``; a replicated box is read on ``partitions``, a spread
+        one's row where it is cut (``Layout.spread``)."""
         box = view.box
         # The view is the box reshaped when it covers it: position is the
         # box's own.
@@ -878,6 +971,9 @@ class Kernel:
         layout = self.layouts[box.name]
         if layout.replicated:
             return partitions * layout.free + col
+        if layout.spread:
+            part, col = np.divmod(col, layout.cols)
+            return part * layout.free + col
         part, block = row % layout.span, row // layout.span
         return part * layout.free + (block * layout.cols + col) * layout.spacing
 
@@ -1019,7 +1115,8 @@ class Kernel:
         """Copy between the HBM elements ``hbm_linear`` of ``hbm`` and
         ``sbuf``'s, in ``sbuf``'s row-major order: the whole tile in one
         ``dma_copy`` when a pattern walks it -- a load in one per piece of
-        its 128-row blocks (``stream_blocks``) -- else 128 rows at a time."""
+        its 128-row blocks (``stream_blocks``), a spread row cut across the
+        partitions as it lies -- else 128 rows at a time."""
         layout = self.layouts[sbuf.box.name]
         rows, cols = _rows_cols(sbuf.shape)
         sbuf_var, hbm_var = self.var(sbuf.box, sbuf.slot), self.var(hbm.box)
@@ -1030,8 +1127,13 @@ class Kernel:
             return s, self.flat(hbm, hbm_linear[linear])
 
         if layout.replicated:
-            parts = PARTITIONS if load else 1
+            parts = layout.parts if load else 1
             linear = np.broadcast_to(np.arange(cols), (parts, cols))
+            s, h = offsets(linear)
+            self._dma(sbuf_var, layout.free, s, hbm_var, h, load)
+            return
+        if layout.spread:
+            linear = np.arange(rows * cols).reshape(layout.parts, -1)
             s, h = offsets(linear)
             self._dma(sbuf_var, layout.free, s, hbm_var, h, load)
             return
@@ -1179,8 +1281,9 @@ class Kernel:
         elif on_tensor_engine:
             gemm_operands = [
                 self._view(anchor.kwargs[k].tensor_box)
-                for k in ("input", "weight", "other")
+                for k in ("input", "weight", "other", "bias")
                 if k in anchor.kwargs
+                and anchor.kwargs[k].WhichOneof("arg_type") == "tensor_box"
             ]
         for view in gemm_operands:
             self._use(view.box, "gemm")
@@ -1196,6 +1299,16 @@ class Kernel:
                     self._use(box, "operand")
                     if box.level == DRAM and box.name not in self.reads:
                         self.reads.append(box.name)
+            flat = (
+                isinstance(dst, View)
+                and pattern is None
+                and not on_tensor_engine
+                and not into_psum
+                and anchor.target
+                not in (MAX_POOL2D, RMS_NORM_KMAJOR, "aten::eye", *REDUCTIONS)
+                and prims[-1].target != QUANTIZE_MX
+            )
+            self.op_uses.append(self._op_use(prims, dst, flat))
             return
         if pattern is not None:
             getattr(self, PATTERN_HANDLERS[pattern])(prims, dst)
@@ -1221,6 +1334,58 @@ class Kernel:
         else:
             self._elementwise(prims, dst)
 
+    def _op_use(self, prims, dst, flat):
+        """The ``OpUse`` of a compute op of ``prims`` writing ``dst``, which
+        may run flat if ``flat`` and its shapes allow: an elementwise chain
+        or an RMS norm alone, whose result is one row in SBUF and whose
+        operands are each that row's size or one element.  An op's rows
+        take ``min(rows, 128)`` partitions of its first result, a row op's
+        of its input; another op's, every partition."""
+        operands = [
+            self._view(arg.tensor_box)
+            for prim in prims
+            for key, arg in prim.kwargs.items()
+            if arg.WhichOneof("arg_type") == "tensor_box"
+            and arg.tensor_box.box.HasField("memory")
+            and "." not in key
+        ]
+        touched = {v.box.name for v in operands if v.box.level in ON_CHIP}
+        views = [dst] if isinstance(dst, View) else list(dst)
+        touched |= {v.box.name for v in views}
+        rowwise = [p for p in prims if p.target in ROWWISE]
+        if not flat:
+            parts = PARTITIONS
+        elif rowwise:
+            shape = tuple(rowwise[0].kwargs["input"].tensor_box.output_shape)
+            parts = min(_rows_cols(shape)[0], PARTITIONS)
+        else:
+            parts = min(
+                _rows_cols(self._result_shape(prims[0], {}))[0], PARTITIONS
+            )
+        cols = math.prod(dst.box.shape) if isinstance(dst, View) else 0
+        rows = {dst.box.name} if isinstance(dst, View) else set()
+        flat = (
+            flat
+            and (not rowwise or [p.target for p in prims] == ["aten::rms_norm"])
+            and dst.box.level == SCRATCHPAD
+            and dst.box.rows == 1
+            and dst.covers_box()
+            and spread_partitions(cols) > 1
+        )
+        for view in operands:
+            if math.prod(view.shape) == 1 and view.box.rows == 1:
+                continue
+            if (
+                view.box.level == SCRATCHPAD
+                and view.box.rows == 1
+                and math.prod(view.box.shape) == cols
+                and view.covers_box()
+            ):
+                rows.add(view.box.name)
+            else:
+                flat = False
+        return OpUse(flat, parts, cols, frozenset(rows), frozenset(touched))
+
     def _gemm_extents(self, gemm, act, weight):
         """``(batch, batch_a, batch_w, m, k, n)`` of a GEMM step: its result's
         batch and its operands', the rows, the contraction and the columns;
@@ -1235,17 +1400,39 @@ class Kernel:
         batch = tuple(np.broadcast_shapes(tuple(batch_a), tuple(batch_w)))
         return batch, tuple(batch_a), tuple(batch_w), m, k, n
 
-    def _block(self, view, index, lo, hi, x, width):
+    def _block(self, view, index, chunks, x, width):
         """The access to a GEMM operand ``[..., K, X]`` held contraction on
-        the partitions: rows ``lo .. hi`` of the contraction and columns
-        ``x .. x + width`` of its batch element ``index``."""
-        key = ("block", view.key(), index, lo, hi, x, width)
+        the partitions: the rows of the contraction in ``chunks``, ``(start,
+        stop)`` each (``contraction_runs``), and columns ``x .. x + width``
+        of its batch element ``index``.  A ``double_row`` matmul's two
+        128-row chunks are read ``[128, 2, width]``, one step of the first
+        free dim apart.
+
+        Raises:
+            NotImplementedError: No access pattern of at most three free
+                dims reads the block, or one reads a ``double_row`` block
+                with its chunks other than a multiple of
+                ``DOUBLE_ROW_STEP`` apart.
+        """
+        key = ("block", view.key(), index, tuple(chunks), x, width)
         if key not in self.memo:
             k, cols = view.shape[-2:]
-            rows = (index * k + lo + np.arange(hi - lo))[:, None]
-            linear = rows * cols + x + np.arange(width)[None, :]
+            rows = index * k + np.concatenate([np.arange(*c) for c in chunks])
+            linear = rows[:, None] * cols + x + np.arange(width)[None, :]
             offsets = self.flat(view, linear)
-            aps = fit([(self.free(view.box), offsets)], hi - lo)
+            first, *second = offsets.reshape(len(chunks), -1, width)
+            aps = fit([(self.free(view.box), first)], len(first))
+            if aps is not None and second:
+                (steps, offset), apart = aps[0], second[0][0, 0] - first[0, 0]
+                paired = [steps[0], [int(apart), 2], *steps[1:]]
+                aps = None
+                # The partition dim and at most three free dims.
+                if (
+                    len(paired) <= 4
+                    and apart % DOUBLE_ROW_STEP == 0
+                    and np.array_equal(second[0], first + apart)
+                ):
+                    aps = [(paired, offset)]
             if aps is None:
                 raise NotImplementedError(f"{view.box.name}: a GEMM block")
             self.memo[key] = _ap(self.var(view.box, view.slot), aps[0])
@@ -1324,9 +1511,10 @@ class Kernel:
 
     def _elementwise(self, prims, dst):
         """Elementwise ops, chunk by chunk of the first op's result: 128 rows
-        and up to ``CHUNK_FREE`` columns at a time, or, reading a tile from
-        PSUM in whole 128-row blocks, every block at once -- PSUM holds a
-        tile's blocks side by side within a bank."""
+        and up to ``CHUNK_FREE`` columns at a time, a row cut across the
+        partitions (``Layout.spread``) on all of them, or, reading a tile
+        from PSUM in whole 128-row blocks, every block at once -- PSUM holds
+        a tile's blocks side by side within a bank."""
         shape = self._result_shape(prims[0], {})
         rows, cols = _rows_cols(shape)
         # A scratch region (``temp``), named ``<group>.<kind>_<cols>``, is
@@ -1337,6 +1525,17 @@ class Kernel:
             for key, arg in prim.kwargs.items()
             if arg.WhichOneof("arg_type") == "tensor_box" and "." not in key
         )
+        layout = (
+            self.layouts.get(dst.box.name) if isinstance(dst, View) else None
+        )
+        if layout is not None and layout.spread:
+            # Partition ``p`` holds the row's elements ``p * cols ..``.
+            for lo, hi in _runs(layout.cols, CHUNK_FREE):
+                linear = np.arange(layout.parts)[:, None] * layout.cols
+                linear = linear + np.arange(lo, hi)[None, :]
+                coords = np.stack(np.unravel_index(linear, shape))
+                self._chain(prims, {}, dst, Chunk(None, None, shape, coords))
+            return
         if reads_psum and rows > PARTITIONS and rows % PARTITIONS == 0:
             # Partition ``p`` holds row ``b * 128 + p`` of each block ``b``.
             row = np.arange(PARTITIONS)[:, None] + np.arange(
@@ -1590,6 +1789,9 @@ class Kernel:
             if alpha is not None and self._scalar(alpha.scalar) != 1:
                 raise NotImplementedError(f"{prim.name}: alpha")
             op = BINARY_OPS[target]
+            if target == "aten::__and__" and out.dtype != "bool":
+                # ``logical_and`` is ``&`` only on 0/1 booleans.
+                raise NotImplementedError(f"{prim.name}: a bitwise and")
             if kinds == ["tile", "tile"]:
                 self.emit(
                     f"nisa.tensor_tensor(dst={dst}, data1={args[0]}, "
@@ -1798,12 +2000,16 @@ class Kernel:
 
     def _rowwise(self, prims, dst):
         """A row-wise op (a layer norm, an RMS norm, a softmax) and the ops
-        fused before or after it, 128 rows at a time.  The ops before it
-        write each block's rows to ``dst``, where the op then runs in place;
-        the op writes ``dst`` itself, or a scratch tile the ops after it
-        read."""
+        fused before or after it, 128 rows at a time; an RMS norm alone of a
+        row cut across the partitions by ``_rms_norm_spread``.  The ops
+        before it write each block's rows to ``dst``, where the op then runs
+        in place; the op writes ``dst`` itself, or a scratch tile the ops
+        after it read."""
         index = next(i for i, p in enumerate(prims) if p.target in ROWWISE)
         pre, prim, post = prims[:index], prims[index], prims[index + 1 :]
+        if self.layouts[dst.box.name].spread:
+            self._rms_norm_spread(prim, dst)
+            return
         if pre and post:
             raise NotImplementedError(f"{prim.name}: ops before and after")
         rows_op = getattr(self, ROWWISE[prim.target])
@@ -1936,6 +2142,58 @@ class Kernel:
             f"data={rows(0, cols)}, op0=nl.multiply, "
             f"operand0={rstd}, op1=nl.multiply, "
             f"operand1={self._rows_ap(weight, 0, r, 0, cols)})"
+        )
+
+    def _rms_norm_spread(self, prim, dst):
+        """RMS norm of a row cut across the partitions (``Layout.spread``)
+        into ``dst``, laid out the same: each partition's squares on
+        ScalarE, summed on the way, the partitions' sums totalled onto every
+        partition by a ones-matmul into PSUM, the mean square plus eps and
+        its rsqrt, then one pass scaling by it and the weight."""
+        kw = self._kwargs(prim)
+        layout = self.layouts[dst.box.name]
+        parts, free = layout.parts, layout.cols
+        if list(kw["normalized_shape"]) != [parts * free]:
+            raise NotImplementedError("an RMS norm over more than one dim")
+        linear = np.arange(parts * free).reshape(parts, free)
+        x, weight = (
+            self._view(prim.kwargs[key].tensor_box)
+            for key in ("input", "weight")
+        )
+        rows = []
+        for view in (x, weight, dst):
+            aps = fit([(self.free(view.box), self.flat(view, linear))], parts)
+            if aps is None:
+                raise NotImplementedError(f"{view.box.name}: a spread row")
+            rows.append(_ap(self.var(view.box, view.slot), aps[0]))
+        data, scale, out = rows
+        ones = self.temp("one", PARTITIONS)
+        if ("ones", ones) not in self.memo:
+            self.memo["ones", ones] = True
+            self.emit(f"nisa.memset(dst={ones}, value=1.0)")
+        squares = self.temp("sq", free) + f"[0:{parts}, 0:{free}]"
+        sums = self.temp("ss", 1) + f"[0:{parts}, 0:1]"
+        total = self.temp("acc", 1) + f"[0:{parts}, 0:1]"
+        rstd = self.temp("rs", 1) + f"[0:{parts}, 0:1]"
+        self.emit(
+            f"nisa.activation(dst={squares}, op=nl.square, data={data}, "
+            f"reduce_op=nl.add, reduce_res={sums}, "
+            "reduce_cmd=nisa.reduce_cmd.reset_reduce)"
+        )
+        self.emit(
+            f"nisa.nc_matmul(dst={total}, stationary={ones}[0:{parts}, "
+            f"0:{parts}], moving={sums}, accumulate=False)"
+        )
+        self.emit(
+            f"nisa.tensor_scalar(dst={rstd}, data={total}, op0=nl.multiply, "
+            f"operand0={1 / (parts * free)!r}, op1=nl.add, "
+            f"operand1={float(kw['eps'])!r})"
+        )
+        self.emit(f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})")
+        self.emit(
+            f"nisa.scalar_tensor_tensor(dst={out}, data={data}, "
+            f"op0=nl.multiply, operand0={rstd}, op1=nl.multiply, "
+            f"operand1={scale})"
         )
 
     def _rms_norm_kmajor(self, prims, dst):
@@ -2162,26 +2420,43 @@ class Kernel:
     def _nc_matmul(self, gemm, dst, accumulate):
         """K-major GEMM prim ``gemm`` into PSUM view ``dst``: per batch
         element, 128 rows and 512 columns of the result, one ``nc_matmul``
-        per 128-deep chunk of the contraction, each after the first adding
-        to the ones before, and the first too given ``accumulate``.  The
-        activation is the stationary operand, or the moving one when the
-        output is transposed (``_gemm_kmajor``).
-
-        Raises:
-            NotImplementedError: The GEMM has a bias.
-        """
-        if self._kwargs(gemm).get("bias") is not None:
-            raise NotImplementedError(f"{gemm.name}: a K-major GEMM's bias")
+        per 128-deep chunk of the contraction -- of two whole chunks, a
+        ``double_row`` one, when both operands are FP8: chunks as many apart
+        as put each operand's pair a multiple of ``DOUBLE_ROW_STEP``
+        elements apart (``pair_distance``, ``contraction_runs``) -- each
+        after the first adding to the ones before, and the first too given
+        ``accumulate``.  The activation is the stationary operand, or the
+        moving one when the output is transposed (``_gemm_kmajor``).  A
+        bias, a row on one partition, is the block's first ``nc_matmul``:
+        of the bias by the IR's ones row (``temp``), contracting that one
+        row."""
         act, weight = (
             self._view(gemm.kwargs[k].tensor_box)
             for k in ("input", "weight", "other")
             if k in gemm.kwargs
         )
+        bias = None
+        if self._kwargs(gemm).get("bias") is not None:
+            bias = self._view(gemm.kwargs["bias"].tensor_box)
+            ones = self.temp("one", self.config.moving_free_max)
+            if ("ones", ones) not in self.memo:
+                self.memo["ones", ones] = True
+                self.emit(f"nisa.memset(dst={ones}, value=1.0)")
         batch, batch_a, batch_w, m, k, n = self._gemm_extents(gemm, act, weight)
         operands = [(act, batch_a, m), (weight, batch_w, n)]
         if _output_transposed(gemm):
             operands.reverse()
         (stationary, batch_s, rows), (moving, batch_m, cols) = operands
+        fp8 = all(_fp8(view.box.dtype) is not None for view in (act, weight))
+        distance = None
+        if k > PARTITIONS and fp8:
+            # Each operand's step from one 128-row chunk to the next.
+            starts = [
+                self.flat(view, np.array([0, PARTITIONS]) * view.shape[-1])
+                for view in (act, weight)
+            ]
+            distance = pair_distance([int(b - a) for a, b in starts])
+        runs = contraction_runs(k, distance)
         for e in range(math.prod(batch)):
             e_coords = [int(c) for c in np.unravel_index(e, batch)]
             es = _batch_index(e_coords, batch_s)
@@ -2190,13 +2465,36 @@ class Kernel:
                 r = i_end - i
                 for j, j_end in _runs(cols, self.config.moving_free_max):
                     out = self._rows_ap(dst, e * rows + i, r, j, j_end)
-                    for c, (lo, hi) in enumerate(_runs(k, PARTITIONS)):
+                    if bias is not None:
+                        # The bias spans the result's columns, or its rows
+                        # when it is transposed.
+                        if _output_transposed(gemm):
+                            pair = (
+                                self._rows_ap(bias, 0, 1, i, i + r),
+                                f"{ones}[0:1, 0:{j_end - j}]",
+                            )
+                        else:
+                            pair = (
+                                f"{ones}[0:1, 0:{r}]",
+                                self._rows_ap(bias, 0, 1, j, j_end),
+                            )
+                        self.emit(
+                            f"nisa.nc_matmul(dst={out}, stationary={pair[0]}"
+                            f", moving={pair[1]}, accumulate={accumulate})"
+                        )
+                    for c, chunks in enumerate(runs):
+                        added = c > 0 or accumulate or bias is not None
+                        mode = (
+                            ", perf_mode=nisa.matmul_perf_mode.double_row"
+                            if len(chunks) == 2
+                            else ""
+                        )
                         self.emit(
                             f"nisa.nc_matmul(dst={out}, stationary="
-                            f"{self._block(stationary, es, lo, hi, i, r)}, "
+                            f"{self._block(stationary, es, chunks, i, r)}, "
                             "moving="
-                            f"{self._block(moving, em, lo, hi, j, j_end - j)}"
-                            f", accumulate={c > 0 or accumulate})"
+                            f"{self._block(moving, em, chunks, j, j_end - j)}"
+                            f", accumulate={added}{mode})"
                         )
 
     def _nc_matmul_mx(self, gemm, dst, accumulate):

@@ -6,7 +6,7 @@ A GEMM step ``[rows, depth] x [depth, cols]`` transposes its activation tile
 on TensorE one 128 x 128 block at a time and copies the blocks out of PSUM
 half a bank at a time (``half_bank_blocks``), runs one ``nc_matmul`` per row
 chunk, contraction chunk and moving-operand slice into PSUM, and evicts each
-finished slice to SBUF (``gemm_step_ns``); a reduction split over steps
+finished slice to SBUF (``gemm_step_busy``); a reduction split over steps
 keeps its running sum in PSUM across them, so it is split only when its
 output tile fits there beside the kernel's other PSUM boxes
 (``gemm_buffers``, ``fits_psum``).  An activation stored K-major
@@ -74,10 +74,13 @@ import interstellar
 from voyager_compiler.codegen.node_info import (
     activation_prologue,
     activation_transforms,
+    attention_shapes,
     bound_operands,
     gemm_layout,
     get_anchor_node,
     get_arg_value,
+    is_fully_connected,
+    is_gemm_op,
     is_nop,
     reads_kmajor,
     swaps_last_two_dims,
@@ -86,6 +89,9 @@ from voyager_compiler.codegen.node_info import (
     writes_transposed,
 )
 from voyager_compiler.codegen.transform import fuse_patterns
+from voyager_compiler.codegen.transform.bufferize.bufferization import (
+    _is_compute,
+)
 from voyager_compiler.codegen.transform.bufferize.ops import (
     commit,
     with_scratch,
@@ -142,11 +148,13 @@ from .utils import (
     PARTITIONS,
     QUANTIZE_MX,
     ROW_OPS,
+    SDPA_KMAJOR,
     SRAM,
     TRANSPOSE_TILES,
     TrainiumGrid,
     TrainiumPlacement,
     chain_tiles,
+    contraction_runs,
     extents,
     fits_psum,
     footprints,
@@ -156,10 +164,13 @@ from .utils import (
     half_bank_blocks,
     moved_bytes,
     multiplies_mx,
+    output_buffers,
+    pair_distance,
     pass_engines,
     psum_bytes,
     quantizable,
     row_op_tiles,
+    rows_cols,
     sbuf_bytes,
     sbuf_placed_bytes,
     scratch_regions,
@@ -194,8 +205,10 @@ LOAD_STAGING = {
 }
 # The op groups the translator computes a GEMM's kernel in, each with its
 # scratch regions (``gemm_scratch``): the eviction's chain on each slice,
-# the tail's row op on the output tile's rows, and the prologue.
+# the tail's row op on the output tile's rows, the prologue, and a slice's
+# product on the step adding the bias.
 EVICT_GROUP, ROW_GROUP, PROLOGUE_GROUP = "evict", "row", "prologue"
+PRODUCT_GROUP = "product"
 
 
 def transposed_loads(node):
@@ -215,6 +228,35 @@ def transposed_loads(node):
         )
         if loaded
     ]
+
+
+def first_load_exposed(node):
+    """Whether GEMM ``node``'s first loads wait in the open rather than run
+    under the kernel before it (``TrainiumModel.sweep_ns``).  The step
+    compile starts a kernel's loads under a matrix-matrix GEMM or a flash
+    attention of several queries before it, which leave the DMA idle, the
+    pieces of an activation as that kernel writes them.  After a vector op
+    -- a norm, whose output a GEMM reads whole -- or a matrix-vector GEMM or
+    attention, which keep the DMA busy, and first in the graph they find
+    nothing to overlap.
+
+    Read off the graph the tile search sees and kept on ``node`` (its
+    ``"first_load_exposed"`` meta): the bufferizer asks again with the
+    kernels before it already rewritten into loops.
+    """
+    if "first_load_exposed" not in node.meta:
+        before = node.prev
+        while before.op != "root" and not _is_compute(before):
+            before = before.prev
+        exposed = before.op == "root"
+        if not exposed:
+            anchor = get_anchor_node(before) or before
+            if anchor.target is SDPA_KMAJOR:
+                exposed = attention_shapes(anchor)[2][-2] == 1
+            else:
+                exposed = not is_gemm_op(anchor) or is_fully_connected(anchor)
+        node.meta["first_load_exposed"] = exposed
+    return node.meta["first_load_exposed"]
 
 
 def lands_on_tensor_engine(elements, rows):
@@ -262,6 +304,33 @@ def gemm_operands(node):
             staged = (dtype, get_dtype_width(dtype))
     prologue = bool(activation_prologue(node))
     return activation, prologue, staged, loads
+
+
+def multiplied_bits(node):
+    """``(activation, weight)`` element widths of the tiles TensorE
+    multiplies in GEMM ``node``, bare or fused: each operand as stored,
+    beneath a transpose or repeat its load folds in
+    (``activation_transforms``, ``weight_transforms``), read off the node a
+    fused GEMM's placeholder stands for; a weight dequantized on chip at its
+    dequantized width."""
+    anchor = get_anchor_node(node)
+    bound = bound_operands(node, node.meta.get("submodule"))
+    act = activation_transforms(anchor.args[0])[0]
+    weight, _, _, dequant = weight_transforms(anchor.args[1])
+    if dequant is not None:
+        weight = anchor.args[1]
+    return tuple(widest_bits(bound.get(n, n)) for n in (act, weight))
+
+
+def pairing(bits, act_step, weight_step):
+    """Chunks apart a GEMM step's ``double_row`` matmuls pair two 128-deep
+    chunks of its contraction (``pair_distance``, ``contraction_runs``),
+    its contraction-major tiles holding consecutive chunks ``act_step`` and
+    ``weight_step`` elements apart; ``None`` unless its operands are FP8
+    (``bits``, the step's widths)."""
+    if max(bits[:2]) > 8:
+        return None
+    return pair_distance((act_step, weight_step))
 
 
 def gemm_buffers(config, operands, scratch, tile, staging):
@@ -390,26 +459,35 @@ def evicts_by_copy(tail):
     return all(is_nop(n) or n.target in RELAYOUTS for n in tail[:stop])
 
 
-def gemm_scratch(config, groups, cols, depth):
+def gemm_scratch(config, groups, cols, depth, bias):
     """The scratch regions of a GEMM's kernel whose output tile PSUM holds
     ``cols`` wide, contracting ``depth`` (``scratch_regions``): the
     eviction's chain on each 512-column slice (``EVICT_GROUP``), its row op
-    on the tile's rows (``ROW_GROUP``), and the prologue's group over the
-    activation's rows (``PROLOGUE_GROUP``).  ``groups`` is the GEMM's
+    on the tile's rows (``ROW_GROUP``), the prologue's group over the
+    activation's rows (``PROLOGUE_GROUP``), and with a bias, of dtype
+    ``bias`` (else ``None``), a ones row of a slice's columns, which a
+    slice's first GEMM adds the bias by: a matmul of it by the bias,
+    contracting one row (``PRODUCT_GROUP``).  ``groups`` is the GEMM's
     ``gemm_groups``."""
     (chain, row_op, _), prologue = groups
     evict = set()
     for width in extents(cols, config.moving_free_max):
         evict |= chain_tiles(chain, width)
     row = row_op_tiles(row_op, cols, ()) if row_op is not None else ()
+    ones = (
+        {("one", config.moving_free_max, bias, 1, SRAM)}
+        if bias is not None
+        else ()
+    )
     return (
         scratch_regions(EVICT_GROUP, evict)
         + scratch_regions(ROW_GROUP, row)
         + scratch_regions(PROLOGUE_GROUP, group_tiles(prologue, depth))
+        + scratch_regions(PRODUCT_GROUP, ones)
     )
 
 
-def gemm_step_ns(
+def gemm_step_busy(
     model,
     rows,
     depth,
@@ -424,17 +502,22 @@ def gemm_step_ns(
     act_k_major=False,
     *,
     tail_copies,
+    store_issue=0.0,
+    distance,
 ):
-    """One GEMM step's compute, ``[rows, depth] x [depth, cols]``: the
-    busiest engine.
+    """Each engine's busy time on one GEMM step, ``[rows, depth] x [depth,
+    cols]``.
 
     TensorE transposes each 128 x 128 block of an activation stored
     ``[rows, depth]`` -- and of a weight stored ``[cols, depth]`` -- and
     multiplies the activation into PSUM one moving slice at a time; VectorE
     copies the transposed blocks out of PSUM, an activation's half a bank
     of them at a time (``half_bank_blocks``, a short last block alone) and
-    a weight's one at a time, and evicts the finished slices.  FP32
-    operands multiply at ``fp32_matmul_rate`` of the 16-bit rate and
+    a weight's one at a time, and evicts the finished slices.  Given a
+    ``distance``, the matmuls contract two 128-deep chunks that many apart
+    in one ``double_row`` matmul at ``fp8_matmul_speedup`` times the 16-bit
+    rate, a chunk left unpaired at the 16-bit rate (``contraction_runs``).
+    FP32 operands multiply at ``fp32_matmul_rate`` of the 16-bit rate and
     transpose at ``fp32_transpose_rate``.  MX operands are stored
     contraction-major, so they need no transposes, and each
     ``nc_matmul_mx`` contracts 512.  The tail's passes run over an output
@@ -466,6 +549,10 @@ def gemm_step_ns(
             contraction on the partitions.
         tail_copies: Each finished slice is copied out of PSUM
             (``evicts_by_copy``).
+        store_issue: ScalarE's time issuing the step's share of the output
+            stores (``TrainiumModel.store_issue_ns``).
+        distance: Chunks apart the step's matmuls pair them, ``None`` for
+            none (``pairing``).
     """
     config = model.config
     act_bits, weight_bits, _ = bits
@@ -473,19 +560,18 @@ def gemm_step_ns(
     widths = extents(cols, config.moving_free_max)
     tensor_cycles = 0.0
     busy = Counter()
+    doubles = 0
     if mx:
         rate = 1.0
-        depth_chunks = math.ceil(depth / (config.partitions * MX_PACK))
+        singles = math.ceil(depth / (config.partitions * MX_PACK))
         transposes = []
     else:
         width = max(act_bits, weight_bits)
-        if width <= 8:
-            rate = config.fp8_matmul_speedup
-        elif width <= 16:
-            rate = 1.0
-        else:
-            rate = config.fp32_matmul_rate
+        rate = 1.0 if width <= 16 else config.fp32_matmul_rate
         depth_chunks = math.ceil(depth / config.partitions)
+        runs = contraction_runs(depth, distance)
+        doubles = sum(len(chunks) == 2 for chunks in runs)
+        singles = len(runs) - doubles
         transposes = []
         if not act_k_major:
             per_copy = half_bank_blocks(config, act_bits)
@@ -510,7 +596,10 @@ def gemm_step_ns(
         )
     evictions = 1 / num_k if tail_copies else 0
     for _ in extents(rows, config.pe_array_size[1]):
-        tensor_cycles += depth_chunks * sum(w / rate + overhead for w in widths)
+        tensor_cycles += singles * sum(w / rate + overhead for w in widths)
+        tensor_cycles += doubles * sum(
+            2 * w / config.fp8_matmul_speedup + overhead for w in widths
+        )
         busy["vector"] += evictions * sum(
             model.engine_ns("vector", w, 32) for w in widths
         )
@@ -523,7 +612,8 @@ def gemm_step_ns(
         busy[engine] += ns / num_k
     prologue = [(e, 1.0, act_bits) for e in prologue_engines]
     busy.update(model.passes_busy(prologue, rows, depth))
-    return max(busy.values())
+    busy["scalar"] += store_issue
+    return busy
 
 
 @dataclass(frozen=True)
@@ -542,12 +632,14 @@ class TrainiumGemm(OpModel):
             tail's operands and ops (by name), whether that tail takes passes
             of its own and the scratch regions they may take, its outlier
             CSRs, its prologue's ops (by name) and operands, how its
-            activation and output are stored and what it keeps in PSUM.
+            activation and output are stored, what it keeps in PSUM and its
+            bias's dtype.
         model: The ``TrainiumModel``, which prices each step.
         bits: ``(activation, weight, output)`` element widths.
         output_scale_bits: The output's block-scale width, 0 unless it is
             MX.
         bias_bits: The bias's element width, 0 without one.
+        bias_dtype: The bias's dtype, ``None`` without one.
         block_size: The operands' MX block, 1 unless they are MX.
         batch: Batch elements the builder loops outside the mapping.
         weight_batch: Distinct weight tiles over that loop (a GQA repeat
@@ -582,6 +674,8 @@ class TrainiumGemm(OpModel):
             split.
         row_width: The output's last dim when the tail runs a row op, which
             an output tile then spans whole; 0 otherwise.
+        first_load_exposed: Its first loads overlap no kernel before it
+            (``first_load_exposed``).
     """
 
     space: MatrixSpace
@@ -590,6 +684,7 @@ class TrainiumGemm(OpModel):
     bits: tuple
     output_scale_bits: int
     bias_bits: int
+    bias_dtype: Optional[torch.dtype]
     block_size: int
     batch: int
     weight_batch: int
@@ -608,6 +703,7 @@ class TrainiumGemm(OpModel):
     prologue_engines: tuple
     whole_depth: bool
     row_width: int
+    first_load_exposed: bool
 
     @classmethod
     def from_node(cls, node, model):
@@ -630,6 +726,9 @@ class TrainiumGemm(OpModel):
         prologue_ops = tuple(n.target for n in prologue)
         operands = gemm_operands(node)
         groups = gemm_groups(node)
+        exposed = first_load_exposed(node)
+        bias = get_arg_value(anchor, 2, "bias", None)
+        bias_dtype = None if bias is None else bias.value.dtype
         # A prologue operand tiles along the activation's loop dims it
         # spans, right-aligned on them, its broadcast dims dropped.
         act_dims = [le.ON] * (anchor.args[0].value.ndim - 2)
@@ -665,20 +764,17 @@ class TrainiumGemm(OpModel):
             writes_transposed(anchor),
             operands,
             groups,
+            exposed,
+            bias_dtype,
         )
         return cls(
             space=model.matrix_space,
             key=key,
             model=model,
-            bits=(
-                node_dtype_bits(anchor.args[0]),
-                node_dtype_bits(anchor.args[1]),
-                out_bits,
-            ),
+            bits=(*multiplied_bits(node), out_bits),
             output_scale_bits=get_dtype_width(out_dtype[-2]) if mx_out else 0,
-            bias_bits=node_dtype_bits(
-                get_arg_value(anchor, 2, "bias", None), 0
-            ),
+            bias_bits=node_dtype_bits(bias, 0),
+            bias_dtype=bias_dtype,
             block_size=anchor.kwargs.get("block_size") or 1,
             batch=gemm_batch(anchor),
             weight_batch=weight_batch(anchor),
@@ -701,6 +797,7 @@ class TrainiumGemm(OpModel):
                 if any(t in ROW_OPS for t in tail_ops)
                 else 0
             ),
+            first_load_exposed=exposed,
         )
 
     @staticmethod
@@ -735,18 +832,25 @@ class TrainiumGemm(OpModel):
             return batch * tile_cols, tile_rows // batch
         return tile_rows, tile_cols
 
-    def _step_ns(self, rows, depth, cols, **kwargs):
-        """``gemm_step_ns`` of a ``[rows, depth] x [depth,
-        cols]`` step.  A transposed output holds ``cols`` on the PSUM
-        partitions, so the step runs ``[cols, depth] x [depth, rows]``, the
-        weight and the activation trading places."""
+    def _step_ns(self, rows, depth, cols, on, **kwargs):
+        """A ``[rows, depth] x [depth, cols]`` step's busiest engine
+        (``gemm_step_busy``), ``rows`` counting the ``on`` batch elements.
+        The matmuls read the activation ``[depth, rows]`` per batch element
+        when it lands K-major -- its stored layout, flipped by a transposing
+        load -- else TensorE's transposes of it, ``[depth, 128]`` of a batch
+        element at a time (``gemm_buffers``).  A transposed output holds
+        ``cols`` on the PSUM partitions, so the step runs ``[cols, depth] x
+        [depth, rows]``, the weight and the activation trading places."""
         bits = self.bits
+        k_major = self.act_k_major != self.act_loaded
+        act_step = rows // on if k_major else min(PARTITIONS, rows // on)
+        distance = pairing(bits, act_step, cols)
         act_k_major, weight_k_major = self.act_k_major, self.weight_k_major
         if self.out_transposed:
             rows, cols = cols, rows
             bits = (bits[1], bits[0], bits[2])
             act_k_major, weight_k_major = weight_k_major, act_k_major
-        return gemm_step_ns(
+        busy = gemm_step_busy(
             self.model,
             rows,
             depth,
@@ -754,8 +858,10 @@ class TrainiumGemm(OpModel):
             bits,
             weight_k_major,
             act_k_major=act_k_major,
+            distance=distance,
             **kwargs,
         )
+        return max(busy.values())
 
     def fit(self, mapping):
         """The kernel's ``TrainiumPlacement`` -- the buffers its builder
@@ -817,7 +923,9 @@ class TrainiumGemm(OpModel):
                 weight_tile,
                 slots(WEIGHT_DIMS, self.weight_batch),
             )
-        scratch = gemm_scratch(config, self.groups, psum_cols, depth)
+        scratch = gemm_scratch(
+            config, self.groups, psum_cols, depth, self.bias_dtype
+        )
         tile = (on, psum_rows // on, psum_cols, depth, split_k)
         buffers = gemm_buffers(config, self.operands, scratch, tile, staging)
         if buffers is None:
@@ -858,7 +966,8 @@ class TrainiumGemm(OpModel):
 
     def cost(self, mapping, placement):
         """The whole GEMM in TensorE cycles -- its L3 sweep, each step's
-        compute overlapping the DMAs of the operands that change -- and, as
+        compute overlapping the DMAs of the operands that change, its first
+        loads paid only when exposed (``first_load_exposed``) -- and, as
         ``compute``, one step of the GEMM alone, its prologue and tail left
         out.
         ``placement`` is the contract's."""
@@ -876,12 +985,14 @@ class TrainiumGemm(OpModel):
             rows,
             depth,
             cols,
+            on,
             tail_engines=self.tail_engines,
             tail_quantizes_mx=self.tail_quantizes_mx,
             num_k=num_k,
             mx=mx_in,
             prologue_engines=self.prologue_engines,
             tail_copies=self.tail_copies,
+            store_issue=model.store_issue_ns(steps // num_k, steps),
         )
         if mx_in:
             act_ns = model.mx_dma_ns(depth, rows, False)
@@ -951,8 +1062,10 @@ class TrainiumGemm(OpModel):
                     batch_loads(mapping, dims, self.batch, distinct),
                 )
             )
-        latency = model.sweep_ns(dmas, steps, compute)
-        gemm = self._step_ns(rows, depth, cols, mx=mx_in, tail_copies=True)
+        latency = model.sweep_ns(
+            dmas, steps, compute, self.first_load_exposed, held=True
+        )
+        gemm = self._step_ns(rows, depth, cols, on, mx=mx_in, tail_copies=True)
         return Cost(latency * frequency, compute=gemm * frequency)
 
 
@@ -974,17 +1087,16 @@ class TrainiumGemv(TrainiumGrid):
             stored layout (``transposed_loads``).
         groups: The groups of ops the translator runs in its kernel
             (``gemm_groups``).
+        first_load_exposed: Its first loads overlap no kernel before it
+            (``first_load_exposed``).
+        bias_dtype: The bias's dtype, ``None`` without one.
     """
 
     def __init__(self, node, model):
         super().__init__(node, model)
         anchor = get_anchor_node(node)
         tail_ops = tail_targets(node)
-        self.bits = (
-            widest_bits(anchor.args[0]),
-            widest_bits(anchor.args[1]),
-            widest_bits(node),
-        )
+        self.bits = (*multiplied_bits(node), widest_bits(node))
         self.weight_k_major = weight_k_major(anchor)
         self.tail_engines = pass_engines(tail_ops)
         self.tail_quantizes_mx = QUANTIZE_MX in tail_ops
@@ -992,6 +1104,9 @@ class TrainiumGemv(TrainiumGrid):
         self.operands = gemm_operands(node)
         self.loaded = {n: role for role, n in transposed_loads(node)}
         self.groups = gemm_groups(node)
+        self.first_load_exposed = first_load_exposed(node)
+        bias = get_arg_value(anchor, 2, "bias", None)
+        self.bias_dtype = None if bias is None else bias.value.dtype
 
     def placement(self, tiling, shapes, moves):
         """The kernel's ``TrainiumPlacement`` for an ``(X, C, K)`` tile of
@@ -1012,7 +1127,9 @@ class TrainiumGemv(TrainiumGrid):
             if n in self.loaded
             and lands_on_tensor_engine(math.prod(shape[:-2]), shape[-1])
         }
-        scratch = gemm_scratch(config, self.groups, cols, depth)
+        scratch = gemm_scratch(
+            config, self.groups, cols, depth, self.bias_dtype
+        )
         tile = (1, rows, cols, depth, tiling.grid[1] > 1)
         buffers = gemm_buffers(config, self.operands, scratch, tile, staging)
         if buffers is None:
@@ -1030,11 +1147,24 @@ class TrainiumGemv(TrainiumGrid):
         return gemv_transfers(self.node, shapes, tiling.grid)[1]
 
     def cost(self, tiling, placement):
-        """The tile sweep in TensorE cycles, and its DRAM bytes.
-        ``placement`` is the contract's."""
+        """The tile sweep in TensorE cycles, and its DRAM bytes, its first
+        loads paid only when exposed (``first_load_exposed``).  The weight
+        stream has a DMA queue to itself: the step compile moves the
+        one-row activation and output tiles on queues of their own
+        (``TrainiumModel.sweep_ns``'s ``apart``).  A step reads its weight
+        tile piece by piece as the pieces land, so once the last lands it
+        has left the matmuls that piece feeds and the output tile's
+        evictions, each slice's after its last matmul.  ``placement`` is
+        the contract's."""
         model = self.model
+        config = model.config
         rows, depth, cols = tiling.tile_sizes
-        compute = gemm_step_ns(
+        shapes = self.operand_shapes(tiling)
+        mx = self._mx_tiles(shapes)
+        grid, moves = gemv_transfers(self.node, shapes, tiling.grid)
+        steps = math.prod(grid)
+        stores = sum(c for n, _, c in moves if n is self.node)
+        busy = gemm_step_busy(
             model,
             rows,
             depth,
@@ -1046,17 +1176,54 @@ class TrainiumGemv(TrainiumGrid):
             tiling.grid[1],
             self.multiplies_mx,
             tail_copies=not self.tail_engines,
+            # TensorE transposes the activation ``[depth, 128]`` at a time.
+            distance=pairing(self.bits, min(PARTITIONS, rows), cols),
+            store_issue=model.store_issue_ns(stores, steps),
         )
-        shapes = self.operand_shapes(tiling)
-        mx = self._mx_tiles(shapes)
-        grid, moves = gemv_transfers(self.node, shapes, tiling.grid)
         dmas = [
             (model.buffer_dma_ns(n, s, mx, n is not self.node), c)
             for n, s, c in moves
         ]
-        steps = math.prod(grid)
-        latency = model.sweep_ns(dmas, steps, compute)
-        return Cost(latency * model.config.frequency, moved_bytes(moves))
+        apart = {
+            i
+            for i, (n, s, _) in enumerate(moves)
+            if all(rows_cols(b)[0] == 1 for b, _ in output_buffers(s, n))
+        }
+        if len(apart) == len(moves):
+            # One-row tiles alone share one queue.
+            apart = set()
+        # The weight: the largest tile the steps load.
+        weight, shape, _ = max(
+            (m for i, m in enumerate(moves) if i and i not in apart),
+            key=lambda m: math.prod(m[1]),
+        )
+        share = 1.0
+        if weight not in mx:
+            (tile, bits), *_ = output_buffers(shape, weight)
+            share = model.last_piece_share(*rows_cols(tile), bits)
+        widths = extents(cols, config.moving_free_max)
+        row_chunks = math.ceil(rows / config.partitions)
+        slices = row_chunks * len(widths)
+        if self.tail_engines:
+            tail = [(e, 1.0, 32) for e in self.tail_engines]
+            finish = max(model.passes_busy(tail, rows, cols).values())
+        else:
+            finish = row_chunks * sum(
+                model.engine_ns("vector", w, 32) for w in widths
+            )
+        if self.tail_quantizes_mx:
+            finish += max(model.quantize_mx_busy(rows, cols).values())
+        last = max(share * busy["tensor"], finish - finish / slices)
+        latency = model.sweep_ns(
+            dmas,
+            steps,
+            max(busy.values()),
+            self.first_load_exposed,
+            apart,
+            last + finish / slices,
+            held=True,
+        )
+        return Cost(latency * config.frequency, moved_bytes(moves))
 
 
 # The GEMM op a GEMM's slices call instead of its own: a row-major
@@ -1362,8 +1529,9 @@ class GemmSteps:
         mx: The GEMM's operands are MX.
         buffers: The buffers the tile search placed, by role
             (``gemm_buffers``), as ``_ScratchSpec``.
-        scratch: The regions the translator computes the tail and the
-            prologue in, as placed (``gemm_scratch``), by name.
+        scratch: The regions the translator computes the tail, the
+            prologue and a biased product in, as placed (``gemm_scratch``),
+            by name.
         transposes: The PSUM box a row-major activation is transposed into,
             else ``None``.
         groups: ``(start, stop)`` of each run of the contraction a
@@ -1593,7 +1761,7 @@ class GemmSteps:
             for t, (j, w) in enumerate(self.columns):
                 psum = self._psum(boxes, step, c, t)
                 product = self._product(
-                    tiles, activation, weight, chunk, j, w, first
+                    tiles, boxes, activation, weight, chunk, j, w, first
                 )
                 voyager.insert(product if first else product + psum, psum)
                 if evict:
@@ -1626,11 +1794,11 @@ class GemmSteps:
             tile = get_slot(tile, index)
         return window(tile, (0, 0), (rows, cols))
 
-    def _product(self, tiles, activation, weight, chunk, j, w, first):
+    def _product(self, tiles, boxes, activation, weight, chunk, j, w, first):
         """The GEMM of one slice, ``chunk``'s rows and columns ``j .. j +
         w``: of the transposed row-major activation, or of the part of the
         activation tile the slice reads, by the weight's; the bias on the
-        ``first`` step."""
+        ``first`` step, beside its ``product`` scratch in ``boxes``."""
         plan = self.plan
         coords, i, r = chunk
         depth = plan.tile_k
@@ -1663,6 +1831,12 @@ class GemmSteps:
         if first:
             start, size = (i, r) if plan.out_transposed else (j, w)
             bias = window(tiles[plan.bias_idx], (start,), (size,))
+            return self._beside_scratch(
+                PRODUCT_GROUP,
+                lambda a, b, c: self.op(a, b, c, **kwargs),
+                [act, weight, bias],
+                boxes,
+            )
         return self.op(act, weight, bias, **kwargs)
 
     def _transposed(self, tiles, boxes, step, c):
