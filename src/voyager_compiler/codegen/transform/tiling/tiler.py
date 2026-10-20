@@ -96,7 +96,7 @@ def build_tiler(
     )
 
 
-def pick(results, tolerance):
+def pick(results, tolerance, relative_ties=False):
     """The winner among priced ``results`` (``TileResult``): the one moving
     the fewest DRAM bytes among those within ``(1 + tolerance)`` of the best
     latency, then the faster, then the first.
@@ -106,9 +106,24 @@ def pick(results, tolerance):
     any amount of traffic for a rounding error.  This is how the interstellar
     tiler picks a mapping too (``mapping_point_generator``, with energy in
     place of bytes).
+
+    With ``relative_ties``, bytes buy latency only share for share: the
+    winner is the least latency plus bytes, each over the fastest result's,
+    so a slower result wins only by saving a larger share of the fastest
+    one's bytes than it adds to its latency.
     """
-    budget = min(result.cost.latency for result in results) * (1.0 + tolerance)
+    fastest = min(results, key=lambda result: result.cost.latency)
+    budget = fastest.cost.latency * (1.0 + tolerance)
+    kept = [result for result in results if result.cost.latency <= budget]
+    if relative_ties:
+        return min(
+            kept,
+            key=lambda result: (
+                result.cost.latency / fastest.cost.latency
+                + result.cost.dram_bytes / fastest.cost.dram_bytes,
+                result.cost.latency,
+            ),
+        )
     return min(
-        (result for result in results if result.cost.latency <= budget),
-        key=lambda result: (result.cost.dram_bytes, result.cost.latency),
+        kept, key=lambda result: (result.cost.dram_bytes, result.cost.latency)
     )

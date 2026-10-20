@@ -8,7 +8,6 @@ provenance capture stamps on every node.
 """
 
 import logging
-import operator
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -73,7 +72,7 @@ def merge_sibling_linears(
     mergeable: Optional[Callable[[Node, Node], bool]] = None,
 ) -> None:
     """Merge the bias-free linears that read one input into one linear over
-    their weights stacked, its output split back into theirs, in place.
+    their weights stacked, its output sliced back into theirs, in place.
 
     A linear takes part when no other node reads its weight; those whose
     weights share the first's dtype, device and ``requires_grad``, and for
@@ -163,14 +162,16 @@ def merge_sibling_linears(
                 torch.ops.aten.linear.default,
                 (first.args[0], graph.get_attr(target)),
             )
-            split = graph.call_function(
-                torch.ops.aten.split_with_sizes.default,
-                (merged_linear, [weight.shape[0] for weight in weights], -1),
-            )
-            parts = [
-                graph.call_function(operator.getitem, (split, index))
-                for index in range(len(linears))
-            ]
+            parts = []
+            row = 0
+            for weight in weights:
+                parts.append(
+                    graph.call_function(
+                        torch.ops.aten.slice.Tensor,
+                        (merged_linear, -1, row, row + weight.shape[0]),
+                    )
+                )
+                row += weight.shape[0]
         merged_linear.meta = {
             key: value for key, value in first.meta.items() if key != "val"
         }

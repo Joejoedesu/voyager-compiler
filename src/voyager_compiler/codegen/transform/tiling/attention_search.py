@@ -283,6 +283,6 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
     if not scored:
         raise RuntimeError(f"{node}: no tiling of its products maps on chip")
 
-    best = pick(scored, tiler.runtime_tolerance)
+    best = pick(scored, tiler.runtime_tolerance, op.space.relative_ties)
     node.meta["tile_result"] = best
     return best.tiling.grid[-2:]

@@ -113,10 +113,13 @@ class GridSpace:
         lanes: The multiple a tile's innermost dim takes.
         ranked: Price every tiling that fits; else the first that fits, in
             the enumeration's order, wins unpriced.
+        relative_ties: Bytes break a near-tie in latency only share for
+            share (``pick``).
     """
 
     lanes: int
     ranked: bool
+    relative_ties: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,10 +130,13 @@ class AttentionSpace:
         unit: The multiple a query / key tile takes.
         head_multiple: The kernel holds the head dim padded to a multiple of
             this (:func:`pad_head`).
+        relative_ties: Bytes break a near-tie in latency only share for
+            share (``pick``).
     """
 
     unit: int
     head_multiple: int
+    relative_ties: bool = False
 
 
 @dataclass(frozen=True)

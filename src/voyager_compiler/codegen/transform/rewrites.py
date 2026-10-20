@@ -152,12 +152,15 @@ def match_and_fuse_rms_norm(
     """Fuse each decomposed RMSNorm in ``model`` into one ``aten.rms_norm``.
 
     The pattern is ``rms_norm`` traced to ATen; literals must match, so a
-    match carries the module's eps, which the fused op takes.
+    match carries the module's eps, which the fused op takes.  The fused
+    op's weight is what the pattern scales the normalized input by: the
+    ``weight`` itself, or an expression of it (Gemma's ``1 + weight``) cast
+    to the input's dtype, which constant folding later collapses.
 
     Args:
         model: The graph to rewrite.
         rms_norm: An RMSNorm module of the model (e.g. ``LlamaRMSNorm``),
-            with a ``weight`` and a ``variance_epsilon``.
+            with a ``weight`` and a ``variance_epsilon`` or ``eps``.
         example_input: Inputs to trace ``rms_norm`` with.
         convert_scalars_to_attrs: Turn the pattern's scalars into attributes
             before matching.
@@ -179,25 +182,35 @@ def match_and_fuse_rms_norm(
     _matches: List[InternalMatch] = matcher.match(original_graph)
     logger.info(f"Found {len(_matches)} matches")
 
-    weight_node = next(
-        iter(n for n in pattern_graph.nodes if n.target == "weight")
-    )
+    # The scale is the operand of the last multiply that descends from the
+    # weight; the other operand is the normalized input.
+    from_weight = set()
+    scale = None
+    for n in pattern_graph.nodes:
+        if n.target == "weight" or from_weight & set(n.all_input_nodes):
+            from_weight.add(n)
+        if n.target is torch.ops.aten.mul.Tensor:
+            weighted = [a for a in n.args if a in from_weight]
+            if len(weighted) == 1:
+                scale = weighted[0]
+    x = next(n for n in pattern_graph.nodes if n.op == "placeholder")
+    cast = scale.meta["val"].dtype != x.meta["val"].dtype
+    eps = getattr(rms_norm, "variance_epsilon", None) or rms_norm.eps
 
     for match in _matches:
         input_node = match.placeholder_nodes[0]
         output_node = match.returning_nodes[0]
-        input_shape = input_node.meta["val"].shape
-        new_weight_node = match.nodes_map[weight_node]
-        rms_norm_inputs = (
-            input_node,
-            [input_shape[-1]],
-            new_weight_node,
-            rms_norm.variance_epsilon,
-        )
-
+        input_val = input_node.meta["val"]
+        weight = match.nodes_map[scale]
         with original_graph.inserting_before(output_node):
+            if cast:
+                weight = original_graph.call_function(
+                    torch.ops.aten.to.dtype, (weight, input_val.dtype)
+                )
+                propagate_shape(weight, model)
             new_node = original_graph.call_function(
-                torch.ops.aten.rms_norm.default, rms_norm_inputs
+                torch.ops.aten.rms_norm.default,
+                (input_node, [input_val.shape[-1]], weight, eps),
             )
 
         output_node.replace_all_uses_with(new_node)

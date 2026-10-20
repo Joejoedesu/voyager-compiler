@@ -794,6 +794,21 @@ def _swapped(rank: int) -> Perm:
     return tuple(perm)
 
 
+def _norm_layout(norm: Node, perm: Perm) -> Optional[str]:
+    """How an RMS norm runs on its input stored in ``perm``: ``"row"`` when
+    the normalized dims stay innermost in order, ``"kmajor"`` when the one
+    normalized dim lies second-last, on the partitions
+    (``rms_norm_kmajor``), and ``None`` when neither holds.  Leading dims
+    may lie in any order: they are batch."""
+    rank = len(perm)
+    count = len(norm.args[1])
+    if perm[rank - count :] == tuple(range(rank - count, rank)):
+        return "row"
+    if count == 1 and perm[-2] == rank - 1:
+        return "kmajor"
+    return None
+
+
 def _is_tensor(node) -> bool:
     return isinstance(node, Node) and isinstance(
         getattr(node, "value", None), torch.Tensor
@@ -1045,7 +1060,7 @@ def _plan_kmajor(
             for arg in node.args[0]:
                 need(node, arg, perm_of(arg), out)
         elif node.target is RMS_NORM:
-            out = src if src in (_identity(rank), _swapped(rank)) else None
+            out = src if _norm_layout(node, src) else None
         else:  # elementwise
             # A quantization table is indexed by value, not position, so it
             # is read as it is.
@@ -1257,10 +1272,10 @@ def _rewrite(
         node.args = (node.args[0], [out_shape[a] for a in perm])
     elif node.target in DIM_OPS | CACHE_WRITES:
         node.update_arg(1, perm.index(_cat_dim(node) % rank))
-    elif node.target is RMS_NORM and perm == _swapped(rank):
+    elif node.target is RMS_NORM and _norm_layout(node, perm) == "kmajor":
         _, _, weight, eps = (list(node.args) + [None, None])[:4]
         if weight is not None:
-            # The weight scales the hidden dim, now the second-last.
+            # The weight scales the normalized dim, now the second-last.
             with model.graph.inserting_after(weight):
                 weight = create_getattr_from_value(
                     model,
@@ -1332,8 +1347,9 @@ def normalize_activation_layout(model: GraphModule) -> GraphModule:
     computes the physical tensors, so it stays executable.
 
     Two ops reduce or move data across the partitions of a K-major tensor, and
-    both run on TensorE: an RMS norm over the hidden dim becomes
-    ``rms_norm_kmajor`` (a ones-matmul sums the squares), and RoPE's rotate-half
+    both run on TensorE: an RMS norm whose normalized dim lies on the
+    partitions -- the hidden dim, or a head's -- becomes ``rms_norm_kmajor``
+    (a ones-matmul sums the squares), and RoPE's rotate-half
     -- ``cat([-x2, x1])`` of the two halves of the head dim -- becomes a
     K-major ``matmul`` by a signed permutation.  A GEMM whose activation is a
     single row or column -- a matrix-vector product, an outer product -- keeps
