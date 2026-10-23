@@ -15,46 +15,59 @@ requires-python = ">=3.10"
 # STABILITY FIRST: Exact versions enforced where critical.
 dependencies = [
     "accelerate==1.12.0",
-    "datasets==4.8.5",
+    "datasets==4.5.0",
     "evaluate",
-    "fuzzywuzzy",
     "graphviz",
     "jiwer",
     "librosa",
     "matplotlib",
+    "opencv-python-headless==4.13.0.92",
     "peft==0.18.1",
     "protobuf",
-    "rouge",
+    "PyYAML",
     "scikit-learn",
     "scipy",
     "sentencepiece",
     "soundfile",
     "tabulate",
     "timm",
-    "torch==2.12.1",
-    "torchao==0.17.0",
-    "torchvision==0.27.1",
-    "transformers==5.13.0",
-    "wandb",
-    "xlsxwriter"
+    "torchao",
+    "transformers==5.1.0",
+    "wandb"
 ]
 
 [project.optional-dependencies]
-dev = ["black", "ruff"]
+cpu = [
+    "torch==2.8.0+cpu"
+]
+cuda = [
+    "torch==2.8.0"
+]
+# Style and test tooling.  pytest is required: conversion/gemmini/test_convert.py
+# is pytest-only (no unittest.TestCase, no __main__ entry point).
+dev = [
+    "black",
+    "ruff",
+    "pytest",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["scheduler*", "voyager_compiler*"]
 
 [tool.setuptools.package-data]
-# Package data for voyager_compiler and all subpackages.
-"*" = ["*.txt", "*.json", "*.proto"]
+"voyager_compiler" = ["*.txt", "*.json"]
 
 [tool.black]
 line-length = 80
 target-version = ["py312"]
 # Generated; regenerating would undo any formatting.  force- rather than
 # extend-, so it holds when the file is named explicitly on the CLI.
-force-exclude = '/src/interstellar/|(voyager_ir_pb2|aten_classifier)\.py$'
+# ``scheduler/interstellar`` is a vendored external tree. ``examples/`` holds
+# HuggingFace-derived scripts kept
+# close to their upstream, which ruff already exempts for the same reason;
+# without this, ``black --check .`` can never pass and is useless as a gate.
+force-exclude = '''/src/scheduler/interstellar/|/libraries/|/examples/|param_pb2\.py$'''
 
 # Linting only; black owns formatting (line-length matches it so the two agree
 # on what fits).
@@ -63,13 +76,14 @@ line-length = 80
 target-version = "py312"
 # Honour the excludes below for explicitly-named paths too.
 force-exclude = true
-# Code we do not own: interstellar is an external repo, the examples' run_*.py
-# are HuggingFace scripts kept close to upstream.
+# Code we do not own: Interstellar is an external repository, and the examples'
+# run_*.py files are HuggingFace scripts kept close to upstream.
 extend-exclude = [
-    "src/interstellar",
+    "src/scheduler/interstellar",
+    # Vendored checkout, untracked but on sys.path (test/test_codegen.py:1023).
+    "libraries",
     "examples/**/run_*.py",
-    "**/voyager_ir_pb2.py",
-    "**/aten_classifier.py",
+    "**/param_pb2.py",
 ]
 
 [tool.ruff.lint]
@@ -78,6 +92,11 @@ select = ["F", "I"]
 [tool.ruff.lint.per-file-ignores]
 # Leave the examples' import order alone; the F rules still apply to them.
 "examples/**" = ["I001"]
+# Package __init__ files are re-export hubs.  Their imports are the public
+# surface, not dead code, so F401 does not apply.  The surface is wider than
+# ``__all__`` because it was inherited from ``import *``; narrowing it is an
+# API decision, not a formatting one, and is deliberately left alone here.
+"**/__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["voyager_compiler", "interstellar"]
+known-first-party = ["voyager_compiler", "scheduler"]

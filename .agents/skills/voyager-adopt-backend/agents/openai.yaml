@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Voyager Target Adoption"
+  short_description: "Register targets and refine workload bindings"
+  default_prompt: "Use $voyager-adopt-backend to choose target registration, semantic workload binding, or bit-accurate full-control workload binding and gate the intended claim."

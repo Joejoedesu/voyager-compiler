@@ -1,0 +1,418 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Magnet Alpha capability and evidence index. Final FX/model.txt and linked
+# code are authoritative.
+schema_version: 6
+backend: magnet-alpha
+# The recorded evidence predates the published history.
+source_revision: null
+
+regression_status:
+  scope: >-
+    yolo5-face-nv x magnet-alpha compiler serialization and collateral
+    conversion
+  stage: R
+  status: unverified
+  details: docs/targets/magnet-alpha/regression.md
+  checks:
+    - check_id: yolo5-face-nv-alpha-structural
+      run_root: external-evidence/not-packaged
+      voyager_collateral:
+        artifact: model.txt
+        sha256: 2ba2689688ed5774ebba8da1b34a98a1ec4c2ad7fbf946ca99bf2f2fa7b01cdb
+      conversion:
+        passed: 144
+        total: 144
+        unit: supported_execution_records
+      boundaries:
+        compiler: pass
+        conversion: pass
+        execution: not_in_scope
+        comparison: unverified
+
+endpoint:
+  endpoint_id: magnet-alpha.converter
+  accepted_artifact: converter-produced Alpha directory plus layers.txt
+  adapter: conversion/magnet-alpha/convert.py::_Converter.convert
+  interface: conversion/magnet-alpha/README.md
+  control: partial-control
+  ownership:
+    voyager:
+      - final FX and model.txt semantics
+      - local schedule factors
+      - scratchpad placement and encoded addresses
+      - fixed-point controls
+    endpoint:
+      - target-file schema validation
+      - external execution is not included
+
+# Scheme records are searchable arithmetic families. Exact qparam policy,
+# physical-form selection, and operation compatibility remain in the linked
+# target code.
+
+semantic_fidelity:
+  stage: R
+  reference: >-
+    Fresh compiler serialization compared structurally with the retained
+    prior model.txt snapshot.
+  required: reference_tolerance
+  numerical_perturbation_permitted: true
+  tolerance:
+    absolute: 0
+    relative: 0
+
+quantization:
+  schemes:
+    - scheme_id: magnet-alpha.signed-int8-accumulator
+      status: supported
+      summary: Signed-INT8 payload multiplication with wrapping signed-INT32 accumulation.
+      implementation:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_int8_accumulator
+      semantic_evidence:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_int8_accumulator
+      adapter: []
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - scheme_id: magnet-alpha.vsq-block32
+      status: supported
+      summary: Alpha W4/A4 VSQ accumulator arithmetic; physical-form selection remains in target lowering.
+      implementation:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_vsq_conv2d_accumulator
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/pe_lowering.py::lower_magnet_alpha_vsq_convolutions
+      semantic_evidence:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_vsq_conv2d_accumulator
+      adapter: []
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - scheme_id: magnet-alpha.ppu-fixed-epilogue
+      status: supported
+      summary: Alpha PE fixed-point epilogue arithmetic.
+      implementation:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_pe_epilogue
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/pe_lowering.py::lower_magnet_alpha_fixed_point_epilogues
+      semantic_evidence:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_pe_epilogue
+      adapter: []
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - scheme_id: magnet-alpha.nmp-fixed-epilogue
+      status: supported
+      summary: Alpha NMP scalar fixed-point epilogue arithmetic.
+      implementation:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_nmp_epilogue
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/nmp_lowering.py::lower_magnet_alpha_depthwise_fixed_point
+      semantic_evidence:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_nmp_epilogue
+      adapter: []
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - scheme_id: magnet-alpha.pvs-output-block32
+      status: supported
+      summary: Alpha PVS payload and companion-mantissa arithmetic.
+      implementation:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_pvs_quantize
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/boundary_lowering.py::lower_magnet_alpha_pvs_outputs
+      semantic_evidence:
+        - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_pvs_quantize
+      adapter: []
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+
+  qdq_forms:
+    - capability_id: magnet-alpha.public-input-quantize-absorption
+      status: unverified
+      summary: >-
+        Converter owner resolution exists, but no target-core implementation
+        evidence establishes the public-input quantize computation and qparams.
+      implementation: []
+      semantic_evidence: []
+      adapter:
+        - conversion/magnet-alpha/convert.py::_fusion_owners_for_record
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - capability_id: magnet-alpha.public-output-dequantize-absorption
+      status: unverified
+      summary: >-
+        Converter owner resolution exists, but no target-core implementation
+        evidence establishes terminal dequantize computation and qparams.
+      implementation: []
+      semantic_evidence: []
+      adapter:
+        - conversion/magnet-alpha/convert.py::_fusion_owners_for_record
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - capability_id: magnet-alpha.public-output-host-layout-suffix
+      status: unsupported
+      summary: >-
+        At assignment, external output-layout suffixes are assumed CPU work
+        with zero Alpha coverage. Conversion projects their already-external
+        records as non-executable; Voyager implements no CPU path.
+      implementation: []
+      semantic_evidence: []
+      adapter:
+        - conversion/magnet-alpha/convert.py::_resolve_host_output_layouts
+      checks:
+        serialization: unverified
+        adapter: unverified
+        execution: not_in_scope
+        comparison: not_in_scope
+
+capabilities:
+  - capability_id: magnet-alpha.gemm-accumulator-ppu
+    kind: composite
+    status: supported
+    summary: >-
+      GEMM accumulator plus PPU requantization, with optional PVS output
+      packing; the optional EADD form is INT8-accumulator-only.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/hardware_pipeline.py::MAGNET_ALPHA_HARDWARE_PIPELINE
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_int8_accumulator
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_vsq
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_ppu_fixed_relu
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_pvs_quantize
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_int8_accumulator
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_vsq
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_ppu_fixed_relu
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_pvs_quantize
+    adapter:
+      - conversion/magnet-alpha/convert.py::_execution_kind_from_targets
+      - conversion/magnet-alpha/convert.py::build_gemm
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.depthwise-int8-nmp
+    kind: composite
+    status: supported
+    summary: Depthwise INT8 accumulator plus NMP requantization, with optional PVS output packing.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/hardware_pipeline.py::MAGNET_ALPHA_HARDWARE_PIPELINE
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_int8_accumulator
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_nmp_fixed_requantize
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_pvs_quantize
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/fixed_point.py::alpha_depthwise_conv2d_reference
+    adapter:
+      - conversion/magnet-alpha/convert.py::_execution_kind_from_targets
+      - conversion/magnet-alpha/convert.py::build_depthwise
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.max-pool2d
+    kind: operation
+    status: unverified
+    summary: Recognized INT8 max-pool form; converter legality is not fully guarded.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation: []
+    semantic_evidence: []
+    adapter:
+      - conversion/magnet-alpha/convert.py::build_pool
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.channel-shuffle
+    kind: operation
+    status: supported
+    summary: Two-branch INT8 channel shuffle translated by the Alpha converter.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_channel_shuffle
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_channel_shuffle
+    adapter:
+      - conversion/magnet-alpha/convert.py::build_shuffle
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.channel-shuffle-copy
+    kind: operation
+    status: supported
+    summary: Explicit physical channel-shuffle copy translated by the Alpha converter.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_channel_shuffle_copy
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_channel_shuffle_copy
+    adapter:
+      - conversion/magnet-alpha/convert.py::build_copy
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.nearest-upsample2d
+    kind: operation
+    status: supported
+    summary: INT8 nearest-neighbor upsample translated by the Alpha converter.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_upsample_nearest2d
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_upsample_nearest2d
+    adapter:
+      - conversion/magnet-alpha/convert.py::build_upsample
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.depthwise-vsq-nmp
+    kind: composite
+    status: unverified
+    summary: Depthwise VSQ accumulator plus NMP requantization and optional PVS packing.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_conv2d_vsq
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_nmp_fixed_requantize
+    semantic_evidence: []
+    adapter: []
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.group-norm
+    kind: operation
+    status: unverified
+    summary: Recognized group-normalization source form without an accepted converter translation.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation: []
+    semantic_evidence: []
+    adapter: []
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.softmax
+    kind: operation
+    status: unverified
+    summary: Recognized softmax source form without an accepted converter translation.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::classify_scheduler_operation
+    implementation: []
+    semantic_evidence: []
+    adapter: []
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+  - capability_id: magnet-alpha.vsq-scale-encode
+    kind: operation
+    status: supported
+    summary: >-
+      Exact standalone Alpha VSQ-scale encoding; no accepted converter translation
+      is registered.
+    recognition: []
+    implementation:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_vsq_scale_encode
+    semantic_evidence:
+      - src/voyager_compiler/codegen/target_backends/magnet_alpha/operators.py::magnet_alpha_vsq_scale_encode
+    adapter: []
+    checks:
+      serialization: unverified
+      adapter: unverified
+      execution: unverified
+      comparison: unverified
+
+performance_observations:
+  available:
+    emitted_layers: conversion/magnet-alpha/convert.py::_Converter.convert
+    scheduler_modeled_cycles_and_scalar_accesses: src/voyager_compiler/codegen/artifacts.py::dump_performance_estimates
+  unavailable:
+    - actual_accelerator_call_count
+    - endpoint_measured_total_time
+    - endpoint_measured_traffic
+    - utilization
+    - qualified_peak_denominator
+
+gaps:
+  - gap_id: GAP-magnet-alpha-operation-anchor-001
+    affects:
+      - magnet-alpha.converter
+    statement: >-
+      No external operation-execution anchor is packaged. Compiler and
+      converter checks do not establish executed target calls.
+  - gap_id: GAP-magnet-alpha-numerical-vectors-003
+    affects:
+      - magnet-alpha.converter
+    statement: Independent durable vectors for registered arithmetic and operation forms are incomplete.
+  - gap_id: GAP-magnet-alpha-performance-observations-004
+    affects:
+      - magnet-alpha.converter
+    statement: Actual calls, matched endpoint time and traffic, utilization, and qualified peaks are unavailable.
+  - gap_id: GAP-magnet-alpha-missing-converter-builders-005
+    affects:
+      - magnet-alpha.depthwise-vsq-nmp
+      - magnet-alpha.group-norm
+      - magnet-alpha.softmax
+      - magnet-alpha.vsq-scale-encode
+    statement: No accepted converter translation exists for these recognized or implemented forms.
+  - gap_id: GAP-magnet-alpha-pool-form-guard-006
+    affects:
+      - magnet-alpha.max-pool2d
+    statement: The adapter does not fully guard the accepted pool form.
+  - gap_id: GAP-magnet-alpha-qdq-execution-007
+    affects:
+      - magnet-alpha.public-input-quantize-absorption
+      - magnet-alpha.public-output-dequantize-absorption
+    statement: >-
+      Converter owner resolution exists, but no registered target-core
+      implementation establishes Q/DQ computation or qparams before
+      conversion. Operation-local semantic support, numerical comparison, and
+      target execution remain unverified.
+  - gap_id: GAP-magnet-alpha-evidence-portability-009
+    affects:
+      - magnet-alpha.converter
+    statement: >-
+      The prior model.txt snapshot is not packaged. Its retained hash supports
+      comparison bookkeeping but not detached reproduction.

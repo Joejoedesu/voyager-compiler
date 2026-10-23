@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Voyager Architecture Design"
+  short_description: "Design Voyager changes with clean boundaries"
+  default_prompt: "Use $voyager-architecture-design to plan or review a Voyager compiler change."

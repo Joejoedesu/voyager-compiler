@@ -14,9 +14,8 @@ from tqdm import tqdm
 from transformers import AutoModelForSemanticSegmentation
 
 from metrics import eval_metrics
-from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
-    add_experiment_args,
+    add_qspec_args,
     convert_pt2e,
     get_default_quantizer,
     prepare_pt2e,
@@ -73,7 +72,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Process model parameters.")
     parser.add_argument('--model_id', required=True, help='Fine-tuned model identifier')
     parser.add_argument('--attention_probs_qmax', type=int, default=None)
-    add_experiment_args(parser)
+    add_qspec_args(parser)
     return parser.parse_args()
 
 
@@ -137,8 +136,11 @@ def main(args):
 
     quantizer = get_default_quantizer(
         input_activation=args.activation,
+        output_activation=args.output_activation,
         weight=args.weight,
         bias=args.bias,
+        record_histogram=args.record_histogram,
+        force_scale_power_of_two=args.force_scale_power_of_two,
     )
     example_args = (dataset[0]["pixel_values"].to(device),)
     model = prepare_pt2e(model, quantizer, example_args)
@@ -151,7 +153,7 @@ def main(args):
             user_node = next(iter(node.users))
             user_node = next(iter(user_node.users))
             obs_or_fq = named_modules[user_node.target]
-            if isinstance(obs_or_fq, FakeQuantizeBase):
+            if isinstance(obs_or_fq, torch.ao.quantization.FakeQuantizeBase):
                 obs_or_fq.quant_max = args.attention_probs_qmax
 
     def calibrate(model):
@@ -168,7 +170,7 @@ def main(args):
     if args.calibration_steps > 0:
         calibrate(model)
         for module in model.modules():
-            if isinstance(module, FakeQuantizeBase):
+            if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
                 module.disable_observer()
 
     if args.convert_model:

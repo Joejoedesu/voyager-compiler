@@ -1,0 +1,492 @@
+from dataclasses import dataclass, replace
+from typing import Callable, Dict, List, Optional
+
+import torch
+from torch.ao.quantization.quantizer import QuantizationAnnotation
+from torch.ao.quantization.quantizer.utils import (
+    _annotate_input_qspec_map,
+    _annotate_output_qspec,
+)
+from torch.fx import Node
+
+from voyager_compiler.quantizer.quantizer import (
+    DerivedQuantizationSpec,
+    QuantizationSpec,
+)
+
+
+# In the absence of better name, just winging it with QuantizationConfig
+@dataclass(eq=True, frozen=True)
+class QuantizationConfig:
+    input_activation: Optional[QuantizationSpec]
+    output_activation: Optional[QuantizationSpec]
+    weight: Optional[QuantizationSpec]
+    bias: Optional[QuantizationSpec]
+
+
+AnnotatorType = Callable[
+    [
+        torch.fx.GraphModule,
+        Optional[QuantizationConfig],
+        Optional[Callable[[Node], bool]],
+    ],
+    Optional[List[List[Node]]],
+]
+OP_TO_ANNOTATOR: Dict[str, AnnotatorType] = {}
+
+
+def register_annotator(op: str):
+    def decorator(annotator: AnnotatorType):
+        OP_TO_ANNOTATOR[op] = annotator
+
+    return decorator
+
+
+def _is_annotated(nodes: List[Node]):
+    """
+    Given a list of nodes (that represents an operator pattern),
+    check if any of the node is annotated, return True if any of the node
+    is annotated, otherwise return False
+    """
+    annotated = False
+    for node in nodes:
+        annotated = annotated or (
+            "quantization_annotation" in node.meta
+            and node.meta["quantization_annotation"]._annotated
+        )
+    return annotated
+
+
+def _mark_nodes_as_annotated(nodes: List[Node]):
+    for node in nodes:
+        if node is not None:
+            if "quantization_annotation" not in node.meta:
+                node.meta["quantization_annotation"] = QuantizationAnnotation()
+            node.meta["quantization_annotation"]._annotated = True
+
+
+@register_annotator("linear")
+def _annotate_linear(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    weight_qspec = quantization_config.weight
+    bias_qspec = quantization_config.bias
+    for node in gm.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.linear.default
+        ):
+            continue
+        if filter_fn and not filter_fn(node):
+            continue
+        act_node = node.args[0]
+        weight_node = node.args[1]
+        bias_node = None
+        if len(node.args) > 2:
+            bias_node = node.args[2]
+
+        if isinstance(quantization_config.bias, DerivedQuantizationSpec):
+            bias_qspec = replace(
+                quantization_config.bias,
+                derived_from=[(act_node, node), (weight_node, node)],
+            )
+
+        if _is_annotated([node]) is False:  # type: ignore[list-item]
+            _annotate_input_qspec_map(
+                node,
+                act_node,
+                input_act_qspec,
+            )
+            _annotate_input_qspec_map(
+                node,
+                weight_node,
+                weight_qspec,
+            )
+            nodes_to_mark_annotated = [node, weight_node]
+            if bias_node:
+                _annotate_input_qspec_map(
+                    node,
+                    bias_node,
+                    bias_qspec,
+                )
+                nodes_to_mark_annotated.append(bias_node)
+            _annotate_output_qspec(node, output_act_qspec)
+            _mark_nodes_as_annotated(nodes_to_mark_annotated)
+            annotated_partitions.append(nodes_to_mark_annotated)
+
+    return annotated_partitions
+
+
+@register_annotator("conv")
+def _annotate_conv(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    for n in gm.graph.nodes:
+        if n.op != "call_function" or n.target not in [
+            torch.ops.aten.conv1d.default,
+            torch.ops.aten.conv2d.default,
+        ]:
+            continue
+        conv_node = n
+
+        input_qspec_map = {}
+        input_act = conv_node.args[0]
+        assert isinstance(input_act, Node)
+        input_qspec_map[input_act] = quantization_config.input_activation
+
+        weight = conv_node.args[1]
+        assert isinstance(weight, Node)
+        input_qspec_map[weight] = quantization_config.weight
+
+        # adding weight node to the partition as well
+        partition = [conv_node, conv_node.args[1]]
+
+        bias_qspec = quantization_config.bias
+        if isinstance(bias_qspec, DerivedQuantizationSpec):
+            bias_qspec = replace(
+                quantization_config.bias,
+                derived_from=[(input_act, n), (weight, n)],
+            )
+
+        bias = conv_node.args[2] if len(conv_node.args) > 2 else None
+        if isinstance(bias, Node):
+            input_qspec_map[bias] = bias_qspec
+            partition.append(bias)
+
+        if _is_annotated([n]):
+            continue
+
+        if filter_fn and not filter_fn(n):
+            continue
+
+        conv_node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=quantization_config.output_activation,
+            _annotated=True,
+        )
+        _mark_nodes_as_annotated(partition)
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("matmul")
+def _annotate_matmul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    weight_qspec = quantization_config.weight
+    for node in gm.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.matmul.default
+        ):
+            continue
+        if filter_fn and not filter_fn(node):
+            continue
+        if _is_annotated([node]):
+            continue
+
+        input_qspec_map = {}
+        input_act0 = node.args[0]
+        if isinstance(input_act0, Node):
+            input_qspec_map[input_act0] = input_act_qspec
+
+        # We use weight_qspec for the second input to differentiate
+        # the two inputs of torch.matmul
+        input_act1 = node.args[1]
+        if isinstance(input_act1, Node):
+            input_qspec_map[input_act1] = weight_qspec
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(node)
+    return annotated_partitions
+
+
+@register_annotator("residual")
+def _annotate_residual(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    node_order = {node: i for i, node in enumerate(gm.graph.nodes)}
+    annotated_partitions = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in [
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add_.Tensor,
+        ]:
+            continue
+        add_node = node
+        partition = [add_node]
+
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_act_qspec = quantization_config.input_activation
+        output_act_qspec = quantization_config.output_activation
+
+        input_act0 = add_node.args[0]
+        input_act1 = add_node.args[1]
+
+        if (
+            not isinstance(input_act0, Node)
+            or not isinstance(input_act1, Node)
+            or input_act0.op == "get_attr"
+            or input_act1.op == "get_attr"
+            or input_act0.meta["val"].shape != input_act1.meta["val"].shape
+        ):
+            continue
+
+        node_to_quantize = (
+            input_act0
+            if node_order[input_act0] < node_order[input_act1]
+            else input_act1
+        )
+        input_qspec_map = {node_to_quantize: input_act_qspec}
+
+        add_node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("add")
+def _annotate_add(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in [
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add_.Tensor,
+        ]:
+            continue
+        add_node = node
+        partition = [add_node]
+
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_act_qspec = quantization_config.input_activation
+        output_act_qspec = quantization_config.output_activation
+
+        input_qspec_map = {}
+        input_act0 = add_node.args[0]
+        if isinstance(input_act0, Node):
+            input_qspec_map[input_act0] = input_act_qspec
+
+        input_act1 = add_node.args[1]
+        if isinstance(input_act1, Node):
+            input_qspec_map[input_act1] = input_act_qspec
+
+        add_node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("mul")
+def _annotate_mul(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in [
+            torch.ops.aten.mul.Tensor,
+            torch.ops.aten.mul_.Tensor,
+        ]:
+            continue
+
+        mul_node = node
+        partition = [mul_node]
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_act_qspec = quantization_config.input_activation
+        output_act_qspec = quantization_config.output_activation
+
+        input_qspec_map = {}
+        input_act0 = mul_node.args[0]
+        if isinstance(input_act0, Node):
+            input_qspec_map[input_act0] = input_act_qspec
+
+        input_act1 = mul_node.args[1]
+        if isinstance(input_act1, Node):
+            input_qspec_map[input_act1] = input_act_qspec
+
+        mul_node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("softmax")
+def _annotate_softmax(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    for node in gm.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.softmax.int
+        ):
+            continue
+
+        partition = [node]
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_qspec_map = {}
+        input_act = node.args[0]
+        assert isinstance(input_act, Node)
+        input_qspec_map[input_act] = input_act_qspec
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("layer_norm")
+def _annotate_layer_norm(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    weight_qspec = quantization_config.weight
+    bias_qspec = quantization_config.bias
+    for node in gm.graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.layer_norm.default
+        ):
+            continue
+
+        partition = [node]
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_qspec_map = {}
+        act_node = node.args[0]
+        assert isinstance(act_node, Node)
+        input_qspec_map[act_node] = input_act_qspec
+
+        weight_node = node.args[2]
+        assert isinstance(weight_node, Node)
+        input_qspec_map[weight_node] = weight_qspec
+
+        bias_node = node.args[3] if len(node.args) > 3 else None
+        if bias_node:
+            assert isinstance(bias_node, Node)
+            input_qspec_map[bias_node] = bias_qspec
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions
+
+
+@register_annotator("activation")
+def _annotate_activation(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target not in [
+            torch.ops.aten.relu.default,
+            torch.ops.aten.sigmoid.default,
+            torch.ops.aten.tanh.default,
+            torch.ops.aten.hardswish.default,
+            torch.ops.aten.hardtanh.default,
+            torch.ops.aten.silu.default,
+            torch.ops.aten.gelu.default,
+            torch.ops.aten.relu_.default,
+            torch.ops.aten.sigmoid_.default,
+            torch.ops.aten.tanh_.default,
+            torch.ops.aten.hardswish_.default,
+            torch.ops.aten.hardtanh_.default,
+            torch.ops.aten.silu_.default,
+            torch.ops.aten.gelu_.default,
+        ]:
+            continue
+
+        partition = [node]
+        if _is_annotated(partition):
+            continue
+
+        if filter_fn and any(not filter_fn(n) for n in partition):
+            continue
+
+        input_qspec_map = {}
+        act_node = node.args[0]
+        assert isinstance(act_node, Node)
+        input_qspec_map[act_node] = input_act_qspec
+
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(partition)
+    return annotated_partitions

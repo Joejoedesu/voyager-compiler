@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Capability index plus compact regression snapshot. Point to authoritative
+# implementation and adapter sources; do not copy arithmetic, ABI fields,
+# validation algorithms, commands, or detailed run evidence.
+schema_version: 6
+backend: <backend>
+# Must resolve to a real revision; a placeholder is not provenance.
+source_revision: <git-revision>
+
+# Compact target x workload stage gate. `stage` names the gate being evaluated;
+# only `status: pass` makes that stage achieved. Detailed commands, numerical
+# statistics, limitations, and maintenance lanes belong in the linked
+# regression document. A passing gate has no failed, blocked, or unverified
+# in-scope boundary and retains at least one check whose compiler, execution,
+# and comparison boundaries all pass.
+# Hash only Voyager-emitted collateral. Conversion is regenerated and judged
+# by pass count; converted or runtime artifacts are not identity-gated. Add a
+# check only for a distinct retained Voyager package, not every sanity run.
+regression_status:
+  scope: <workload-x-target-scope>
+  stage: <R|W|X>
+  status: <pass|fail|blocked|unverified>
+  details: <repository-relative-regression-document>
+  checks:
+    - check_id: <stable-check-id>
+      run_root: <fresh-output-root-that-produced-it>
+      voyager_collateral:
+        artifact: <model.txt-or-voyager-collateral-manifest>
+        sha256: <content-hash>
+      conversion:
+        passed: <nonnegative-int>
+        total: <nonnegative-int>
+        # Use 0/0 and `not_in_scope` when full conversion did not run.
+        unit: <converted-record-unit|not_in_scope>
+      boundaries:
+        # For an X gate, execution includes consumption of the full-control
+        # artifact; comparison includes exact target agreement with the frozen
+        # workload-semantic reference and provenance for any packaged expected
+        # stream. An endpoint-self-generated self-check is not an X pass.
+        compiler: <pass|fail|blocked|unverified|not_in_scope>
+        conversion: <pass|fail|blocked|unverified|not_in_scope>
+        execution: <pass|fail|blocked|unverified|not_in_scope>
+        comparison: <pass|fail|blocked|unverified|not_in_scope>
+
+endpoint:
+  endpoint_id: <stable-endpoint-id>
+  accepted_artifact: <artifact-or-entrypoint>
+  adapter: <repository-path::symbol-or-authoritative-entrypoint>
+  interface: <repository-path-or-versioned-contract>
+  # The linked interface contract owns the target-specific justification.
+  control: <partial-control|full-control>
+  ownership:
+    voyager: []
+    endpoint: []
+
+quantization:
+  schemes:
+    - scheme_id: <stable-scheme-id>
+      # `status` is an evidence-local semantic capability result, never a
+      # serialization, adapter, execution, comparison, or workload-stage result.
+      status: <supported|unsupported|unverified>
+      summary: <concise-arithmetic-family-summary>
+      implementation: []
+      semantic_evidence: []
+      adapter: []
+      checks:
+        serialization: <pass|fail|blocked|unverified|not_in_scope>
+        adapter: <pass|fail|blocked|unverified|not_in_scope>
+        execution: <pass|fail|blocked|unverified|not_in_scope>
+        comparison: <pass|fail|blocked|unverified|not_in_scope>
+  qdq_forms:
+    - capability_id: <stable-qdq-capability-id>
+      status: <supported|unsupported|unverified>
+      summary: <concise-boundary-form-summary>
+      implementation: []
+      semantic_evidence: []
+      adapter: []
+      checks:
+        serialization: <pass|fail|blocked|unverified|not_in_scope>
+        adapter: <pass|fail|blocked|unverified|not_in_scope>
+        execution: <pass|fail|blocked|unverified|not_in_scope>
+        comparison: <pass|fail|blocked|unverified|not_in_scope>
+
+# Summaries make the inventory searchable. Exact selection, semantics, and
+# legality remain in linked source. `implementation` and `semantic_evidence`
+# must point to core compiler or authoritative target semantics. `adapter`
+# points only to boundary implementation and cannot establish semantic support
+# or invent computation or qparams. A supported record means the target
+# realization semantically matches the logical form under the declared
+# fidelity. `semantic_fidelity.stage` is the fidelity required by the current
+# stage gate and must match `regression_status.stage`; it is achieved only when
+# `regression_status.status` is `pass`. It does not promote every listed
+# capability or make the four per-capability checks implicit.
+semantic_fidelity:
+  stage: <R|W|X>
+  reference: <frozen-target-x-workload-semantic-reference>
+  required: <reference_tolerance|output_code_lsb|bit_exact_endpoint>
+  numerical_perturbation_permitted: <true|false>
+  tolerance:
+    absolute: <nonnegative-absolute-tolerance>
+    relative: <nonnegative-relative-tolerance>
+capabilities:
+  - capability_id: <stable-capability-id>
+    kind: <operation|composite>
+    status: <supported|unsupported|unverified>
+    summary: <concise-form-summary>
+    recognition: []
+    implementation: []
+    semantic_evidence: []
+    adapter: []
+    checks:
+      serialization: <pass|fail|blocked|unverified|not_in_scope>
+      adapter: <pass|fail|blocked|unverified|not_in_scope>
+      execution: <pass|fail|blocked|unverified|not_in_scope>
+      comparison: <pass|fail|blocked|unverified|not_in_scope>
+
+performance_observations:
+  available: {}
+  unavailable: []
+
+# References point one way to endpoint, scheme, Q/DQ, or capability IDs.
+gaps:
+  - gap_id: <stable-gap-id>
+    affects: []
+    statement: <evidence-backed-missing-boundary>

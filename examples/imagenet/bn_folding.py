@@ -1,7 +1,6 @@
 import copy
 
 import torch
-import torchvision.models as models
 
 # This file provides bn_folding_model, a function to fold bn into conv
 # With minor changes taken from here https://github.com/raja-kumar/folding-batchnorm/blob/master/bn_folder.py

@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Copy once per unsupported, approximated, failed, blocked, or unverified
+# in-scope claim. Add only details needed to explain this gap.
+schema_version: 2
+gap_id: GAP-<backend>-<number>
+backend: <backend>
+workload: <workload-or-all>
+adoption:
+  mode: <register_target|bind_workload_target|deepen_inner_control>
+  claim_id: <stable-claim-id-or-null>
+  work_order_id: <stable-task-id>
+stage: >-
+  <registration|quantization|candidate_assignment|final_fx|serialization|
+  conversion|final_execution_assignment|operation_execution|
+  connected_execution|performance|bit_accurate_core_lowering|inner_control>
+evidence_state: <unsupported|approximated|fail|blocked|unverified>
+
+affected:
+  source_occurrence_ids: []
+  model_operation_ids: []
+  artifact: null
+
+expected_contract: <required-behavior>
+observed_behavior: <evidence-backed-current-behavior>
+evidence: []
+
+# Optional. Include only facts relevant to this gap, such as an injection
+# contract hash, failed emitted call, comparison artifact, metric, or named X
+# decision. Do not restate graph membership already present in final FX/model.txt.
+details: {}
+
+classification: <correctness|legality|coverage|performance|evidence|shared_contract>
+severity: <blocking|high|medium|low>
+blocker:
+  boundary: <precise-interface-or-stage>
+  owner: <role-id-or-external-owner>
+  authority: <current_work_order|successor_work_order|external|denied|none>
+unblock_condition: <concrete-proof-or-implementation>
+next_action: <concrete-action>
+status: open
+resolution_evidence: []

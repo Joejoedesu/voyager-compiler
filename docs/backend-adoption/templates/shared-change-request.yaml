@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Copy only when a backend-local implementation cannot be correct.
+schema_version: 1
+request_id: ICR-<backend>-<short-name>
+observed_missing_contract: <precise-fact-or-argument>
+current_hook_or_ir: <exact-symbol-and-path>
+why_backend_local_is_incorrect: <duplication-hidden-state-or-target-branch>
+consumers:
+  - <first-real-consumer>
+exceptional_correctness_reason: null
+smallest_api_change: <signature-or-field-level-proposal>
+migration_impact: <callers-implementers-persistence>
+compatibility_plan: <explicit-plan>
+required_regression: []
+requesting_role_id: <role-id>
+decision: pending

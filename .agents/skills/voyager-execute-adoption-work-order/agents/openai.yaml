@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Voyager Adoption Work Order"
+  short_description: "Execute one phase-scoped adoption work order"
+  default_prompt: "Use $voyager-execute-adoption-work-order to complete one assigned Voyager adoption work order at its declared lifecycle phase and claim boundary."

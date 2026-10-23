@@ -1,153 +1,175 @@
-import os
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 
-import torch
-from voyager_compiler import (
-    capture_training,
-    compile,
-    gradient_program,
-    prepare_training,
-    shared_dram_layout,
-    transform,
-    update_program,
+from voyager_compiler.codegen import (
+    DEFAULT_ACCELERATOR_FREQUENCY_GHZ,
+    DEFAULT_COMPILATION_TARGET,
+    DEFAULT_DRAM_BANDWIDTH_GBPS,
+    DEFAULT_EXECUTION_ORDER_MODE,
+    GEMMINI_COMPILATION_TARGET,
+    GEMMINI_HARDWARE_CONFIG,
+    MAGNET_ALPHA_COMPILATION_TARGET,
+    PER_OPERATION_SCRATCHPAD_MAPPING,
+    HardwareConfig,
+    MagnetAlphaHardwareConfig,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
-from voyager_compiler.shape_prop import ShapeProp
+from voyager_compiler.codegen.target_backends.magnet_alpha import (
+    AOV_COMPAT_HARDWARE_CONFIG,
+)
 
 
-def get_transform_args(args, vector_stages):
-    return {
-        "patterns": vector_stages,
-        "config": AcceleratorConfig.from_args(args),
-        "layout_policy": args.layout_policy,
-        "gemv_weight_layout": args.gemv_weight_layout,
-        "fuse_reshape": not args.disable_reshape_fusion,
-        "keep_fp32": not args.remove_fp32_casts,
+def get_hardware_config(args):
+    """Build a typed profile when the legacy CLI describes full hardware."""
+    target = getattr(args, "target", DEFAULT_COMPILATION_TARGET)
+    if (
+        getattr(args, "bufferize", False)
+        and target == DEFAULT_COMPILATION_TARGET
+    ):
+        # Generic bufferized compilation is explicitly an unscheduled
+        # representation-lowering path. Its cache and unroll arguments remain
+        # graph-tiling inputs rather than selecting a local scheduler.
+        return None
+    hardware_unrolling = getattr(args, "hardware_unrolling", None)
+    cache_size = getattr(args, "cache_size", None)
+    has_unrolling = hardware_unrolling is not None
+    has_cache = cache_size is not None
+    if target == GEMMINI_COMPILATION_TARGET:
+        if has_unrolling or has_cache:
+            raise ValueError(
+                "gemmini uses its registered immutable hardware profile; "
+                "do not pass --hardware_unrolling or --cache_size"
+            )
+        return GEMMINI_HARDWARE_CONFIG
+    if not has_unrolling and not has_cache:
+        if target == MAGNET_ALPHA_COMPILATION_TARGET:
+            return AOV_COMPAT_HARDWARE_CONFIG
+        return None
+    if has_unrolling != has_cache:
+        raise ValueError(
+            "--hardware_unrolling and --cache_size must be specified together"
+        )
+    config_type = (
+        MagnetAlphaHardwareConfig
+        if target == MAGNET_ALPHA_COMPILATION_TARGET
+        else HardwareConfig
+    )
+    legacy_args = {
+        "unroll_dims": hardware_unrolling,
+        "cache_size": cache_size,
+        "input_buffer_size": args.input_buffer_size,
+        "weight_buffer_size": args.weight_buffer_size,
+        "accum_buffer_size": args.accum_buffer_size,
+        "num_banks": args.num_banks,
+        "bank_width": args.bank_width,
+        "target": target,
     }
+    if config_type is HardwareConfig:
+        legacy_args.update(
+            {
+                "double_buffered_accum_buffer": (
+                    getattr(
+                        args,
+                        "double_buffered_accum_buffer",
+                        False,
+                    )
+                ),
+                "double_buffered_l2": getattr(
+                    args,
+                    "double_buffered_l2",
+                    False,
+                ),
+                "dram_size": getattr(args, "dram_size", None),
+                "dram_bandwidth": getattr(
+                    args,
+                    "dram_bandwidth",
+                    DEFAULT_DRAM_BANDWIDTH_GBPS,
+                ),
+                "frequency": getattr(
+                    args,
+                    "frequency",
+                    DEFAULT_ACCELERATOR_FREQUENCY_GHZ,
+                ),
+            }
+        )
+    return config_type.from_legacy(
+        **legacy_args,
+    )
 
 
-def get_compile_args(args):
-    return {
-        "config": AcceleratorConfig.from_args(args),
+def get_transform_args(args, vector_stages, hardware_config=None):
+    unroll_dims = (
+        hardware_config.unroll_dims
+        if hardware_config is not None
+        else args.hardware_unrolling
+    )
+    cache_size = (
+        hardware_config.global_capacity_bytes
+        if hardware_config is not None
+        else args.cache_size
+    )
+    fuse_reshape = not args.disable_reshape_fusion and (
+        unroll_dims is None or max(unroll_dims) < 64
+    )
+    transform_args = {
+        "patterns": vector_stages,
+        "transform_layout": args.transform_layout,
+        "transpose_fc": args.transpose_fc,
+        "fuse_reshape": fuse_reshape,
+        "split_spmm": args.split_spmm,
+    }
+    if hardware_config is not None:
+        transform_args["hardware_config"] = hardware_config
+    else:
+        transform_args.update(
+            {
+                "unroll_dims": unroll_dims,
+                "cache_size": cache_size,
+                "num_banks": args.num_banks,
+            }
+        )
+    return transform_args
+
+
+def get_compile_args(
+    args,
+    hardware_config=None,
+    scheduler_backend=None,
+):
+    compile_args = {
+        "total_memory": getattr(args, "total_memory", None),
         "output_dir": args.model_output_dir,
         "output_file": args.model,
         "dump_tensors": args.dump_tensors,
-        "runtime_tolerance": args.runtime_tolerance,
-        "accumulate_fp32": args.accumulate_fp32,
+        "bufferize": args.bufferize,
+        "scratchpad_mapping": getattr(
+            args,
+            "scratchpad_mapping",
+            PER_OPERATION_SCRATCHPAD_MAPPING,
+        ),
+        "execution_order": getattr(
+            args,
+            "execution_order",
+            DEFAULT_EXECUTION_ORDER_MODE,
+        ),
     }
+    if scheduler_backend is not None:
+        compile_args["scheduler_backend"] = scheduler_backend
+    if hardware_config is not None:
+        compile_args["hardware_config"] = hardware_config
+        return compile_args
 
-
-class Loss(torch.nn.Module):
-    """A Hugging Face model whose forward returns its loss alone."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, **inputs):
-        return self.model(**inputs).loss
-
-
-def compile_training_step(model, inputs, vector_stages, args, quantizer):
-    """Compile one AdamW step of training ``model`` on the batch ``inputs``.
-
-    The step is two programs sharing one DRAM layout: the gradient program
-    -- forward, loss and backward -- and the update program, each compiled
-    into its own directory under ``args.model_output_dir``.  They run on
-    ``model``'s own tensors and ``inputs``, zeroed gradient buffers or, for
-    the update, random gradients, and the optimizer's state as before a
-    first step.  With ``--error``, the step trains through ``quantizer``'s
-    fake-quants, forward and backward, after ``--calibration_steps`` eager
-    steps have started their delayed scaling.  A dropout draws its mask per
-    tile once compiled, so with dropout the compiled program's results
-    differ from the reference's.
-
-    Args:
-        model: A Hugging Face model that returns its loss given labels.
-        inputs: One batch, labels included.
-        vector_stages: The fusion patterns ``transform`` applies.
-        args: The command line.
-        quantizer: Picks the GEMM operands to quantize, with ``--error``.
-
-    Returns:
-        ``(programs, reference, lowered)``, each keyed ``"gradient"`` and
-        ``"update"``: the compiled programs, the tensors each writes and
-        returns when its transformed graph runs -- the reference, since
-        ``--remove_fp32_casts`` changes the numbers on purpose -- and the
-        same from the compiled graphs under ``--debug``, else ``None``.
-    """
-    model = Loss(model).train()
-    if args.error is not None:
-        prepare_training(model, quantizer, (), inputs, None)
-        for _ in range(args.calibration_steps):
-            with torch.enable_grad():
-                model(**inputs).backward()
-        model.zero_grad(set_to_none=True)
-    else:
-        with torch.enable_grad():
-            capture_training(model, (), inputs, None)
-    gradient = gradient_program(model)
-    # A torch optimizer skips a parameter the loss never reaches, such as a
-    # vision tower under a text-only batch: it steps the ones with gradients.
-    grads = {n.name for n in gradient.graph.find_nodes(op="placeholder")}
-    optimizer = torch.optim.AdamW(
-        p
-        for name, p in model.named_parameters()
-        if name.replace(".", "_") + "_grad" in grads
+    compile_args["double_buffered_accum_buffer"] = (
+        args.double_buffered_accum_buffer
     )
-    programs = {
-        "gradient": gradient,
-        "update": update_program(model, optimizer),
-    }
-
-    tensors = {
-        name.replace(".", "_"): tensor
-        for name, tensor in [*model.named_parameters(), *model.named_buffers()]
-    }
-    example = {}
-    for kind, program in programs.items():
-        batch = iter(inputs.values())
-        values = []
-        for node in program.graph.find_nodes(op="placeholder"):
-            val = node.meta["val"]
-            if node.name in tensors:
-                values.append(tensors[node.name])
-            elif kind == "gradient" and not node.name.endswith("_grad"):
-                values.append(next(batch))
-            elif kind == "update" and node.name.endswith("_grad"):
-                values.append(torch.randn(val.shape).to(val.dtype) * 1e-2)
-            elif node.name.startswith("lr_"):
-                values.append(torch.tensor(1e-3))
-            else:
-                values.append(torch.zeros(val.shape, dtype=val.dtype))
-        example[kind] = values
-
-    transform_args = get_transform_args(args, vector_stages)
-    for kind, program in programs.items():
-        transform(program, example[kind], **transform_args)
-    layout = shared_dram_layout(
-        list(programs.values()), transform_args["config"]
+    compile_args.update(
+        {
+            "cache_size": args.cache_size,
+            "num_banks": args.num_banks,
+            "bank_width": args.bank_width,
+            "unroll_dims": args.hardware_unrolling,
+            "input_buffer_size": args.input_buffer_size,
+            "weight_buffer_size": args.weight_buffer_size,
+            "accum_buffer_size": args.accum_buffer_size,
+        }
     )
-
-    def run():
-        outputs = {}
-        for kind, program in programs.items():
-            written = [v.clone() for v in example[kind]]
-            result = ShapeProp(program).propagate(*written)
-            # The masks and token ids are only read.
-            outputs[kind] = [
-                t for t in [*written, *(result or ())] if t.is_floating_point()
-            ]
-        return outputs
-
-    reference = run()
-    compile_args = get_compile_args(args)
-    out_dir = compile_args.pop("output_dir")
-    for kind, program in programs.items():
-        compile(
-            program,
-            [v.clone() for v in example[kind]],
-            output_dir=os.path.join(out_dir, kind),
-            dram_layout=layout,
-            **compile_args,
-        )
-    return programs, reference, run() if args.debug else None
+    return compile_args

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Analytical Scheduler"
+  short_description: "Analyze Voyager and Magnet Alpha schedules"
+  default_prompt: "Use $analytical-scheduler to explain a Voyager scheduling decision and compare it with AoV and Magnet Alpha constraints."
