@@ -1,3 +1,5 @@
+import re
+
 import torch
 from torchvision import models
 from tqdm import tqdm
@@ -6,31 +8,36 @@ from voyager_compiler import (
     DerivedQuantizationSpec,
     QuantizationConfig,
     QuantizationSpec,
-    convert_pt2e,
-    export_model,
-    replace_conv2d_with_im2col,
-    prepare_pt2e,
-    transform,
     compile,
+    convert_pt2e,
     derive_bias_qparams_fn,
+    export_model,
     extract_input_preprocessor,
-    fuse_operator,
+    fuse,
+    prepare_pt2e,
+    replace_conv2d_with_im2col,
+    transform,
 )
-from voyager_compiler.quantization import parse_codebook_dtype
-from voyager_compiler.export_utils import get_conv_bn_layers
+from voyager_compiler.codegen import get_conv_bn_layers
 
-from .utils import get_transform_args, get_compile_args
+from .utils import get_compile_args, get_transform_args
 
 
 def load_model(args):
     if args.model_name_or_path is None:
         args.model_name_or_path = "DEFAULT"
 
+    if str(args.model_name_or_path).upper() == "NONE":
+        model = models.__dict__[args.model](weights=None).eval()
+        if args.bf16:
+            model.bfloat16()
+        return model
+
     try:
         model = models.__dict__[args.model](
             weights=args.model_name_or_path
         ).eval()
-    except Exception as e:
+    except Exception:
         model = models.__dict__[args.model](pretrained=True).eval()
 
         if args.model_name_or_path:
@@ -43,11 +50,25 @@ def load_model(args):
 
 
 def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
+    model,
+    quantizer,
+    calibration_data,
+    vector_stages,
+    args,
+    hardware_config,
+    scheduler_backend,
 ):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
-    transform_args = get_transform_args(args, vector_stages)
-    compile_args = get_compile_args(args)
+    transform_args = get_transform_args(
+        args,
+        vector_stages,
+        hardware_config,
+    )
+    compile_args = get_compile_args(
+        args,
+        hardware_config,
+        scheduler_backend,
+    )
 
     modules_to_fuse = get_conv_bn_layers(model)
     if len(modules_to_fuse) > 0:
@@ -67,6 +88,27 @@ def quantize_and_dump_model(
         quantizer.set_module_name("classifier", None)
 
         if args.activation is not None and "microscaling" in args.activation:
+            mobilenet_int8_layers = [
+                "features.0.0",
+                # "features.1.conv.0.0",
+                # "features.2.conv.1.0",
+                # "features.3.conv.1.0",
+                # "features.4.conv.1.0",
+                # "features.5.conv.1.0",
+                # "features.6.conv.1.0",
+                # "features.7.conv.1.0",
+                # "features.8.conv.1.0",
+                # "features.9.conv.1.0",
+                # "features.10.conv.1.0",
+                # "features.11.conv.1.0",
+                # "features.12.conv.1.0",
+                # "features.13.conv.1.0",
+                # "features.14.conv.1.0",
+                # "features.15.conv.1.0",
+                # "features.16.conv.1.0",
+                # "features.17.conv.1.0",
+            ]
+
             qspec = QuantizationSpec.from_str("int8,qs=per_tensor_symmetric")
 
             bias_qspec = DerivedQuantizationSpec(
@@ -76,7 +118,9 @@ def quantize_and_dump_model(
             )
 
             qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
-            quantizer.set_module_name("features.0.0", qconfig)
+
+            for layer in mobilenet_int8_layers:
+                quantizer.set_module_name(layer, qconfig)
 
         model.features[0][0].padding = (3, 3)
         model.features[0][0].weight.data = torch.nn.functional.pad(
@@ -98,21 +142,18 @@ def quantize_and_dump_model(
     # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        # A lookup table's layer takes its entry dtype, and stays unquantized
-        # when the entries keep the model's.
-        if (codebook := parse_codebook_dtype(dtype)) is not None:
-            dtype = codebook[1]
-        qconfig = None
-        if dtype is not None:
-            qspec = QuantizationSpec.from_str(
-                f"{dtype},qs=per_tensor_symmetric"
-            )
-            bias_qspec = DerivedQuantizationSpec(
-                derived_from=None,
-                derive_qparams_fn=derive_bias_qparams_fn,
-                dtype=None,
-            )
-            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
+        match = re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype, re.IGNORECASE)
+        if match is not None and match.group(2) is not None:
+            dtype = f"int{match.group(2)}"
+        qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
+
+        bias_qspec = DerivedQuantizationSpec(
+            derived_from=None,
+            derive_qparams_fn=derive_bias_qparams_fn,
+            dtype=None,
+        )
+
+        qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
         quantizer.set_module_name("^conv1$", qconfig)
 
     example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
@@ -122,7 +163,11 @@ def quantize_and_dump_model(
     if args.conv2d_im2col:
         replace_conv2d_with_im2col(gm)
 
-    gm = prepare_pt2e(gm, quantizer)
+    gm = prepare_pt2e(
+        gm,
+        quantizer,
+        hardware_config=hardware_config,
+    )
 
     model_name = model.__class__.__name__
     for i in tqdm(
@@ -132,20 +177,24 @@ def quantize_and_dump_model(
         with torch.no_grad():
             gm(inputs.to(torch_dtype))
 
-    convert_pt2e(gm, args.bias)
+    convert_pt2e(
+        gm,
+        args.bias,
+        hardware_config=hardware_config,
+    )
 
     old_output = gm(*example_args)
 
-    transform(gm, example_args, **transform_args, skip_op_fusion=True)
+    transform(gm, example_args, **transform_args, fuse_operator=False)
 
     gm, preprocess_fn = extract_input_preprocessor(gm)
     example_args = (preprocess_fn(*example_args),)
 
-    fuse_operator(gm, vector_stages)
+    fuse(gm, vector_stages, example_args)
 
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args) if args.debug else None
+    new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn

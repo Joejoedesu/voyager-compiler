@@ -8,13 +8,13 @@ from transformers import (
 )
 
 from voyager_compiler import (
+    compile,
     convert_pt2e,
     prepare_pt2e,
     transform,
-    compile,
 )
 
-from .utils import get_transform_args, get_compile_args
+from .utils import get_compile_args, get_transform_args
 
 
 def load_model(args):
@@ -34,14 +34,28 @@ def load_model(args):
 
 
 def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
+    model,
+    quantizer,
+    calibration_data,
+    vector_stages,
+    args,
+    hardware_config,
+    scheduler_backend,
 ):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
 
-    compile_args = get_compile_args(args)
-    transform_args = get_transform_args(args, vector_stages)
+    compile_args = get_compile_args(
+        args,
+        hardware_config,
+        scheduler_backend,
+    )
+    transform_args = get_transform_args(
+        args,
+        vector_stages,
+        hardware_config,
+    )
 
     batch = next(iter(calibration_dataloader))
     input_ids = batch["input_ids"]
@@ -64,13 +78,13 @@ def quantize_and_dump_model(
             self.classifier = model.classifier
 
         def forward(self, hidden_states, attention_mask):
-            for i, layer_module in enumerate(self.mobilebert.encoder.layer):
+            for layer_module in self.mobilebert.encoder.layer:
                 hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
                 )
 
-                if args.num_hidden_layers and i + 1 >= args.num_hidden_layers:
+                if args.compile_single_layer:
                     break
 
             pooled_output = self.mobilebert.pooler(hidden_states)
@@ -79,7 +93,12 @@ def quantize_and_dump_model(
 
     quantizer.set_module_name("classifier", None)
 
-    gm = prepare_pt2e(MobileBertWrapper(), quantizer, example_args)
+    gm = prepare_pt2e(
+        MobileBertWrapper(),
+        quantizer,
+        example_args,
+        hardware_config=hardware_config,
+    )
 
     if args.calibration_steps > 0:
         for i, batch in enumerate(
@@ -93,18 +112,18 @@ def quantize_and_dump_model(
             if i == args.calibration_steps - 1:
                 break
 
-    convert_pt2e(gm, args.bias)
+    convert_pt2e(
+        gm,
+        args.bias,
+        hardware_config=hardware_config,
+    )
 
     old_output = gm(*example_args)
 
     transform(gm, example_args, **transform_args)
     gm.graph.print_tabular()
 
-    # Verifying the lowered graph re-runs it, which is expensive; gate it on
-    # ``--debug`` so a plain compile skips it.  ``None`` signals "not checked".
-    new_output = None
-    if args.debug:
-        new_output = gm(*example_args)
+    new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output
@@ -157,5 +176,6 @@ def evaluate_gm(gm, dataset):
                 correct_predictions += 1
             total_samples += 1
 
-    accuracy = correct_predictions / total_samples
-    print(f"Quantized MobileBERT Accuracy: {accuracy:.4f}")
+    print(
+        f"Quantized MobileBERT Accuracy: {correct_predictions / total_samples:.4f}"
+    )

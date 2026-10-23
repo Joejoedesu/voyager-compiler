@@ -8,24 +8,22 @@ from transformers import (
 )
 
 from voyager_compiler import (
+    compile,
     convert_pt2e,
     prepare_pt2e,
     transform,
-    compile,
 )
 
-from .utils import get_transform_args, get_compile_args
+from .utils import get_compile_args, get_transform_args
 
 
 def load_model(args):
     if args.model_name_or_path is None:
         args.model_name_or_path = "bert-base-uncased"
 
-    layers = getattr(args, "num_hidden_layers", None)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         attn_implementation="eager",
-        **({"num_hidden_layers": layers} if layers else {}),
     )
 
     model.eval()
@@ -36,14 +34,28 @@ def load_model(args):
 
 
 def quantize_and_dump_model(
-    model, quantizer, calibration_data, vector_stages, args
+    model,
+    quantizer,
+    calibration_data,
+    vector_stages,
+    args,
+    hardware_config,
+    scheduler_backend,
 ):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
 
-    compile_args = get_compile_args(args)
-    transform_args = get_transform_args(args, vector_stages)
+    compile_args = get_compile_args(
+        args,
+        hardware_config,
+        scheduler_backend,
+    )
+    transform_args = get_transform_args(
+        args,
+        vector_stages,
+        hardware_config,
+    )
 
     batch = next(iter(calibration_dataloader))
     input_ids = batch["input_ids"]
@@ -66,13 +78,13 @@ def quantize_and_dump_model(
             self.classifier = model.classifier
 
         def forward(self, hidden_states, attention_mask):
-            for i, layer_module in enumerate(self.bert.encoder.layer):
+            for layer_module in self.bert.encoder.layer:
                 hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
                 )
 
-                if args.num_hidden_layers and i + 1 >= args.num_hidden_layers:
+                if args.compile_single_layer:
                     break
 
             pooled_output = self.bert.pooler(hidden_states)
@@ -82,7 +94,12 @@ def quantize_and_dump_model(
     quantizer.set_module_name("pooler", None)
     quantizer.set_module_name("classifier", None)
 
-    gm = prepare_pt2e(BertWrapper(), quantizer, example_args)
+    gm = prepare_pt2e(
+        BertWrapper(),
+        quantizer,
+        example_args,
+        hardware_config=hardware_config,
+    )
 
     if args.calibration_steps > 0:
         for i, batch in enumerate(
@@ -95,14 +112,18 @@ def quantize_and_dump_model(
             if i == args.calibration_steps - 1:
                 break
 
-    convert_pt2e(gm, args.bias)
+    convert_pt2e(
+        gm,
+        args.bias,
+        hardware_config=hardware_config,
+    )
 
     old_output = gm(*example_args)
 
     transform(gm, example_args, **transform_args)
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args) if args.debug else None
+    new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output

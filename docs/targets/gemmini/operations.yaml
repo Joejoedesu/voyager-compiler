@@ -1,0 +1,460 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Gemmini capability and evidence index. Final FX/model.txt and linked
+# implementation are authoritative.
+schema_version: 6
+backend: gemmini
+# The recorded evidence predates the published history.
+source_revision: null
+
+# The W endpoint campaign is a promotion candidate, not yet a repository-owned
+# golden. The inventory hash covers the 243-file Voyager-emitted
+# compiler/capture package. Conversion is intentionally tracked only as a pass
+# count.
+regression_status:
+  scope: resnet18 x gemmini
+  stage: W
+  status: pass
+  details: docs/targets/gemmini/regression.md
+  checks:
+    - check_id: resnet18-w
+      run_root: external-evidence/not-packaged
+      voyager_collateral:
+        artifact: compiler/artifact-inventory.json
+        sha256: 90e88a11848192b95834fcabe04a6713fa2e3e53b04a54166f41bb3352519b08
+      conversion:
+        passed: 30
+        total: 30
+        unit: mapped_regions
+      boundaries:
+        compiler: pass
+        conversion: pass
+        execution: pass
+        comparison: pass
+
+endpoint:
+  endpoint_id: gemmini.spike-public-auto-helpers
+  claim_scope: resnet18 W public-helper injection
+  x_interface_status: not_selected
+  accepted_artifact: >-
+    Gemmini-linked RV64 bare-metal ELF derived from canonical model.txt and
+    referenced tensor payloads
+  adapter: conversion/gemmini/workload.py::convert_region
+  interface: docs/targets/gemmini/workload-injection-contract.md
+  control: partial-control
+  ownership:
+    voyager:
+      - shared Q/DQ, Conv2d, residual Add, global-average, and Linear semantics
+      - final FX, tensor identities, logical layouts, values, and qparams
+      - canonical model.txt and independent complete-output oracles
+      - fail-closed conversion, static packing, launch glue, and readback
+    endpoint:
+      - public _auto helper local tile selection and loop traversal
+      - DMA, buffering, and scratchpad/accumulator windows
+      - local addresses, RoCC expansion, and execution completion
+
+quantization:
+  schemes:
+    - scheme_id: gemmini.s8-symmetric-per-tensor
+      status: unverified
+      summary: >-
+        Symmetric signed INT8 activation, weight, and narrowed output with
+        qmin -128, qmax 127, zero point zero, FP32 scales, and nearest-even
+        rounding. The exact nonunit Conv2d R anchor and fixed ResNet-18 W
+        binding pass; scheme-wide support across other forms is unverified.
+      implementation:
+        - src/voyager_compiler/decomposed.py::quantize
+        - src/voyager_compiler/decomposed.py::conv2d
+        - src/voyager_compiler/decomposed.py::dequantize
+        - src/voyager_compiler/codegen/target_backends/gemmini/quantization.py
+      semantic_evidence: &campaign_evidence
+        - docs/targets/gemmini/regression.md
+      adapter:
+        - conversion/gemmini/convert.py::convert
+      checks: &mixed_checks
+        serialization: unverified
+        adapter: unverified
+        execution: unverified
+        comparison: unverified
+    - scheme_id: gemmini.s8-weight-per-channel-axis0
+      status: unverified
+      summary: >-
+        Per-tensor signed-INT8 activations/output with axis-zero symmetric
+        signed-INT8 weights and one derived signed-INT32 bias scale per output
+        channel. Natural rows retain exact vector qparams, but no row reaches
+        native comparison.
+      implementation:
+        - src/voyager_compiler/decomposed.py::quantize
+        - src/voyager_compiler/decomposed.py::dequantize
+      semantic_evidence: *campaign_evidence
+      adapter: []
+      checks: *mixed_checks
+
+  qdq_forms:
+    - capability_id: gemmini.s8s8-s32-full
+      status: unverified
+      summary: >-
+        Signed-INT8 inputs and weights with the actual signed-INT32 MatMul or
+        Linear accumulator and immediate dequantize. Non-Conv rows attempt
+        this distinct raw form; both Conv rows are explicitly deferred and no
+        Conv raw-accumulator support is claimed.
+      implementation:
+        - src/voyager_compiler/decomposed.py::dequantize
+      semantic_evidence: *campaign_evidence
+      adapter: []
+      checks: *mixed_checks
+    - capability_id: gemmini.s8s8-s32-to-s8-f32-rne-sat
+      status: unverified
+      summary: >-
+        Signed-INT32 accumulation followed by a scalar FP32 multiplier,
+        nearest-even rounding, zero point zero, signed-INT8 saturation, and a
+        terminal FLOAT32 dequantize. The exact nonunit Conv2d anchor passes;
+        broader form support is unverified.
+      implementation:
+        - src/voyager_compiler/decomposed.py::conv2d
+        - src/voyager_compiler/decomposed.py::dequantize
+        - src/voyager_compiler/decomposed.py::quantize
+      semantic_evidence:
+        - docs/targets/gemmini/regression.md
+      adapter:
+        - conversion/gemmini/convert.py::convert
+      checks: *mixed_checks
+    - capability_id: gemmini.s8-resadd-equal-domain
+      status: unverified
+      summary: >-
+        Both Add inputs and output request one shared per-tensor scale and zero
+        point. The R breadth probes stop at qparam validation; the separate
+        fixed ResNet-18 W binding executes its eight admitted Add/ReLU regions.
+      implementation: []
+      semantic_evidence: *campaign_evidence
+      adapter: []
+      checks: *mixed_checks
+
+semantic_fidelity:
+  stage: W
+  reference: >-
+    For the frozen ResNet-18 x Gemmini binding, executable natural PyTorch and
+    shared PT2E Q/DQ on identical frozen tensors and exact qparams. Narrowed
+    output is compared in signed output-code space with rtol zero and atol one.
+    Raw MatMul/Linear accumulator probes use exact signed-INT32 comparison
+    before immediate dequantize.
+  required: output_code_lsb
+  numerical_perturbation_permitted: true
+  tolerance:
+    absolute: 1
+    relative: 0
+
+# This exact-pair record is the evidence for the W stage above. It does not
+# promote broad shapes or quantization schemes from unverified to supported.
+workload_bindings:
+  - binding_id: W-resnet18-gemmini-20260818
+    stage: W
+    workload: torchvision.models.resnet18(weights=None).eval()
+    profile_id: resnet18-gemmini-w-20260818-v1
+    status: pass
+    promotion_status: working_tree_candidate
+    fixed_input: uniform[-1,1] FLOAT32 [1,3,224,224], seed 20260818
+    helper_regions:
+      conv: 20
+      add: 8
+      global_average: 1
+      linear: 1
+    capture_logical_dtypes:
+      conv_input_float32: 1
+      conv_input_int8: 19
+      conv_output_int8: 20
+    checks:
+      compiler_semantic_comparison: pass
+      serialization: pass
+      adapter: pass
+      execution: pass
+      comparison: pass
+    comparison:
+      element_count: 2635752
+      exact_match_count: 2367030
+      one_lsb_difference_count: 268722
+      tolerance_mismatch_count: 0
+      maximum_absolute_error: 1
+      absolute_tolerance: 1
+      relative_tolerance: 0
+    connected_execution_claimed: false
+    performance_claimed: false
+    exact_x_claimed: false
+    x_status: not_started
+    x_reason: >-
+      selected helper point is partial-control; the same frozen W binding has
+      not been exercised through a full-control point
+
+capabilities:
+  - capability_id: gemmini.matmul-2d
+    kind: operation
+    status: unverified
+    summary: >-
+      Natural 2-D MatMul across per-tensor/per-channel and raw/narrowed forms.
+      Rows stop at qparam validation or canonical compilation.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.linear-nobias
+    kind: operation
+    status: unverified
+    summary: >-
+      Natural Linear without bias across both schemes and output forms. Rows
+      stop at target transform or canonical compilation.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.linear-bias
+    kind: operation
+    status: unverified
+    summary: >-
+      Natural Linear with independently derived signed-INT32 bias across both
+      schemes and output forms. R breadth rows stop before canonical native
+      acceptance; the fixed W record separately covers one exact Linear form.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.linear-bias-relu
+    kind: composite
+    status: unverified
+    summary: >-
+      Linear with derived bias and ReLU in the narrowed form. Per-tensor and
+      per-channel rows stop at different pre-serialization boundaries.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-anchor-s1-p1-d1-g1-nobias
+    kind: composite
+    status: supported
+    summary: >-
+      One fused [quantize, ordinary aten.conv2d, dequantize, quantize] region
+      plus terminal dequantize: frozen FLOAT32 NCHW [1,16,4,4] input, signed-
+      INT8 OIHW [16,16,3,3] weight, no bias, stride/padding/dilation one,
+      groups one, nonunit scalar scales, and signed-INT8 fused output. Scope is
+      the pinned default-derived configuration and tiled_conv_auto helper.
+    recognition:
+      - src/voyager_compiler/codegen/target_backends/gemmini/hardware_pipeline.py::GEMMINI_HARDWARE_PIPELINE
+      - src/voyager_compiler/codegen/target_backends/gemmini/lowering.py::gemmini_injection_region
+    implementation:
+      - src/voyager_compiler/decomposed.py::quantize
+      - src/voyager_compiler/decomposed.py::conv2d
+      - src/voyager_compiler/decomposed.py::dequantize
+      - src/voyager_compiler/codegen/target_backends/gemmini/lowering.py::apply_memory_rewrites
+      - src/voyager_compiler/codegen/target_backends/gemmini/serialization.py::prepare_canonical_serialization_metadata
+    semantic_evidence:
+      - docs/targets/gemmini/regression.md
+    adapter:
+      - conversion/gemmini/convert.py::convert
+    checks:
+      serialization: pass
+      adapter: pass
+      execution: pass
+      comparison: pass
+  - capability_id: gemmini.conv2d-bias-s1-p1-d1-g1
+    kind: operation
+    status: unverified
+    summary: >-
+      Dense stride-one Conv2d with derived bias. The per-tensor row reaches the
+      adapter; the per-channel row stops at target transform.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-s2-p1-d1-g1-nobias
+    kind: operation
+    status: unverified
+    summary: >-
+      Bias-free stride-two Conv2d. The per-tensor row reaches the adapter and
+      the per-channel row stops at target transform.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-s1-p2-d2-g1-nobias
+    kind: operation
+    status: unverified
+    summary: >-
+      Bias-free dilation-two Conv2d with padding two. The per-tensor row reaches
+      the adapter and the per-channel row stops at target transform.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-bias-relu
+    kind: composite
+    status: unverified
+    summary: >-
+      Dense Conv2d with derived bias and ReLU. Neither scheme reaches native
+      execution in the broad R probes. The fixed W record separately covers
+      its admitted Conv/ReLU signatures through the workload contract.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-relu-maxpool2-pad0
+    kind: composite
+    status: unverified
+    summary: >-
+      Conv2d, ReLU, and unpadded 2x2 max-pool. Both scheme rows stop before
+      adapter acceptance.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.conv2d-relu-maxpool2-pad1
+    kind: composite
+    status: unverified
+    summary: >-
+      Conv2d, ReLU, and padded 2x2 max-pool. Both scheme rows stop before
+      adapter acceptance.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.add-same-shape-equal-domain
+    kind: operation
+    status: unverified
+    summary: >-
+      Same-shape equal-domain residual Add with two independent inputs. The
+      R natural row stops at exact observer/qparam validation. The fixed W
+      record separately covers eight workload Add/ReLU regions.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.add-relu-same-shape-equal-domain
+    kind: composite
+    status: unverified
+    summary: >-
+      Same-shape equal-domain residual Add followed by ReLU. The natural row
+      in the R breadth campaign stops at observer/qparam validation. The
+      fixed W record separately executes eight admitted regions.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.depthwise-c16-multiplier1-d1
+    kind: operation
+    status: unverified
+    summary: >-
+      C16 depthwise Conv2d with multiplier one and dilation one. The per-tensor
+      row reaches the adapter and the per-channel row stops at target transform.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.convtranspose-s2-p1-op0-d1-g1
+    kind: operation
+    status: unverified
+    summary: >-
+      Natural ConvTranspose2d with stride two and output padding zero. Both
+      scheme rows stop at exact observer/qparam validation.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.maxpool2-pad0
+    kind: operation
+    status: unverified
+    summary: >-
+      Standalone unpadded 2x2 max-pool. The natural row stops at exact
+      observer/qparam validation.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+  - capability_id: gemmini.relu6
+    kind: operation
+    status: unverified
+    summary: >-
+      Natural ReLU6. The natural row stops at exact observer/qparam validation.
+    recognition: []
+    implementation: []
+    semantic_evidence: *campaign_evidence
+    adapter: []
+    checks: *mixed_checks
+
+performance_observations:
+  available:
+    retained_summary: docs/targets/gemmini/regression.md
+  unavailable:
+    - endpoint_cycle_count
+    - endpoint_memory_traffic
+    - accelerator_utilization
+    - endpoint_energy
+    - target_latency
+    - target_throughput
+
+gaps:
+  - gap_id: GAP-gemmini-shared-semantic-qparam-001
+    affects:
+      - gemmini.s8-weight-per-channel-axis0
+      - gemmini.s8-resadd-equal-domain
+      - gemmini.matmul-2d
+      - gemmini.add-same-shape-equal-domain
+      - gemmini.add-relu-same-shape-equal-domain
+      - gemmini.convtranspose-s2-p1-op0-d1-g1
+      - gemmini.maxpool2-pad0
+      - gemmini.relu6
+    statement: Eight rows stop at exact role-specific observer/qparam validation.
+  - gap_id: GAP-gemmini-shared-semantic-transform-002
+    affects:
+      - gemmini.s8-weight-per-channel-axis0
+      - gemmini.s8s8-s32-full
+      - gemmini.s8s8-s32-to-s8-f32-rne-sat
+      - gemmini.linear-nobias
+      - gemmini.linear-bias
+      - gemmini.linear-bias-relu
+      - gemmini.conv2d-bias-s1-p1-d1-g1
+      - gemmini.conv2d-s2-p1-d1-g1-nobias
+      - gemmini.conv2d-s1-p2-d2-g1-nobias
+      - gemmini.conv2d-bias-relu
+      - gemmini.conv2d-relu-maxpool2-pad0
+      - gemmini.conv2d-relu-maxpool2-pad1
+      - gemmini.depthwise-c16-multiplier1-d1
+    statement: Thirteen per-channel rows lack a legal exact vector-scale mapping.
+  - gap_id: GAP-gemmini-shared-semantic-compile-003
+    affects:
+      - gemmini.s8-symmetric-per-tensor
+      - gemmini.s8s8-s32-full
+      - gemmini.s8s8-s32-to-s8-f32-rne-sat
+      - gemmini.matmul-2d
+      - gemmini.linear-nobias
+      - gemmini.linear-bias
+      - gemmini.linear-bias-relu
+      - gemmini.conv2d-bias-relu
+      - gemmini.conv2d-relu-maxpool2-pad0
+      - gemmini.conv2d-relu-maxpool2-pad1
+    statement: Ten final-FX rows fail the exact current canonical region contract.
+  - gap_id: GAP-gemmini-shared-semantic-adapter-004
+    affects:
+      - gemmini.s8s8-s32-to-s8-f32-rne-sat
+      - gemmini.conv2d-bias-s1-p1-d1-g1
+      - gemmini.conv2d-s2-p1-d1-g1-nobias
+      - gemmini.conv2d-s1-p2-d2-g1-nobias
+      - gemmini.depthwise-c16-multiplier1-d1
+    statement: Four canonical shared Conv signatures fail pinned adapter admission.
+  - gap_id: GAP-gemmini-shared-semantic-conv-raw-s32-005
+    affects:
+      - gemmini.s8s8-s32-full
+    statement: Two Conv raw-INT32 rows are user-deferred with no target worker.

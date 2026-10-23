@@ -12,8 +12,15 @@ models
 plots
 slurm_scripts
 test/*
+test/unit_tests/__pycache__/*
 !test/test_codegen.py
-!test/run_ci.py
+!test/test_gemm_lowering.py
+!test/test_attention_lowering.py
+!test/__init__.py
+!test/utils/
+!test/utils/models/
+!test/utils/models/registry.py
+!test/unit_tests/
+!test/unit_tests/*
 wandb
 .vscode
-tools/artifacts/shards/

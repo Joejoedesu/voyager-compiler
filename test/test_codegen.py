@@ -1,125 +1,183 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import argparse
 import logging
+import os
+import re
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import torch
-from torch.testing import assert_close
-from torch.utils._pytree import tree_flatten
-from torchvision import models
-from utils.dataset import glue, imagenet
-from utils.models import bert, llama, mobilebert, torchvision_models, vit
-from utils.models.llama import QUANTIZATION_CONFIGS
-from utils.models.utils import compile_training_step
+import torch.nn as nn
+from datasets import load_dataset
+from torch.ao.quantization.quantizer.utils import _annotate_output_qspec
+from torchvision import models, transforms
+from tqdm import tqdm
+from transformers import (
+    AutoImageProcessor,
+    AutoTokenizer,
+    StaticCache,
+)
 
+from test.utils.dataset import glue, imagenet
+from test.utils.models import bert, mobilebert, torchvision_models, vit
+from test.utils.models.registry import resolve_workload_target
+from test.utils.models.utils import (
+    get_compile_args,
+    get_hardware_config,
+    get_transform_args,
+)
+from test.verify_help import assert_output_close, compare_output_statistics
 from voyager_compiler import (
-    OpMatcher,
-    add_compile_args,
-    add_quantization_args,
+    QuantizationConfig,
+    QuantizationSpec,
+    TorchExportableModuleWithStaticCache,
+    add_qspec_args,
+    compile,
+    convert_and_export_with_split_cache,
+    convert_pt2e,
+    export_model,
+    extract_input_preprocessor,
+    fuse,
     get_default_quantizer,
+    prepare_pt2e,
+    sink_obs_or_fq,
+    swap_llama_attention,
+    transform,
 )
-from voyager_compiler.codegen.node_info import is_fully_connected
-from voyager_compiler.codegen.reporting import (
-    coverage,
-    kernel_rows,
-    load_calibration,
-    report,
+from voyager_compiler.codegen import (
+    COMPILATION_TARGETS,
+    DEFAULT_ACCELERATOR_FREQUENCY_GHZ,
+    DEFAULT_COMPILATION_TARGET,
+    DEFAULT_DRAM_BANDWIDTH_GBPS,
+    DEFAULT_EXECUTION_ORDER_MODE,
+    END_TO_END_SCRATCHPAD_MAPPING,
+    EXECUTION_ORDER_MODES,
+    LOCAL_SCHEDULERS,
+    PER_OPERATION_SCRATCHPAD_MAPPING,
+    SCRATCHPAD_MAPPING_MODES,
+    get_target_operator_traits,
+    get_target_hardware_pipeline,
+    inline_autocast_modules,
+    remove_softmax_dtype_cast,
+    replace_rmsnorm_with_layer_norm,
+    resolve_compilation_target,
+    validate_execution_order_mode,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 logger = logging.getLogger()
 
 
-def _can_fuse(node):
-    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
-    if hasattr(node, "value") and is_fully_connected(node):
-        input_node = node.args[0]
-        return input_node.meta.get("dtype") is not None
+def get_llama_qconfig(bs=64, outlier_pct=None):
+    if outlier_pct is None:
+        return {
+            torch.nn.Linear: [
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+            torch.ops.aten.matmul.default: [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"int6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3",
+            ],
+            (r"lm_head", torch.ops.aten.linear.default, 0): [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+        }
+    else:
+        return {
+            torch.nn.Linear: [
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3,opct={outlier_pct}",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+            torch.ops.aten.matmul.default: [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3,othr=6.0",
+            ],
+        }
+
+
+def _report_output_comparison(old_output, new_output, *, imprecise):
+    if imprecise:
+        compare_output_statistics(
+            old_output,
+            new_output,
+            label="Converted reference versus transformed target",
+        )
+        return
+    assert_output_close(
+        old_output,
+        new_output,
+        label="old_output versus new_output",
+        rtol=0.0,
+        atol=0.0,
+    )
+    print("Results match")
+
+
+def _dispatch_registered_workload(
+    adapter,
+    args,
+    *,
+    hardware_pipeline,
+    hardware_config,
+    scheduler_backend,
+):
+    """Run one registered adapter, or preserve the legacy fallback."""
+
+    if adapter is None:
+        return False
+    result = adapter.run(
+        args,
+        vector_stages=hardware_pipeline,
+        hardware_config=hardware_config,
+        scheduler_backend=scheduler_backend,
+    )
+    print(
+        "Resolved workload route: "
+        f"{result.workload} x {result.target}; "
+        f"profile={result.profile_id or 'none'}"
+    )
+    _report_output_comparison(
+        result.reference_output,
+        result.transformed_output,
+        imprecise=result.imprecise_pt2e,
+    )
     return True
 
 
-def _is_constant_div(node):
-    if node.target != torch.ops.aten.div.Tensor:
-        return True
-
-    divisor = node.args[1]
-    if isinstance(divisor, torch.fx.Node):
-        return divisor.value.numel() == 1
-
-    return True
-
-
-def model_input_name(gm):
-    """The compiled graph's input placeholder, which names the per-sample
-    tensor files the accuracy tester loads."""
-    return next(n.name for n in gm.graph.nodes if n.op == "placeholder")
-
-
-MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = [
-    "quantize",
-    "quantize_mx",
-    "quantize_mx_outlier",
-    "quantize_affine",
-]
-# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
-# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
-# op, and its slice width follows the consumers.
-GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
-
-# Tolerance for comparing the lowered graph's output against the original's.
-# Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
-# mantissa bits away from the reference one (an ulp is 2**-8 relative, and a
-# split reduction compounds several); the two are numerically equivalent but
-# not bit-identical.  Exceeding this warns rather than fails, since telling a
-# real lowering error from an unlucky accumulation needs a human.
-OUTPUT_RTOL = 5e-2
-OUTPUT_ATOL = 1e-4
-
-VECTOR_PIPELINE = [
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
-        OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher("layer_norm", "softmax"),
-        OpMatcher(*QUANT_OPS),
-    ],
-]
-
-
-def main():
+if __name__ == "__main__":
     torch.manual_seed(0)
     torch.set_printoptions(sci_mode=False, precision=10)
     torch.set_num_threads(32)
-    torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()
+    parser.add_argument("model")
     parser.add_argument(
-        "model",
+        "--target",
+        choices=COMPILATION_TARGETS,
+        default=DEFAULT_COMPILATION_TARGET,
+        help="Compilation target for architecture-specific graph rewrites.",
+    )
+    parser.add_argument(
+        "--imprecise_pt2e",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
-            "Model to compile. Medusa stages are medusa_prefill and "
-            "medusa_decode."
+            "Report statistical similarity instead of requiring exact "
+            "converted-reference versus transformed-target equality. "
+            "Defaults on for quantized Magnet Alpha AoV and off otherwise."
         ),
     )
     parser.add_argument(
         "--model_name_or_path",
         default=None,
-        help=(
-            "Path to pretrained model or model identifier from "
-            "huggingface.co/models. Use tiny-random for the offline Medusa "
-            "smoke model."
-        ),
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--task_name",
@@ -145,61 +203,100 @@ def main():
         help="Whether to save intermediate outputs for verification.",
     )
     parser.add_argument(
-        "--debug",
-        action="store_true",
-        help=(
-            "Re-run the lowered graph and compare its output against the "
-            "pre-transform reference.  Re-running the graph is expensive on a "
-            "large model, so this verification is off by default."
-        ),
-    )
-    parser.add_argument(
         "--context_length",
         type=int,
         default=512,
         help="Context length for the LLM decoding.",
     )
     parser.add_argument(
-        "--spec_length",
+        "--compile_single_layer",
+        action="store_true",
+        help="Only compile for a single encoder/decoder layer in Transformer models.",
+    )
+    parser.add_argument(
+        "--enable_mixed_precision",
+        action="store_true",
+        help="Use mixed precision quantization scheme to quantize LLMs.",
+    )
+    parser.add_argument(
+        "--outlier_pct",
+        type=float,
+        default=None,
+        help="Percentage of outliers to filter when quantizing activations.",
+    )
+    parser.add_argument(
+        "--cache_size",
         type=int,
-        default=1,
+        default=None,
+        help="Total L2 SRAM size in SoC.",
+    )
+    parser.add_argument(
+        "--num_banks",
+        type=int,
+        default=None,
+        help="Number of banks in the accelerator.",
+    )
+    parser.add_argument(
+        "--input_buffer_size",
+        type=int,
+        default=1024,
+        help="Input buffer size per IC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--weight_buffer_size",
+        type=int,
+        default=1024,
+        help="Weight buffer size per OC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--accum_buffer_size",
+        type=int,
+        default=1024,
+        help="Accum buffer size per OC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--double_buffered_accum_buffer",
+        action="store_true",
+        help="Use double-buffered accumulation buffer for interstellar tiling.",
+    )
+    parser.add_argument(
+        "--double_buffered_l2",
+        action="store_true",
         help=(
-            "Tokens a llama_verify step writes at once: the draft tokens a "
-            "speculative-decoding verification step checks."
+            "Use ping-pong L2 storage and overlap its DRAM transfer with "
+            "compute."
         ),
     )
     parser.add_argument(
-        "--residual_length",
+        "--dram_size",
         type=int,
         default=None,
+        help="Optional DRAM capacity in bytes for a four-level hierarchy.",
+    )
+    parser.add_argument(
+        "--dram_bandwidth",
+        type=float,
+        default=DEFAULT_DRAM_BANDWIDTH_GBPS,
+        help="DRAM interface bandwidth in GB/s.",
+    )
+    parser.add_argument(
+        "--frequency",
+        type=float,
+        default=DEFAULT_ACCELERATOR_FREQUENCY_GHZ,
+        help="Accelerator frequency in GHz.",
+    )
+    parser.add_argument(
+        "--transform_layout",
+        action="store_true",
         help=(
-            "Positions of a KIVI KV cache kept in full precision while their "
-            "chunk fills; a multiple of the 64-token KIVI group, 128 by "
-            "default."
+            "Whether to transpose Conv2d inputs and weights and Linear weights "
+            "to a systolic-array friendly layout."
         ),
     )
     parser.add_argument(
-        "--num_hidden_layers",
-        type=int,
-        default=None,
-        help=(
-            "Compile only the first N encoder/decoder layers of a Transformer "
-            "(the whole model when unset).  Two is the useful minimum for "
-            "calibration: a model's last layer is built differently from the "
-            "ones before it -- its MLP down_proj fuses the residual quantize "
-            "and stores fp8 rather than bf16 -- so a one-layer compile only "
-            "ever produces the tail variant."
-        ),
-    )
-    parser.add_argument(
-        "--qconfig",
-        default=None,
-        choices=sorted(QUANTIZATION_CONFIGS),
-        help=(
-            "Named per-operand qconfig table for LLMs (from "
-            "examples/language_modeling/quantization_configs.py); also puts "
-            "softmax and layer_norm outputs in fp8."
-        ),
+        "--transpose_fc",
+        action="store_true",
+        help="Whether to transpose the weights of fully connected layers.",
     )
     parser.add_argument(
         "--use_maxpool_2x2",
@@ -213,6 +310,23 @@ def main():
             "Whether to transform Conv2d operations with small input channels "
             "into linear operations using im2col."
         ),
+    )
+    parser.add_argument(
+        "--hardware_unrolling",
+        type=lambda x: tuple(map(int, x.split(","))),
+        default=None,
+        help="Hardware unroll dimensions for the accelerator.",
+    )
+    parser.add_argument(
+        "--local_scheduler",
+        choices=LOCAL_SCHEDULERS,
+        default=None,
+        help="Local GEMM scheduler backend.",
+    )
+    parser.add_argument(
+        "--disable_reshape_fusion",
+        action="store_true",
+        help="Whether to not fuse reshape operation with following GEMM in Transformer.",
     )
     parser.add_argument(
         "--evaluate",
@@ -230,42 +344,70 @@ def main():
         help="Whether to quantize the fully connected layers.",
     )
     parser.add_argument(
+        "--split_spmm",
+        action="store_true",
+        help="Whether to split linear_mx with outliers into dense and SpMM operations.",
+    )
+    parser.add_argument(
         "--attn_implementation",
         default="eager",
-        choices=["eager", "sdpa"],
-        help=(
-            "HuggingFace attention module the graph is built from. Only sdpa "
-            "emits a scaled_dot_product_attention node, the one the flash-"
-            "attention builders lower; eager decomposes it into "
-            "matmul/softmax/matmul."
-        ),
+        choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
     )
     parser.add_argument(
-        "--training",
+        "--bufferize",
         action="store_true",
         help=(
-            "Compile one AdamW training step instead of inference: the "
-            "gradient program (forward, loss and backward) and the update "
-            "program, into the gradient/ and update/ subdirectories of "
-            "--model_output_dir.  bert trains on a GLUE batch; "
-            "llama_prefill pre-trains on --context_length wikitext tokens."
+            "Use the bufferized FX lowering path: rewrite tiled "
+            "GEMM/conv/pointwise nodes into explicit while_loop nests over "
+            "voyager.* primitives and emit model.txt / bufferized_graph.txt / "
+            "compute_graph from that graph, instead of run_memory_mapping + "
+            "gen_code.  Requires --cache_size (the L2 tiling pass sets the "
+            "l2_tiling/tiled_shapes meta the bufferizer consumes). This is "
+            "an unscheduled representation-lowering path: hardware profiles, "
+            "local schedulers, scheduler options, and scheduler double "
+            "buffering are rejected until loop lowering can preserve the "
+            "selected LocalScheduleResult."
         ),
     )
     parser.add_argument(
-        "--log_level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        default="WARNING",
-        help="Logging level.",
+        "--scratchpad_mapping",
+        choices=SCRATCHPAD_MAPPING_MODES,
+        default=PER_OPERATION_SCRATCHPAD_MAPPING,
+        help=(
+            "Scratchpad address policy. 'per_operation' retains legacy tile "
+            "placements; 'end_to_end' assigns model-wide liveness-based "
+            "addresses in the hardware profile's global memories."
+        ),
     )
-    add_quantization_args(parser)
-    add_compile_args(parser)
+    parser.add_argument(
+        "--execution_order",
+        choices=EXECUTION_ORDER_MODES,
+        default=DEFAULT_EXECUTION_ORDER_MODE,
+        help=(
+            "Outer operation order. 'dp' is opt-in and available only for "
+            "operator-graph compilation with end-to-end scratchpad mapping."
+        ),
+    )
+    add_qspec_args(parser)
     args = parser.parse_args()
-    if args.training and args.model not in ("bert", "llama_prefill"):
-        parser.error("--training compiles bert or llama_prefill")
-    if args.training and args.report:
-        parser.error("--report takes one graph; --training compiles two")
-    if args.training and args.activation and args.error is None:
-        parser.error("--training quantizes the backward pass too: give --error")
+    try:
+        validate_execution_order_mode(
+            args.execution_order,
+            bufferized=args.bufferize,
+            end_to_end=(
+                args.scratchpad_mapping == END_TO_END_SCRATCHPAD_MAPPING
+            ),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+
+    try:
+        workload_target_adapter = resolve_workload_target(
+            args.model,
+            args.target,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -277,14 +419,43 @@ def main():
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
+    hardware_config = get_hardware_config(args)
+    # Fusion semantics belong to the selected hardware target.  The generic
+    # pipeline is a named target profile, not a workload-wide default imposed
+    # on Gemmini or Alpha.
+    hardware_pipeline = get_target_hardware_pipeline(args.target)
+    scheduler_backend = args.local_scheduler
+    if _dispatch_registered_workload(
+        workload_target_adapter,
+        args,
+        hardware_pipeline=hardware_pipeline,
+        hardware_config=hardware_config,
+        scheduler_backend=scheduler_backend,
+    ):
+        raise SystemExit(0)
+
     quantizer = get_default_quantizer(
         input_activation=args.activation,
+        output_activation=args.output_activation,
         weight=args.weight,
         bias=args.bias,
-        error=args.error,
+        force_scale_power_of_two=args.force_scale_power_of_two,
     )
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+    if args.imprecise_pt2e is None:
+        args.imprecise_pt2e = False
+    transform_args = get_transform_args(
+        args,
+        hardware_pipeline,
+        hardware_config=hardware_config,
+    )
+    compile_args = get_compile_args(
+        args,
+        hardware_config=hardware_config,
+        scheduler_backend=scheduler_backend,
+    )
 
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)
@@ -293,16 +464,20 @@ def main():
             imagenet_dataset = imagenet.retrieve_dataset(1000, "resnet")
             if args.evaluate:
                 torchvision_models.evaluate(model, imagenet_dataset)
-        else:
+        elif args.calibration_steps > 0:
             imagenet_dataset = imagenet.retrieve_dataset(10, "resnet")
+        else:
+            imagenet_dataset = ()
 
         gm, old_output, new_output, preprocess_fn = (
             torchvision_models.quantize_and_dump_model(
                 model=model,
                 quantizer=quantizer,
                 calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
+                vector_stages=hardware_pipeline,
                 args=args,
+                hardware_config=hardware_config,
+                scheduler_backend=scheduler_backend,
             )
         )
 
@@ -310,7 +485,7 @@ def main():
             preprocessed_imagenet = imagenet.dump_imagenet(
                 args.dataset_output_dir,
                 imagenet_dataset,
-                model_input_name(gm),
+                "resnet",
                 preprocess_fn,
                 torch_dtype,
             )
@@ -336,8 +511,10 @@ def main():
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=VECTOR_PIPELINE,
+            vector_stages=hardware_pipeline,
             args=args,
+            hardware_config=hardware_config,
+            scheduler_backend=scheduler_backend,
         )
 
         if args.evaluate:
@@ -358,49 +535,384 @@ def main():
                 args.dataset_output_dir, eval_dataset, model
             )
 
-        if args.training:
-            inputs = {k: torch.tensor([v]) for k, v in train_dataset[0].items()}
-            gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args, quantizer
+        gm, old_output, new_output = bert.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            calibration_data=train_dataset,
+            vector_stages=hardware_pipeline,
+            args=args,
+            hardware_config=hardware_config,
+            scheduler_backend=scheduler_backend,
+        )
+
+        if args.evaluate:
+            bert.evaluate_gm(gm, preprocessed_dataset)
+
+    elif args.model == "llm_prefill" or args.model == "llm_decode":
+        from transformers import AutoModelForCausalLM
+
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "meta-llama/Llama-3.1-8B"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+            attn_implementation=args.attn_implementation,
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+
+        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+
+        input_ids = encodings.input_ids[:, : args.context_length]
+
+        past_key_values = None
+
+        if args.model == "llm_decode":
+            past_key_values = StaticCache(
+                config=model.config,
+                max_batch_size=1,
+                max_cache_len=input_ids.shape[1] + 128,
+                dtype=model.dtype,
             )
-        else:
-            gm, old_output, new_output = bert.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=train_dataset,
-                vector_stages=VECTOR_PIPELINE,
-                args=args,
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids, past_key_values=past_key_values, use_cache=True
+                )
+
+            input_ids = torch.argmax(
+                outputs.logits[:, -1, :], dim=-1, keepdim=True
+            )
+            past_key_values = outputs.past_key_values
+
+        inputs_embeds = model.model.embed_tokens(input_ids)
+
+        past_seen_tokens = (
+            past_key_values.get_seq_length()
+            if past_key_values is not None
+            else 0
+        )
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        )
+
+        position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = TorchExportableModuleWithStaticCache._prepare_4d_causal_attention_mask_with_cache_position(
+            None,
+            sequence_length=inputs_embeds.shape[1],
+            target_length=args.context_length + 128,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            cache_position=cache_position,
+            batch_size=inputs_embeds.shape[0],
+        )
+
+        if args.model == "llm_prefill":
+            causal_mask = causal_mask[:, :, :, : args.context_length]
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = model.model.rotary_emb(
+            inputs_embeds, position_ids
+        )
+
+        example_args = (
+            inputs_embeds,
+            causal_mask,
+            position_embeddings,
+            cache_position,
+        )
+        example_kwargs = {}
+
+        class LlamaWrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = model.model
+                self.lm_head = model.lm_head
+
+                self.static_cache = past_key_values
+
+                if self.static_cache is not None:
+                    for i in range(len(self.static_cache.layers)):
+                        self.register_buffer(
+                            f"key_cache_{i}",
+                            self.static_cache.layers[i].keys,
+                            persistent=False,
+                        )
+                        self.register_buffer(
+                            f"value_cache_{i}",
+                            self.static_cache.layers[i].values,
+                            persistent=False,
+                        )
+
+            def forward(
+                self,
+                hidden_states,
+                attention_mask,
+                position_embeddings,
+                cache_position=None,
+            ):
+                for decoder_layer in self.model.layers:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_embeddings=position_embeddings,
+                        past_key_values=self.static_cache,
+                        cache_position=cache_position,
+                    )
+                    hidden_states = layer_outputs[0]
+
+                    if args.compile_single_layer:
+                        break
+
+                logits = self.lm_head(hidden_states)
+                return logits
+
+        gm = export_model(LlamaWrapper(), example_args, example_kwargs)
+
+        remove_softmax_dtype_cast(gm)
+
+        hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
+        example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
+        replace_rmsnorm_with_layer_norm(
+            gm, model.model.layers[0].input_layernorm, (example_input,)
+        )
+
+        if args.enable_mixed_precision:
+            qconfig = get_llama_qconfig(
+                args.hardware_unrolling[0], args.outlier_pct
             )
 
-            if args.evaluate:
-                bert.evaluate_gm(gm, preprocessed_dataset)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            target_path = os.path.join(
+                script_dir, "../examples/language_modeling"
+            )
+            sys.path.append(os.path.abspath(target_path))
 
-    elif args.model in (
-        "llama_prefill",
-        "llama_decode",
-        "llama_decode_kivi",
-        "llama_verify",
-    ):
-        model, tokenizer = llama.load_model(args)
+            from quantization_configs import set_qconfig
 
-        if args.training:
-            input_ids = llama._prompt_ids(tokenizer, args.context_length)
-            inputs = {"input_ids": input_ids, "labels": input_ids}
-            # As inference: the rotary embedding's matmul stays unquantized.
+            set_qconfig(quantizer, qconfig)
+
+            fp8_qspec = QuantizationSpec.from_str(
+                "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
+            )
+            qconfig = QuantizationConfig(fp8_qspec, None, None, None)
+            quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
+            quantizer.set_object_type(
+                torch.ops.aten.layer_norm.default, qconfig
+            )
+
+        if args.quantize_attention_mask:
+            qspec = QuantizationSpec.from_str(
+                "int1,qs=per_tensor_symmetric,qmax=1"
+            )
+            attention_mask = next(
+                iter(n for n in gm.graph.nodes if n.target == "attention_mask")
+            )
+            _annotate_output_qspec(attention_mask, qspec)
+
+        gm = prepare_pt2e(
+            gm,
+            quantizer,
+            example_args,
+            example_kwargs,
+            hardware_config=hardware_config,
+        )
+
+        for _ in range(2):
+            gm(*example_args, *list(example_kwargs.values()))
+
+        convert_pt2e(
+            gm,
+            args.bias,
+            hardware_config=hardware_config,
+        )
+
+        old_output = gm(*example_args, *list(example_kwargs.values()))
+
+        has_outlier = (
+            args.enable_mixed_precision
+            and args.outlier_pct is not None
+            and args.outlier_pct > 0.0
+        )
+
+        # if outlier quantization is enabled, we need to use actual data to determine the tile sizes of
+        # csr tensors
+        transform(
+            gm,
+            example_args,
+            example_kwargs=example_kwargs,
+            use_fake_mode=(not has_outlier),
+            **transform_args,
+        )
+        compile(gm, example_args, **compile_args)
+
+        new_output = gm(*example_args, *list(example_kwargs.values()))
+        gm.graph.print_tabular()
+    elif args.model == "llm_kivi":
+        from transformers import AutoModelForCausalLM
+
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "meta-llama/Llama-3.1-8B"
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
+            attn_implementation=args.attn_implementation,
+        ).eval()
+
+        if args.compile_single_layer:
+            layers_to_keep = model.model.layers[:1]
+            model.model.layers = nn.ModuleList(layers_to_keep)
+
+            if hasattr(model, "config"):
+                model.config.num_hidden_layers = len(model.model.layers)
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+
+        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+
+        input_ids = encodings.input_ids[:, : args.context_length]
+
+        max_length = args.context_length
+        bs = (
+            64
+            if args.hardware_unrolling is None
+            else args.hardware_unrolling[0]
+        )
+
+        swap_llama_attention(model)
+
+        from torch._export.utils import _disable_aten_to_metadata_assertions
+
+        with _disable_aten_to_metadata_assertions():
+            gm = convert_and_export_with_split_cache(
+                model, max_len=max_length, max_new_tokens=bs
+            ).module()
+
+        # Run decode once to fill in the KV caches
+        output = TorchExportableModuleWithStaticCache.generate(
+            model,
+            prompt_token_ids=input_ids,
+            max_new_tokens=bs,
+            min_length=max_length + 1,
+            eos_token_id=[
+                tokenizer.eos_token_id,
+                tokenizer.encode("\n", add_special_tokens=False)[-1],
+            ],
+            model_decode=gm,
+        )[0]
+
+        inline_autocast_modules(gm)
+        remove_softmax_dtype_cast(gm)
+
+        hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
+        example_input = torch.randn(1, 1, hidden_size, dtype=model.dtype)
+        replace_rmsnorm_with_layer_norm(
+            gm, model.model.layers[0].input_layernorm, (example_input,)
+        )
+
+        quantizer.set_object_type(torch.ops.aten.matmul.default, None)
+
+        act0 = QuantizationSpec.from_str(
+            "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3"
+        )
+        act1 = QuantizationSpec.from_str(
+            "int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3"
+        )
+        qconfig = QuantizationConfig(act0, None, act1, None)
+
+        for layer_idx in range(model.config.num_hidden_layers):
+            module_name = f"model.model.layers.slice(None, {model.config.num_hidden_layers}, None).{layer_idx}.self_attn"
             quantizer.set_module_name_object_type_order(
-                llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
+                module_name, torch.ops.aten.matmul.default, 0, qconfig
             )
-            gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args, quantizer
+            quantizer.set_module_name_object_type_order(
+                module_name, torch.ops.aten.matmul.default, 2, qconfig
             )
-        else:
-            gm, old_output, new_output = llama.quantize_and_dump_model(
-                model=model,
-                tokenizer=tokenizer,
-                quantizer=quantizer,
-                vector_stages=VECTOR_PIPELINE,
-                args=args,
-            )
+
+        fp8_qspec = QuantizationSpec.from_str(
+            "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
+        )
+        qconfig = QuantizationConfig(fp8_qspec, None, None, None)
+        quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
+        quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
+
+        qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
+        attention_mask = next(
+            iter(n for n in gm.graph.nodes if n.target == "attention_mask")
+        )
+        _annotate_output_qspec(attention_mask, qspec)
+
+        # KV Cache shape: (N, H, S, D)
+        #   N = batch size
+        #   H = number of heads
+        #   S = sequence length
+        #   D = head dimension
+        key_qspec = QuantizationSpec.from_str(
+            "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
+        )
+        value_qspec = QuantizationSpec.from_str(
+            "uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
+        )
+
+        for node in gm.graph.nodes:
+            match = re.match(r"^(key|value)_cache_(\d+)$", str(node.target))
+            if node.op == "get_attr" and match is not None:
+                _annotate_output_qspec(
+                    node, key_qspec if match.group(1) == "key" else value_qspec
+                )
+
+        example_input_ids = torch.tensor([[1]], dtype=torch.long)
+        example_cache_position = torch.tensor([0], dtype=torch.long)
+        example_cache_position_residual = torch.tensor([0], dtype=torch.long)
+        example_attention_mask = torch.ones(
+            (1, max_length + bs), dtype=torch_dtype
+        )[None, None, :, :]
+        example_args = ()
+        example_kwargs = {
+            "input_ids": example_input_ids,
+            "cache_position": example_cache_position,
+            "cache_position_residual": example_cache_position_residual,
+            "attention_mask": example_attention_mask,
+        }
+
+        gm = prepare_pt2e(
+            gm,
+            quantizer,
+            hardware_config=hardware_config,
+        )
+
+        for _ in range(2):
+            gm(*example_args, **example_kwargs)
+
+        sink_obs_or_fq(gm)
+        convert_pt2e(
+            gm,
+            eliminate_no_effect=False,
+            hardware_config=hardware_config,
+        )
+
+        old_output = gm(*example_args, **example_kwargs)
+
+        operator_traits = get_target_operator_traits(
+            resolve_compilation_target(hardware_config)
+        )
+        fuse_dequantize_quantize(
+            gm,
+            operator_traits=operator_traits,
+        )
+
+        transform(gm, example_args, example_kwargs, **transform_args)
+        compile(gm, example_args, example_kwargs, **compile_args)
+
+        new_output = gm(*example_args, **example_kwargs)
+        gm.graph.print_tabular()
     elif args.model == "vit":
         model = vit.load_model(args)
 
@@ -411,100 +923,261 @@ def main():
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
 
-        gm, old_output, new_output, preprocess_fn = (
-            vit.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=imagenet_dataset,
-                vector_stages=VECTOR_PIPELINE,
-                args=args,
-            )
+        gm, old_output, new_output, preprocess_fn = vit.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            calibration_data=imagenet_dataset,
+            vector_stages=hardware_pipeline,
+            args=args,
+            hardware_config=hardware_config,
+            scheduler_backend=scheduler_backend,
         )
 
         if args.dump_dataset:
             preprocessed_imagenet = imagenet.dump_imagenet(
                 args.dataset_output_dir,
                 imagenet_dataset,
-                model_input_name(gm),
+                "vit",
                 preprocess_fn,
                 torch_dtype,
             )
 
         if args.evaluate:
             vit.evaluate(gm, preprocessed_imagenet)
+    elif args.model == "yolo5":
+        import sys
+
+        sys.path.append("libraries/yolov5-face")
+
+        # Clear any previously loaded modules to avoid conflicts
+        if "utils" in sys.modules:
+            del sys.modules["utils"]
+
+        from models.experimental import attempt_load
+
+        model = attempt_load(args.model_name_or_path, map_location="cpu").eval()
+
+        if args.bf16:
+            model.bfloat16()
+
+        example_args = (torch.randn(1, 3, 640, 640, dtype=torch_dtype),)
+        output = model(*example_args)
+
+        gm = prepare_pt2e(
+            model,
+            quantizer,
+            example_args,
+            hardware_config=hardware_config,
+        )
+
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+
+        if args.calibration_steps > 0:
+            dataset = load_dataset("CUHK-CSE/wider_face")
+            pipeline = transforms.Compose(
+                [
+                    transforms.Resize((640, 640)),
+                    transforms.ToTensor(),
+                ]
+            )
+
+            for i in tqdm(
+                range(args.calibration_steps),
+                desc="Calibrating yolo5",
+            ):
+                inputs = pipeline(dataset["train"][i]["image"])
+                with torch.no_grad():
+                    gm(inputs.unsqueeze(0).to(torch_dtype))
+
+        convert_pt2e(
+            gm,
+            args.bias,
+            hardware_config=hardware_config,
+        )
+
+        old_output = gm(*example_args)[0]
+
+        transform(gm, example_args, **transform_args)
+        gm.graph.print_tabular()
+
+        new_output = gm(*example_args)[0]
+
+        compile(gm, example_args, **compile_args)
+    elif args.model == "mobilevit":
+        try:
+            import timm
+            from timm.layers import set_fused_attn
+        except ImportError as e:
+            raise ImportError(
+                "The 'timm' library is not installed. Please install it using 'pip install timm'."
+            ) from e
+
+        set_fused_attn(False)
+        model = timm.create_model(
+            "hf-hub:timm/mobilevit_xxs.cvnets_in1k", pretrained=True
+        ).eval()
+
+        if args.bf16:
+            model.bfloat16()
+
+        example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
+        gm = prepare_pt2e(
+            model,
+            quantizer,
+            example_args,
+            hardware_config=hardware_config,
+        )
+
+        dataset = load_dataset("zh-plus/tiny-imagenet")
+
+        image_processor = AutoImageProcessor.from_pretrained(
+            "microsoft/resnet-18"
+        )
+
+        for i in tqdm(range(10)):
+            inputs = image_processor(
+                dataset["train"][i]["image"], return_tensors="pt"
+            )
+            with torch.no_grad():
+                gm(inputs.pixel_values.to(torch_dtype))
+
+        convert_pt2e(
+            gm,
+            args.bias,
+            hardware_config=hardware_config,
+        )
+
+        old_output = gm(*example_args)
+
+        transform(gm, example_args, **transform_args, fuse_operator=False)
+
+        gm, preprocess_fn = extract_input_preprocessor(gm)
+        example_args = (preprocess_fn(example_args[0]),)
+
+        fuse(gm, hardware_pipeline, example_args)
+
+        gm.graph.print_tabular()
+
+        new_output = gm(*example_args)
+
+        compile(gm, example_args, **compile_args)
+    elif args.model == "mamba_prefill" or args.model == "mamba_decode":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        if args.model_name_or_path is None:
+            args.model_name_or_path = "state-spaces/mamba-130m-hf"
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        ).eval()
+
+        context_length = args.context_length
+        input_ids = torch.randint(
+            low=0, high=tokenizer.vocab_size, size=(1, context_length)
+        )
+
+        if args.model == "mamba_decode":
+            # Run prefill to populate SSM conv/ssm states
+            with torch.no_grad():
+                prefill_out = model(input_ids, return_dict=True, use_cache=True)
+                cache = prefill_out.cache_params
+                decode_input = torch.argmax(
+                    prefill_out.logits[:, -1, :], dim=-1, keepdim=True
+                )
+
+            # Register each layer's conv and SSM states as model buffers so they
+            # appear as constant tensors in the exported graph
+            num_layers = model.config.num_hidden_layers
+            for i in range(num_layers):
+                model.register_buffer(
+                    f"conv_state_{i}", cache.conv_states[i], persistent=False
+                )
+                model.register_buffer(
+                    f"ssm_state_{i}", cache.ssm_states[i], persistent=False
+                )
+                # Redirect the cache lists to the same underlying tensors
+                cache.conv_states[i] = getattr(model, f"conv_state_{i}")
+                cache.ssm_states[i] = getattr(model, f"ssm_state_{i}")
+
+            # Store cache on the backbone so it can be accessed without being
+            # passed as an export input (MambaCache is not a pytree-compatible type)
+            model.backbone._static_cache = cache
+
+            _orig_backbone_fwd = model.backbone.forward
+
+            def _patched_backbone_fwd(
+                input_ids=None,
+                inputs_embeds=None,
+                cache_params=None,
+                use_cache=None,
+                output_hidden_states=None,
+                return_dict=None,
+                cache_position=None,
+                attention_mask=None,
+                **kwargs,
+            ):
+                if use_cache and cache_params is None:
+                    cache_params = model.backbone._static_cache
+                # Pass use_cache=False so MambaCache is not included in the output
+                # tuple (it is not a pytree-compatible type and would break export)
+                return _orig_backbone_fwd(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    cache_params=cache_params,
+                    use_cache=False,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=False,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+            model.backbone.forward = _patched_backbone_fwd
+
+            cache_position = torch.tensor([context_length], dtype=torch.long)
+            example_args = (decode_input,)
+            example_kwargs = {
+                "cache_position": cache_position,
+                "return_dict": False,
+                "use_cache": True,
+            }
+        else:
+            example_args = (input_ids,)
+            example_kwargs = {"return_dict": False, "use_cache": False}
+
+        gm = prepare_pt2e(
+            model,
+            quantizer,
+            example_args,
+            example_kwargs,
+            hardware_config=hardware_config,
+        )
+
+        for _ in range(2):
+            gm(*example_args, **example_kwargs)
+
+        convert_pt2e(
+            gm,
+            args.bias,
+            hardware_config=hardware_config,
+        )
+
+        old_output = gm(*example_args, **example_kwargs)[0]
+
+        transform(gm, example_args, example_kwargs, **transform_args)
+        gm.graph.print_tabular()
+
+        new_output = gm(*example_args, **example_kwargs)[0]
+
+        compile(gm, example_args, example_kwargs, **compile_args)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
-    if args.report:
-        # Estimate the schedule of the graph the compile just produced, so
-        # the workbook, its Calibration sheet and the emitted model all
-        # describe one tiling -- which the sheet's frozen "Analytic
-        # cyc/iter" requires.
-        out_dir = args.report_output_dir
-        if out_dir == "." and args.model_output_dir:
-            out_dir = args.model_output_dir
-        calibration = (
-            load_calibration(args.calib_in) if args.calib_in else None
-        )
-        if calibration is not None:
-            print(
-                f"[report] {len(calibration.measurements)} measured groups "
-                f"from {args.calib_in}"
-            )
-        print(f"[report] {args.model} -> {out_dir}", flush=True)
-        result = report(
-            gm,
-            AcceleratorConfig.from_args(args),
-            output_dir=out_dir,
-            basename=args.report_basename,
-            calibration=calibration,
-        )
-        rows = kernel_rows(result)
-        # Compute kernels only: the DMA-only ones carry a key too, but they
-        # are not things the RTL measures.
-        groups = len({r.group for r in rows if r.group and r.ops_per_period})
-        print(
-            f"[report] total_latency={result.total_latency} "
-            f"dram_read={result.dram_read_bytes} "
-            f"dram_write={result.dram_write_bytes} "
-            f"kernels={len(rows)} groups={groups} "
-            f"calibrated={sum(1 for r in rows if r.calibration)} "
-            f"coverage={coverage(rows, result.total_latency):.3f}",
-            flush=True,
-        )
-
-    if new_output is None:
-        print("Skipping output verification (pass --debug to run it)")
-        return
-
-    try:
-        old_flat, old_spec = tree_flatten(old_output)
-        new_flat, new_spec = tree_flatten(new_output)
-        n_old, n_new = len(old_flat), len(new_flat)
-        assert n_old == n_new, f"{n_old} outputs became {n_new}"
-        # The reference comes from ShapeProp, which hands back the output
-        # node's value and so keeps the graph's output tuple, while calling
-        # the module unwraps a single-element one.  Only the leaves matter.
-        if old_spec != new_spec:
-            print(f"Note: output structure {old_spec} vs {new_spec}")
-        worst = 0.0
-        for old, new in zip(old_flat, new_flat):
-            if not isinstance(old, torch.Tensor):
-                assert old == new, f"non-tensor output {old!r} != {new!r}"
-                continue
-            deviation = (new - old).abs().to(torch.float32) / (
-                old.abs().to(torch.float32) + OUTPUT_ATOL
-            )
-            worst = max(worst, deviation.max().item())
-            assert_close(new, old, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
-        print(f"Results match (max deviation {worst:.2e})")
-    except Exception as e:
-        print(f"WARNING: output verification failed: {e}")
-        print(old_output)
-        print(new_output)
-        if args.model.startswith("medusa_"):
-            raise
-
-
-if __name__ == "__main__":
-    main()
+    _report_output_comparison(
+        old_output,
+        new_output,
+        imprecise=args.imprecise_pt2e,
+    )

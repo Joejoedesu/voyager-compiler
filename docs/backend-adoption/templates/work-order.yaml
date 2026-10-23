@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Copy once per specialist assignment. The coordinator owns the copy.
+#
+# A work order bounds ONE assignment: one role, one owned output, one write
+# scope, one acceptance bar. Campaign parameters -- repositories, environment,
+# target configuration, injection contract, requested operation kinds, stage
+# tolerances, workload inventories, decomposition bounds, qscheme candidates,
+# and estimation inputs -- belong to the instantiated run guide. Reference the
+# run guide here; do not copy it here.
+schema_version: 5
+task_id: <stable-task-id>
+objective: <one-owned-outcome>
+
+role_id: <kebab-case-role-id>
+role_contract: docs/backend-adoption/roles/<role-id>.md
+backend: <backend-or-null>
+workload_scope:
+  - <workload-or-null>
+
+adoption:
+  # register_target | bind_workload_target | deepen_inner_control
+  mode: <adoption-mode>
+  claim_id: <stable-claim-id>
+  intended_claim: <boundary-limited-claim>
+  # deepen_inner_control only; null otherwise. This legacy mode performs
+  # X-oriented work. Keep exactness and one full-control decision in separate
+  # orders. Interface dependencies determine which is implemented first;
+  # neither alone completes X.
+  # null | bit_accurate_core_lowering | inner_control
+  x_step: null
+
+# The instantiated run guide supplies every campaign parameter.
+run_guide:
+  path: <instantiated-run-guide-path>
+  revision_or_hash: <run-guide-identity>
+  # The R claim that established the target configuration and injection
+  # contract this order consumes. Null for a register_target order.
+  registration_claim_id: null
+
+# What this order must prove before handoff.
+acceptance:
+  # register_target uses its declared reference_tolerance. bind_workload_target
+  # uses output_code_lsb with absolute=1 and relative=0. deepen_inner_control
+  # requires bit_exact_endpoint with absolute=relative=0 and forbids numerical
+  # perturbation. The run guide additionally freezes X full-control,
+  # comparison-boundary, and reference-provenance requirements.
+  fidelity: <reference_tolerance|output_code_lsb|bit_exact_endpoint>
+  tolerance:
+    absolute: <nonnegative-absolute-tolerance>
+    relative: <nonnegative-relative-tolerance>
+  oracle: <oracle-or-artifact>
+  comparison_scope: <complete-output-scope>
+  # Named boundaries this order must evidence. List only what is in scope:
+  #   serialization | backend_translation | operation_execution
+  #   | connected_execution | performance | control_consumption
+  # control_consumption accompanies a complete mapping-control evidence record.
+  # R and W may use either control class; recording full control never promotes
+  # their achieved stage. An X inner_control order requires this evidence.
+  required_evidence: []
+  tests: []
+  regression_tests: []
+
+# Compatibility key for mapping-control evidence. It may be populated by an R,
+# W, or X order at either control class. A complete record shows that the named
+# Voyager decisions reach named endpoint fields, but does not by itself prove
+# full control: classification still depends on whether any performance-
+# relevant mapping choice remains hidden. Empty evidence likewise does not
+# imply partial control. Legal variation is additional field-causality
+# evidence, not a universal requirement.
+inner_control:
+  voyager_owned_decisions: []
+  endpoint_consumed_fields: []
+
+inputs:
+  - artifact: <typed-contract-or-source-evidence>
+    producer: <owner-or-external-source>
+    path: <repository-relative-or-authoritative-path>
+    revision_or_hash: null
+
+# Only writable_paths authorizes repository changes.
+workspace:
+  repository: <repository-root>
+  writable_paths: []
+  readonly_dependencies: []
+  forbidden_paths: []
+  allow_preexisting_dirty_paths: []
+
+# Exactly one specialist role owns exactly one output.
+owned_outputs:
+  - artifact: <code-test-contract-or-evidence>
+    path: <intended-path>
+    consumer: <role-or-compiler-stage>
+
+invariants: []
+unsupported_behavior: []
+allowed_assumptions: []
+decisions_requiring_escalation: []
+required_gap_report: true
+handoff_revision: null
+status: not_started

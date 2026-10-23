@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Voyager Regression Gate"
+  short_description: "Gate phase-specific adoption claims"
+  default_prompt: "Use $voyager-gate-regressions to validate target registration, workload binding and its refinements, or X bit accuracy and full control, then record the strongest supported boundary."

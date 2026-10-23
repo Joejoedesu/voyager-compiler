@@ -46,8 +46,10 @@ def write_slurm_script(args, cmd):
         args.error = os.path.join(SLURM_LOG_DIR, args.job_name + ".%j.err")
     args.gpus = f"gpu:{args.gpus}" if args.gpus is not None else args.gpus
 
-    with open(os.path.join(SLURM_SCRIPT_DIR, f"{args.job_name}.sbatch"), "w") as f:
-        f.write('#!/bin/bash\n')
+    with open(
+        os.path.join(SLURM_SCRIPT_DIR, f"{args.job_name}.sbatch"), "w"
+    ) as f:
+        f.write("#!/bin/bash\n")
 
         for arg_name in SLURM_ARGS.keys():
             arg_value = vars(args)[arg_name.replace("-", "_")]
@@ -56,30 +58,30 @@ def write_slurm_script(args, cmd):
             if arg_value is not None:
                 f.write(f"#SBATCH --{arg_name}={arg_value}\n")
 
-        f.write('\n')
+        f.write("\n")
         f.write('echo "SLURM_JOBID = "$SLURM_JOBID\n')
         f.write('echo "SLURM_JOB_NODELIST = "$SLURM_JOB_NODELIST\n')
         f.write('echo "SLURM_NNODES = "$SLURM_NNODES\n')
         f.write('echo "SLURMTMPDIR = "$SLURMTMPDIR\n')
         f.write('echo "working directory = "$SLURM_SUBMIT_DIR\n')
-        f.write('\n')
-        f.write('source ' + ENV_SETUP_SCRIPT + '\n')
-        f.write('python ' + ' '.join(cmd) + '\n')
-        f.write('wait\n')
+        f.write("\n")
+        f.write("source " + ENV_SETUP_SCRIPT + "\n")
+        f.write("python " + " ".join(cmd) + "\n")
+        f.write("wait\n")
 
 
 def write_bash_script(args, cmd):
     with open(f"{args.run_name or 'job'}.sh", "w") as f:
-        f.write('#!/bin/bash\n')
-        f.write('python ' + ' '.join(cmd) + '\n')
+        f.write("#!/bin/bash\n")
+        f.write("python " + " ".join(cmd) + "\n")
 
 
 def with_execution_context(fn):
     @wraps(fn)
     def wrapper(args):
         if args.log_file == "datetime":
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-            args.log_file = f'logs/{timestamp}.log'
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            args.log_file = f"logs/{timestamp}.log"
 
         if args.log_file is not None:
             dirname = os.path.dirname(args.log_file)
@@ -100,14 +102,16 @@ def with_execution_context(fn):
             except json.JSONDecodeError as e:
                 raise ValueError(f"Invalid sweep JSON: {e}")
 
-            args.sweep_id = wandb.sweep(sweep=sweep_config, project=args.project)
+            args.sweep_id = wandb.sweep(
+                sweep=sweep_config, project=args.project
+            )
 
         # Write commands to a script
         if args.execution_mode is not None:
             command = copy.deepcopy(sys.argv)
             if args.sweep_config_json is not None:
-                index = command.index('--sweep_config_json')
-                command[index:index + 2] = ['--sweep_id', args.sweep_id]
+                index = command.index("--sweep_config_json")
+                command[index : index + 2] = ["--sweep_id", args.sweep_id]
 
             index = command.index(args.execution_mode)
             if args.execution_mode == "slurm":
@@ -143,7 +147,7 @@ def with_execution_context(fn):
                     project=args.project,
                     name=args.run_name,
                     id=args.run_id,
-                    resume="allow"
+                    resume="allow",
                 )
             logger.info(f"Run Args: {pformat(vars(args))}")
             fn(args)

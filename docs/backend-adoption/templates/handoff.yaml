@@ -1,0 +1,242 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+# Return this record to the coordinator with every specialist handoff.
+#
+# A handoff reports four things: what changed, whether it stayed in scope,
+# what was proven, and how strong the resulting claim is.
+#
+# It binds to its work order by task_id and claim. It does not restate the
+# work order's declared tolerance, target configuration, or campaign
+# parameters, and it does not carry constants the contracts already fix.
+# Durable capability state and the compact workload regression result belong in
+# the target operations.yaml; detailed reproduction evidence belongs in its
+# regression document, not here.
+# Fill only the sections your adoption mode puts in scope.
+schema_version: 4
+task_id: <stable-task-id>
+handoff_revision: <revision-or-diff-identity>
+
+# status is the handoff result. operational_state is whether the run is still
+# active. A still-running run hands off as partial.
+status: <complete|partial|blocked>
+operational_state: <still_running|stopped|completed|blocked>
+
+# Must match the work order. x_step is set only for deepen_inner_control.
+# claim_state judges this bounded assignment, not the target x workload's
+# achieved R/W/X stage.
+adoption:
+  mode: <register_target|bind_workload_target|deepen_inner_control>
+  claim_id: <stable-claim-id>
+  x_step: null
+  claim_state: <proposed|verified|rejected|superseded>
+
+changed_paths: []
+scope_check:
+  baseline_manifest: <path-outside-repository>
+  command: <exact-verify-command>
+  result: <pass|fail|not_run>
+
+contracts_consumed: []
+contracts_produced: []
+shared_change_requests: []
+assumptions: []
+
+# Semantic support at the fidelity gate this handoff evaluates. Never infer it
+# from adoption.mode, and do not read this field as an achieved R/W/X result.
+# Capability support remains distinct from boundary outcomes; use the boundary
+# evidence and `strongest_supported_claim` to report what was actually proved.
+semantic_support_evidence:
+  stage: <R|W|X>
+  operation_records:
+    - operation_id: <ordinary-or-fused-model-operation-id>
+      occurrence_ids: []
+      metadata_signature_ids: []
+      state: <supported|unsupported|unverified>
+      evidence: []
+
+# Each named check that ran, independent of the support state above.
+boundary_check_evidence:
+  translation: <pass|fail|blocked|unverified|not_in_scope>
+  conversion: <pass|fail|blocked|unverified|not_in_scope>
+  injection: <pass|fail|blocked|unverified|not_in_scope>
+  execution: <pass|fail|blocked|unverified|not_in_scope>
+  comparison: <pass|fail|blocked|unverified|not_in_scope>
+  evidence: []
+
+# R only. The target operation inventory keeps durable registration state.
+registration_evidence:
+  inventory_artifact: null
+  hardware_configuration_artifact: null
+  hardware_configuration_status: <pass|fail|blocked|unverified|not_in_scope>
+  injection_contract:
+    path: null
+    source_revision: null
+    content_hash: null
+    status: <pass|fail|blocked|unverified|not_in_scope>
+  # Optional independent endpoint/configuration provenance, not an R gate.
+  stock_native_execution: <pass|fail|blocked|unverified|not_in_scope>
+  voyager_operation_execution: <pass|fail|blocked|unverified|not_in_scope>
+  evidence: []
+
+# W only. Candidate assignment earns no coverage. Freeze the final assignment
+# only after a proven backend translation.
+assignment_evidence:
+  candidate_assignment:
+    artifact: null
+    accelerator_candidate_occurrence_ids: []
+    unsupported_occurrence_ids: []
+    unverified_occurrence_ids: []
+  final_execution_assignment:
+    artifact: null
+    accelerator_model_operation_ids: []
+    unsupported_model_operation_ids: []
+    unverified_model_operation_ids: []
+    backend_translation_status: <pass|fail|blocked|unverified|not_in_scope>
+    evidence: []
+
+compiler_artifacts:
+  final_fx: null
+  model_txt: null
+  model_artifact_hash: null
+
+# Every command that ran, with its result.
+checks:
+  - kind: <shared_unit_test|target_integration_lane|temporary_diagnostic>
+    command: <exact-command>
+    result: <pass|fail|blocked>
+    evidence: <result-or-log-path>
+    # temporary_diagnostic only; a retained diagnostic is not acceptance
+    # evidence.
+    retained: false
+
+# One entry per operation executed on the target.
+target_operation_execution_lanes:
+  - model_operation_id: <ordinary-or-fused-model-operation-id>
+    command: <exact-command>
+    result: <pass|fail|blocked>
+    native_reference: <stock-target-result-or-log-path>
+    injection_contract_hash: <content-hash>
+    boundary_source: <workload_runtime|reference_fed_boundary|unknown>
+    compiler_artifact: <model.txt-or-canonical-compiler-artifact>
+    converter_artifact: null
+    endpoint_glue_artifact: null
+    target_artifact: <executed-target-artifact>
+    emitted_call_artifact: null
+    emitted_backend_calls: []
+    actual_execution_trace: null
+    actual_accelerator_call_count: null
+    # Independent gates. Unsupported work needs no CPU proof, while work
+    # credited to the accelerator needs positive target-execution evidence.
+    semantic_accounting_complete: null
+    all_emitted_calls_executed: null
+    unsupported_excluded_from_accelerator_coverage: null
+    claimed_accelerator_work_executed_on_target: null
+    observed_fidelity: <fidelity-or-unverified>
+    complete_output_comparison: <result-or-null>
+
+connected_execution_evidence:
+  status: <pass|fail|blocked|unverified|not_in_scope>
+  producer_provenance_complete: null
+  complete_output_comparison: null
+  evidence: []
+
+# W only, and always a qualified estimate. Freeze the comparison before
+# refining; every result is judged against identical frozen terms.
+performance_evidence:
+  status: <pass|fail|blocked|unverified|not_in_scope>
+  claim_kind: <qualified_estimate|unverified>
+  objective_order: coverage_first_then_time_at_equal_coverage
+  frozen_comparison:
+    model_artifact_hash: null
+    input_identity: null
+    target_hardware: null
+    injection_contract_hash: null
+    comparison_boundary: null
+    reference_artifact: null
+    semantic_work_set: null
+    coverage_weight: null
+    coverage_denominator: null
+    accelerator_call_boundary: null
+    estimation_model: null
+    estimation_unit: null
+  # One entry per compared candidate; every entry uses this same shape.
+  results:
+    - id: <baseline|candidate|other-candidate-id>
+      artifact: null
+      compiler_revision: null
+      target_software_revision: null
+      quantization_identity:
+        qscheme_and_dtype_ids: []
+        calibration_state_identity: null
+        finalized_qparam_artifact: null
+        inserted_conversion_artifacts: []
+      checked_accelerator_coverage: null
+      estimated_calls: null
+      estimated_calls_provenance: null
+      estimated_total_time: null
+      # accelerator | launch | transfer_or_materialization | host
+      # | synchronization | unresolved
+      cost_components:
+        - component: <cost-component>
+          value: null
+          provenance: null
+  deltas:
+    coverage_gain: null
+    estimated_call_reduction: null
+    estimated_time_reduction: null
+    estimated_speedup: null
+  measured_validation:
+    enabled: false
+    matched_to_frozen_comparison: null
+    measurement_boundary: null
+    timing_source: null
+    repetitions: null
+    actual_accelerator_call_count: null
+    measured_total_time: null
+    measured_speedup: null
+    estimation_error: null
+    artifact: null
+  bottleneck:
+    largest_current_component: null
+    classification: null
+    next_refinement: null
+  utilization:
+    value: null
+    numerator: null
+    peak_denominator: null
+    active_interval: null
+    provenance: null
+  evidence: []
+
+# X bit-accurate-core subcheck only. This local result does not complete X
+# without the same-scope W proof, full-control point, endpoint consumption,
+# zero-tolerance comparison, and workload-reference provenance. Zero tolerance
+# and forbidden perturbation are contract rules, not reportable fields; put
+# provenance evidence below.
+bit_accurate_core_lowering_evidence:
+  status: <pass|fail|blocked|unverified|not_in_scope>
+  operation_ids: []
+  canonical_compiler_artifact: null
+  physical_qparam_artifact: null
+  converter_encoded_finalized_facts_only: null
+  complete_output_comparison_artifact: null
+  bit_exact_output: null
+  evidence: []
+
+# X full-control subcheck only. Keep this legacy key for schema compatibility.
+# List every variable decision that materially affects per-call mapping cost
+# and its consuming endpoint field. A control variation is required only when a
+# stronger field-causality claim depends on it. This local result does not
+# complete X by itself.
+inner_control_evidence:
+  status: <pass|fail|blocked|unverified|not_in_scope>
+  bit_accurate_core_lowering_prerequisite: null
+  voyager_owned_decisions: []
+  endpoint_consumed_fields: []
+  control_variation_artifacts: []
+  control_variation_preserved_bit_exact_output: null
+  evidence: []
+
+gap_ids: []
+strongest_supported_claim: <boundary-limited-claim>

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+interface:
+  display_name: "Voyager AoV Comparison"
+  short_description: "Run Voyager and compare against AoV"
+  default_prompt: "Use $voyager-aov-compare to run Voyager and compare its outputs with current AoV collateral."

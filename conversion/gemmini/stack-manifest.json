@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "tools": {
+    "riscv64-unknown-elf-gcc": {"path": "gemmini-stack/toolchain-env/riscv-tools/bin/riscv64-unknown-elf-gcc", "sha256": "4edd51fc7e8aecc1967d95cff423685dfe6565739fa208f876413fa8277ab8a4"},
+    "riscv64-unknown-elf-readelf": {"path": "gemmini-stack/toolchain-env/riscv-tools/bin/riscv64-unknown-elf-readelf", "sha256": "4289d8c8d012dd7ffd8ea53f43d5bbcbb1d2b4ae8ed0b831e1bb0b748f8b0a5a"},
+    "riscv64-unknown-elf-nm": {"path": "gemmini-stack/toolchain-env/riscv-tools/bin/riscv64-unknown-elf-nm", "sha256": "1637fa2367d7e758962025edc1163e6395f300591eb2c2cdb483cdaf10ad7215"},
+    "riscv64-unknown-elf-objdump": {"path": "gemmini-stack/toolchain-env/riscv-tools/bin/riscv64-unknown-elf-objdump", "sha256": "1c0a65ea4d86a0fdc57e22a49b777f80881b0a3df9b2ac0634dc651b295c0410"},
+    "spike": {"path": "gemmini-stack/runtime-prefix/bin/spike", "sha256": "d74f929c75d07dfaf6da2dd85f881f2743cba4aa23590c4cfcb1f1d3dc8cbb09"},
+    "libgemmini.so": {"path": "gemmini-stack/runtime-prefix/lib/libgemmini.so", "sha256": "9f7f95a0f131bec9c39810491f8accc42badce4a47da6709676c4c96ce8e68cc"}
+  },
+  "sources": {
+    "gemmini": {"path": "gemmini", "revision": "8c3f9923a44a2fe2c7930587be297d6d4f8c09ca"},
+    "gemmini-rocc-tests": {"path": "gemmini/software/gemmini-rocc-tests", "revision": "7c540b3adf1b86ad93d07f893abe3a73489b568e"},
+    "riscv-tests": {"path": "gemmini/software/gemmini-rocc-tests/riscv-tests", "revision": "c84daca8824635b7d896003c78f9c6245997cf7a"},
+    "rocc-software": {"path": "gemmini/software/gemmini-rocc-tests/rocc-software", "revision": "fddb795a0b52e82f8f4ce9ead9b1428440a62ab0"},
+    "libgemmini": {"path": "gemmini-stack/libgemmini", "revision": "ea8f7ed7afd68e001fb06ddccad9a023c990961d"},
+    "spike": {"path": "gemmini-stack/spike-src", "revision": "d182829e68f1393f223c1233cf22d7adcc89042d"}
+  },
+  "files": {
+    "gemmini/src/main/scala/gemmini/Configs.scala": "178c21ac741c89c08158efa71fb34da35d27b75bd50bde5116a5e19178f8391b",
+    "gemmini/src/main/scala/gemmini/GemminiConfigs.scala": "7294a082a1df4ae7aa7d81adc5bde75b7d5118683c083f6a4b998c9ce64d102e",
+    "gemmini/software/gemmini-rocc-tests/include/gemmini.h": "18801f4eab0cd2e81e25a6c2aa97c7ed644b693e8d2c24cdeb41ab3a7208336d",
+    "gemmini/software/gemmini-rocc-tests/include/gemmini_params.h": "3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924",
+    "gemmini/software/gemmini-rocc-tests/include/gemmini_counter.h": "5826242287784b9a383d45fdcb6791f8a1651d9d320a1a5f011585a9885b5669",
+    "gemmini/software/gemmini-rocc-tests/rocc-software/src/xcustom.h": "9582eb00cee774e4680fde6408a0d607bba85196a0a4fd803f7b7ddd801aad69",
+    "gemmini/software/gemmini-rocc-tests/riscv-tests/benchmarks/common/test.ld": "77ff20ffb473836e779809ff47b34fbcc391152025d19de4d6fd7380948658f4",
+    "gemmini/software/gemmini-rocc-tests/riscv-tests/benchmarks/common/crt.S": "2794cf1a7ae21537060453864c94a811869e72335e98b9eb1e8aeee4de7f0508",
+    "gemmini/software/gemmini-rocc-tests/riscv-tests/benchmarks/common/syscalls.c": "71b02fbad1f1d29c7f13fb6ab96a18f90cd7c257398b4a52cd8c9f2b459dfcab",
+    "gemmini-stack/libgemmini/gemmini.cc": "c807b51c7b84b86a2fb270e75af54aae9ef82312b228ce666f716f7f653be4f4",
+    "gemmini-stack/libgemmini/gemmini.h": "264f8858449123efd554642058d69966cdc35d194a3878d550142b3e9594284b",
+    "gemmini-stack/toolchain-env/bin/dtc": "cf4a6fcf83e0f8c2d01bb62be1a93c332bf55819e93bf266d80da0705cabd9b7"
+  }
+}
