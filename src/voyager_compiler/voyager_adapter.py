@@ -1,7 +1,7 @@
-"""Adapt hardware IR to the currently implemented Voyager lowering.
+"""Fixed Voyager resource accounting and fusion patterns.
 
-The IR can describe other accelerators. This adapter explicitly bounds what
-the existing four-level Interstellar search and SRAM allocator can lower.
+These helpers serve the existing four-level Interstellar search and SRAM
+allocator. They are called directly by the Voyager compiler.
 """
 
 import math
@@ -14,9 +14,7 @@ from voyager_compiler.hardware_config import (
 
 
 def interstellar_memory(config):
-    config.require_backend("voyager")
-    # These declarations are available to target-specific adapters. The current
-    # Voyager algorithms must not silently ignore constraints they do not use.
+    # Keep the existing Voyager resource assumptions explicit.
     if any(unit.modes for unit in config.computation_units):
         raise NotImplementedError(
             "Voyager lowering does not select compute modes yet"
@@ -187,8 +185,6 @@ def fusion_patterns(config):
     from voyager_compiler import OpMatcher
     from voyager_compiler.codegen.node_info import is_fully_connected
 
-    config.require_backend("voyager")
-
     def matrix_tail(node):
         if hasattr(node, "value") and is_fully_connected(node):
             return node.args[0].meta.get("dtype") is not None
@@ -208,7 +204,7 @@ def fusion_patterns(config):
         "constant_divisor": constant_divisor,
     }
     patterns = []
-    for pipeline in config.isa_pipelines:
+    for pipeline in VOYAGER.isa_pipelines:
         stages = []
         for stage in pipeline.stages:
             if stage.predicate not in predicates:

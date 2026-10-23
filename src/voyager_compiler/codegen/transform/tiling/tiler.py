@@ -17,7 +17,7 @@ import math
 import multiprocessing
 import os
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -169,28 +169,12 @@ def build_interstellar_tiler(
     so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     """
-    config.require_backend("voyager")
     ic_dim, oc_dim = config.pe_array_size
-
+    resource = interstellar_memory(config)
     if dram_access_cost is not None:
-        # Preserve the explicit legacy override by updating the graph itself.
-        levels = tuple(
-            replace(
-                level,
-                instances=tuple(
-                    (
-                        replace(mem, access_cost=dram_access_cost)
-                        if mem.name == "dram"
-                        else mem
-                    )
-                    for mem in level.instances
-                ),
-            )
-            for level in config.memory.levels
-        )
-        config = replace(config, memory=replace(config.memory, levels=levels))
+        resource["buf_access_cost_list"][-1] = [dram_access_cost]
     architecture = interstellar.Resource(
-        **interstellar_memory(config),
+        **resource,
         mac_capacity=0,
         partition_mode=[0] * len(config.memory.levels),
         invalid_underutilized=False,

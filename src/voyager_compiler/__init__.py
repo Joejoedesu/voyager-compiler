@@ -220,7 +220,7 @@ class OpMatcher:
         return self.predicate(node) if self.predicate else True
 
 
-def _transform_voyager(
+def transform(
     model: torch.fx.GraphModule,
     example_args,
     example_kwargs=None,
@@ -239,8 +239,6 @@ def _transform_voyager(
     # A null config (no hardware) skips padding and tiling.
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
-
-    config.require_backend("voyager")
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -275,7 +273,7 @@ def _transform_voyager(
     return model
 
 
-def _compile_voyager(
+def compile(
     model: torch.fx.GraphModule,
     example_args,
     example_kwargs=None,
@@ -291,8 +289,6 @@ def _compile_voyager(
         config = AcceleratorConfig(pe_array_size=None)
 
     os.makedirs(output_dir, exist_ok=True)
-
-    config.require_backend("voyager")
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -333,13 +329,12 @@ def lower_to_buffers(model, config, runtime_tolerance=None, options=None):
     """Voyager lowering and allocation; no artifact emission or real execution.
 
     Shapes must already be propagated. The graph is mutated in place, as in
-    compile(). Other backends are free to implement a different lowering.
+    compile(). This compiler implements the Voyager pipeline directly.
     """
     from voyager_compiler.codegen.transform.bufferize import (
         BufferizationOptions,
     )
 
-    config.require_backend("voyager")
     options = options or BufferizationOptions()
     tolerance = (
         DEFAULT_RUNTIME_TOLERANCE
@@ -406,67 +401,3 @@ def emit_program(model, flatten_args, output_dir, dump_tensors=True):
 
     flush_tensor_files()
     return params
-
-
-def transform(
-    model,
-    example_args,
-    example_kwargs=None,
-    patterns=None,
-    config=None,
-    layout_policy=DEFAULT_LAYOUT_POLICY,
-    gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
-    skip_op_fusion=False,
-    fuse_reshape=True,
-):
-    """Transform through the selected hardware backend (Voyager by default)."""
-    from voyager_compiler.targets import get_backend
-
-    if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
-    return get_backend(config.backend).transform(
-        model,
-        example_args,
-        example_kwargs,
-        patterns=patterns,
-        config=config,
-        layout_policy=layout_policy,
-        gemv_weight_layout=gemv_weight_layout,
-        skip_op_fusion=skip_op_fusion,
-        fuse_reshape=fuse_reshape,
-    )
-
-
-def compile(
-    model,
-    example_args,
-    example_kwargs=None,
-    config=None,
-    output_dir=None,
-    output_file="compute_graph",
-    dump_tensors=True,
-    runtime_tolerance=None,
-    bufferization_options=None,
-    before_emit=None,
-):
-    """Compile through the selected backend, preserving in-place graph semantics.
-
-    ``before_emit`` observes the lowered graph before optional tensor dumping
-    executes it, allowing verification to snapshot backend-transformed state.
-    """
-    from voyager_compiler.targets import get_backend
-
-    if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
-    return get_backend(config.backend).compile(
-        model,
-        example_args,
-        example_kwargs,
-        config=config,
-        output_dir=output_dir,
-        output_file=output_file,
-        dump_tensors=dump_tensors,
-        runtime_tolerance=runtime_tolerance,
-        bufferization_options=bufferization_options,
-        before_emit=before_emit,
-    )

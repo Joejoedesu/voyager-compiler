@@ -1,8 +1,10 @@
-"""Typed hardware IR and the named Voyager design.
+"""Fixed Voyager configuration and its internal hardware metadata.
 
 The graph (compute units, memory levels/instances, and connections) owns the
 hardware specifications. The historical flat properties are read-only views
-for the Voyager backend, not a second configuration. Physical units are
+for the Voyager compiler, not a second configuration. Public construction only
+accepts Voyager's flat size/rate options; custom topology is not supported.
+Physical units are
 explicit: clock GHz, link GB/s or bytes/elements per cycle, latency ns, energy
 pJ/bit. Historical DRAM capacity in 'GB' means GiB, as before.
 """
@@ -669,57 +671,11 @@ class AcceleratorConfig:
     isa_pipelines: Tuple[ISAPipeline, ...]
     provenance: Tuple[ParameterProvenance, ...]
 
-    def __init__(
-        self,
-        *,
-        name=None,
-        computation_units=None,
-        memory=None,
-        connections=None,
-        frequency=None,
-        backend=None,
-        isa_pipelines=None,
-        provenance=None,
-        **legacy,
-    ):
-        graph = (computation_units, memory, connections)
-        if all(part is None for part in graph):
-            # Backward-compatible construction; only the named profile owns
-            # the flat defaults. No legacy knob is retained in this object.
-            if frequency is not None:
-                legacy["frequency"] = frequency
-            profile = voyager_config(**legacy)
-            for field in self.__dataclass_fields__:
-                object.__setattr__(self, field, getattr(profile, field))
-            if name is not None:
-                object.__setattr__(self, "name", name)
-            if backend is not None:
-                object.__setattr__(self, "backend", backend)
-            if isa_pipelines is not None:
-                object.__setattr__(self, "isa_pipelines", tuple(isa_pipelines))
-            if provenance is not None:
-                object.__setattr__(self, "provenance", tuple(provenance))
-        else:
-            if any(part is None for part in graph) or legacy:
-                raise TypeError(
-                    "Supply the complete typed graph, or Voyager's flat options, not both"
-                )
-            if not name or frequency is None:
-                raise ValueError(
-                    "A typed hardware graph needs a name and frequency"
-                )
-            for key, value in dict(
-                name=name,
-                computation_units=tuple(computation_units),
-                memory=memory,
-                connections=tuple(connections),
-                frequency=frequency,
-                backend=backend,
-                isa_pipelines=tuple(isa_pipelines or ()),
-                provenance=tuple(provenance or ()),
-            ).items():
-                object.__setattr__(self, key, value)
-        self._validate()
+    def __init__(self, **options):
+        """Configure Voyager's sizes and rates; topology is fixed."""
+        profile = voyager_config(**options)
+        for name in self.__dataclass_fields__:
+            object.__setattr__(self, name, getattr(profile, name))
 
     def _validate(self):
         if not isinstance(self.name, str) or not self.name:
@@ -901,13 +857,6 @@ class AcceleratorConfig:
         return memory.usable_size * math.prod(
             self.unroll(r) for r in memory.replication
         )
-
-    def require_backend(self, backend):
-        if self.backend != backend:
-            raise NotImplementedError(
-                f"Hardware {self.name!r} needs a {self.backend!r} lowering; "
-                f"this compiler path implements {backend!r}"
-            )
 
     # Voyager compatibility views. Values live exclusively in the graph.
     @property
@@ -1118,8 +1067,7 @@ def voyager_config(
 ):
     """Instantiate Voyager, the default profile. All Voyager defaults live here.
 
-    Other accelerators construct AcceleratorConfig from their own typed graph;
-    they do not inherit Voyager's topology or its measured timing constants.
+    Only Voyager sizes and rates are configurable; its topology is fixed.
     """
     ic, oc = UnrollingRef("matrix", "IC"), UnrollingRef("matrix", "OC")
     vl = UnrollingRef("vector", "lanes")
@@ -1402,7 +1350,7 @@ def voyager_config(
             FusionStage("vector", quant),
         ),
     )
-    return AcceleratorConfig(
+    values = dict(
         name="voyager",
         backend="voyager",
         frequency=frequency,
@@ -1421,6 +1369,12 @@ def voyager_config(
             )
         ),
     )
+    profile = object.__new__(AcceleratorConfig)
+    for name, value in values.items():
+        object.__setattr__(profile, name, value)
+    object.__setattr__(profile, "provenance", ())
+    profile._validate()
+    return profile
 
 
 # Compatibility exports for the CLI. These are views of the named instance,

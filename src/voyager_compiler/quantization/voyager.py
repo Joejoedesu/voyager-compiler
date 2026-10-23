@@ -1,4 +1,4 @@
-"""Voyager deployment presets, family registration, and model quantization rules."""
+"""Fixed Voyager deployment presets and model quantization settings."""
 
 import math
 
@@ -11,12 +11,6 @@ from voyager_compiler import (
     derive_bias_qparams_fn,
 )
 from voyager_compiler.quantization import parse_codebook_dtype
-from voyager_compiler.quantization.recipes import (
-    FamilyPolicy,
-    Recipe,
-    get_family,
-    register_family,
-)
 from voyager_compiler.quantization.voyager_llm_configs import (
     QUANTIZATION_CONFIGS,
     set_kivi_attention_qconfig,
@@ -42,7 +36,7 @@ def finalize_options(args):
         )
 
 
-def configure_model(kind, model, quantizer, args, *, qconfigs, **options):
+def configure_model(kind, model, quantizer, args, **options):
     if kind == "torchvision":
         _vision(model, quantizer, args)
     elif kind == "vit":
@@ -53,7 +47,7 @@ def configure_model(kind, model, quantizer, args, *, qconfigs, **options):
     elif kind == "mobilebert":
         quantizer.set_module_name("classifier", None)
     elif kind == "llama":
-        _llama(quantizer, args, qconfigs, options["is_decode"])
+        _llama(quantizer, args, QUANTIZATION_CONFIGS, options["is_decode"])
 
 
 def _vision(model, quantizer, args):
@@ -157,28 +151,24 @@ def _llama(quantizer, args, qconfigs, is_decode):
         quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
 
-def quantization_rules(context):
-    from voyager_compiler.quantization.rules import CONCAT_INT8
-
-    # Applicability is checked against each operation's resolved specs, so a
-    # per-model precision override participates even under a different recipe.
-    return (CONCAT_INT8,)
+def _preset(quantization, compilation):
+    return {**quantization, **compilation}
 
 
-def _voyager_policy():
+def _voyager_presets():
     compile_defaults = dict(
         layout_policy="systolic", scratchpad_size=2097152, num_banks=16
     )
     recipes = {
-        "E4M3": Recipe(
+        "E4M3": _preset(
             dict(activation="fp8_e4m3", weight="fp8_e4m3", bf16=True),
             compile_defaults,
         ),
-        "P8_1": Recipe(
+        "P8_1": _preset(
             dict(activation="posit8_1", weight="posit8_1", bf16=True),
             compile_defaults,
         ),
-        "INT8": Recipe(
+        "INT8": _preset(
             dict(
                 activation="int8,qs=per_tensor_symmetric",
                 weight="int8,qs=per_tensor_symmetric",
@@ -188,7 +178,7 @@ def _voyager_policy():
             ),
             compile_defaults,
         ),
-        "MXINT8": Recipe(
+        "MXINT8": _preset(
             dict(
                 activation="int8,qs=microscaling,bs=16",
                 weight="int8,qs=microscaling,bs=16",
@@ -197,7 +187,7 @@ def _voyager_policy():
             ),
             compile_defaults,
         ),
-        "MXNF4": Recipe(
+        "MXNF4": _preset(
             dict(
                 activation="lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3",
                 weight="lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3",
@@ -208,18 +198,7 @@ def _voyager_policy():
             {**compile_defaults, "conv2d_im2col": True},
         ),
     }
-    return FamilyPolicy(
-        recipes,
-        QUANTIZATION_CONFIGS,
-        configure_model,
-        finalize_options,
-        quantization_rules,
-    )
+    return recipes
 
 
-def ensure_voyager_policy():
-    """Register the built-in family once, preserving an existing policy."""
-    try:
-        get_family("voyager")
-    except ValueError:
-        register_family("voyager", _voyager_policy())
+PRESETS = _voyager_presets()

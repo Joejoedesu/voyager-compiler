@@ -359,7 +359,7 @@ def prepare_qat_pt2e(model: GraphModule, quantizer) -> GraphModule:
             momentum or eps is not 0.1 or 1e-5, the values torchao's
             rewrite writes into the graph.
     """
-    if getattr(quantizer, "quantization_rules", ()):
+    if getattr(quantizer, "_share_concat_scales", False):
         raise ValueError(
             "Observer-sharing graph rules currently support PTQ, not QAT"
         )

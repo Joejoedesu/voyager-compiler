@@ -196,12 +196,13 @@ def build_parser():
     parser.add_argument(
         "--target_hardware",
         default="voyager",
-        help="Registered hardware target (default: voyager).",
+        choices=("voyager",),
+        help="Fixed Voyager compiler target (compatibility option).",
     )
     parser.add_argument(
         "--quantization_recipe",
         default=None,
-        help="Deployment recipe from the target's hardware family.",
+        help="Fixed Voyager quantization preset.",
     )
     parser.add_argument(
         "--single_buffer_tail",
@@ -242,7 +243,9 @@ def run(args):
     torch.set_num_threads(args.num_threads)
     torch.set_grad_enabled(False)
     context = args.compilation_context
-    vector_pipeline = context.backend.fusion_patterns(context.hardware)
+    from voyager_compiler.voyager_adapter import fusion_patterns
+
+    vector_pipeline = fusion_patterns(context.hardware)
     write_manifest(args)
 
     logger.setLevel(getattr(logging, args.log_level))

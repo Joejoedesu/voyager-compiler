@@ -1,4 +1,4 @@
-"""Target-selected graph rules resolved before PT2E observer injection.
+"""Fixed Voyager concat scale sharing before PT2E observer injection.
 
 A rule finds edges/outputs whose quantization parameters must be equal. The
 scanner merges overlapping groups, checks explicit specs, and emits PT2E shared
@@ -6,8 +6,7 @@ specs. It does not move quantize operations or depend on quantization folding.
 """
 
 import copy
-from dataclasses import dataclass, fields, replace
-from typing import Callable
+from dataclasses import fields, replace
 
 import torch
 from torchao.quantization.pt2e.quantizer import (
@@ -23,15 +22,6 @@ from voyager_compiler.quantization.quantizer.quantizer import (
     QScheme,
     QuantizationSpec,
 )
-
-
-@dataclass(frozen=True)
-class QuantizationRule:
-    name: str
-    operations: tuple
-    collect: Callable  # (node, context) -> iterable of edges and outputs
-    applies: Callable  # (specs, context) -> bool
-
 
 _CAT = torch.ops.aten.cat.default
 _VIEWS = frozenset(
@@ -108,14 +98,6 @@ def _int8_tensor(specs, context):
     )
 
 
-CONCAT_INT8 = QuantizationRule(
-    "concat_int8_shared_scale",
-    (_CAT,),
-    _concat_members,
-    _int8_tensor,
-)
-
-
 def _observer(spec):
     return spec.observer_or_fake_quant_ctr(
         **{
@@ -144,22 +126,18 @@ def _signature(spec):
     )
 
 
-def scan_quantization_rules(model, rules, context=None):
-    """Resolve target-selected equality constraints, retaining edge isolation."""
+def apply_concat_int8_rule(model):
+    """Apply Voyager's fixed INT8 concat scale-sharing rule before observers."""
     groups = []
-    for rule in rules:
-        visited = set()
-        for node in model.graph.nodes:
-            if node.target not in rule.operations or node in visited:
-                continue
-            members = set(rule.collect(node, context))
-            visited.update(m for m in members if not isinstance(m, tuple))
-            specs = [
-                _resolve(_spec(m)) for m in members if _spec(m) is not None
-            ]
-            if not rule.applies(specs, context):
-                continue
-            groups.append((members, {rule.name}))
+    visited = set()
+    for node in model.graph.nodes:
+        if node.target != _CAT or node in visited:
+            continue
+        members = set(_concat_members(node, None))
+        visited.update(m for m in members if not isinstance(m, tuple))
+        specs = [_resolve(_spec(m)) for m in members if _spec(m) is not None]
+        if _int8_tensor(specs, None):
+            groups.append((members, {"concat_int8_shared_scale"}))
 
     # Overlapping rules/chains are one transitive constraint, not successive
     # annotation overwrites. Specs are checked before any graph mutation.

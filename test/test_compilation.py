@@ -1,11 +1,10 @@
-"""Target selection, recipe precedence, and stateful verification contracts."""
+"""Fixed Voyager presets, quantization, residency and stateful verification."""
 
 import contextlib
 import io
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,17 +16,7 @@ from compilation.pipeline import PreparedModel, compile_prepared
 from test_codegen import build_parser
 
 from voyager_compiler import compile, transform
-from voyager_compiler.hardware_config import VOYAGER
-from voyager_compiler.quantization.recipes import (
-    FamilyPolicy,
-    Recipe,
-    register_family,
-)
-from voyager_compiler.targets import (
-    Target,
-    register_backend,
-    register_target,
-)
+from voyager_compiler.voyager_adapter import fusion_patterns
 
 
 class CompilationTest(unittest.TestCase):
@@ -74,88 +63,6 @@ class CompilationTest(unittest.TestCase):
         )
         self.assertIsNone(plain.activation)
         self.assertEqual(plain.calibration_steps, 0)
-
-    def test_new_family_and_backend_do_not_require_voyager_lowering(self):
-        class Backend:
-            def validate(self, config):
-                self.seen = config
-
-            def transform(self, model, args, kwargs, **options):
-                return ("transformed", options["config"])
-
-            def compile(self, model, args, kwargs, **options):
-                return ("compiled", options["config"])
-
-        from voyager_compiler import targets
-        from voyager_compiler.quantization import recipes
-
-        backend = Backend()
-        with (
-            patch.dict(targets._TARGETS),
-            patch.dict(targets._BACKENDS),
-            patch.dict(recipes._FAMILIES),
-        ):
-            register_backend("unit-backend", backend)
-            register_family(
-                "unit-family",
-                FamilyPolicy(
-                    {
-                        "base": Recipe(
-                            {"activation": "int8"},
-                            models={"bert": {"bias": "int24"}},
-                        )
-                    },
-                    {"per-op": {}},
-                    lambda *a, **kw: None,
-                ),
-            )
-            register_target(
-                Target(
-                    "unit-target",
-                    "unit-family",
-                    "unit-backend",
-                    lambda args: replace(
-                        VOYAGER, name="unit-target", backend="unit-backend"
-                    ),
-                )
-            )
-            args = self.args(
-                "--target_hardware",
-                "unit-target",
-                "--quantization_recipe",
-                "base",
-                "--qconfig",
-                "per-op",
-                model="bert",
-            )
-            self.assertEqual(args.bias, "int24")
-            self.assertIs(backend.seen, args.compilation_context.hardware)
-            self.assertEqual(
-                transform(None, (), config=backend.seen),
-                ("transformed", backend.seen),
-            )
-            self.assertEqual(
-                compile(None, (), config=backend.seen),
-                ("compiled", backend.seen),
-            )
-            register_target(
-                Target(
-                    "unit-variant",
-                    "unit-family",
-                    "unit-backend",
-                    lambda args: backend.seen,
-                    recipes={"base": Recipe({"activation": "int4"})},
-                )
-            )
-            self.assertEqual(
-                self.args(
-                    "--target_hardware",
-                    "unit-variant",
-                    "--quantization_recipe",
-                    "base",
-                ).activation,
-                "int4",
-            )
 
     def test_unknown_target_or_recipe_fails_before_model_loading(self):
         for flags in (
@@ -287,7 +194,6 @@ class QuantizationRuleTest(unittest.TestCase):
 
     def prepare(self, rules=True, conflict=False):
         from voyager_compiler import get_default_quantizer, prepare_pt2e
-        from voyager_compiler.quantization.rules import CONCAT_INT8
 
         args = tuple(torch.ones(1, 4) * v for v in (1, 10, 100))
         quantizer = get_default_quantizer(
@@ -308,7 +214,7 @@ class QuantizationRuleTest(unittest.TestCase):
                 ),
             )
         if rules:
-            quantizer.set_quantization_rules((CONCAT_INT8,))
+            quantizer._share_concat_scales = True
         return prepare_pt2e(self.Concat().eval(), quantizer, args), args
 
     def test_concat_observers_share_before_folding_and_keep_fanout_separate(
@@ -388,7 +294,6 @@ class QuantizationRuleTest(unittest.TestCase):
         from voyager_compiler.quantization.fake_quantize import (
             SharedAmaxObsFakeQuantize,
         )
-        from voyager_compiler.quantization.rules import CONCAT_INT8
 
         graph, args = self.prepare()
         observer = next(
@@ -419,7 +324,8 @@ class QuantizationRuleTest(unittest.TestCase):
                 None,
                 None,
             ),
-        ).set_quantization_rules((CONCAT_INT8,))
+        )
+        q._share_concat_scales = True
         with self.assertRaisesRegex(
             ValueError, "concat_int8_shared_scale: incompatible"
         ):
@@ -795,7 +701,6 @@ class ResidencyTest(unittest.TestCase):
             prepare_pt2e,
         )
         from voyager_compiler.codegen.reporting import estimate_schedule
-        from voyager_compiler.targets import get_backend
 
         torch.manual_seed(21)
         x = torch.randn(1, 32, 16, 16)
@@ -814,7 +719,7 @@ class ResidencyTest(unittest.TestCase):
             graph,
             (x,),
             config=config,
-            patterns=get_backend("voyager").fusion_patterns(config),
+            patterns=fusion_patterns(config),
         )
         self.lower(graph, config)
         torch.testing.assert_close(
@@ -845,7 +750,6 @@ class ResidencyTest(unittest.TestCase):
             is_conv2d,
         )
         from voyager_compiler.codegen.reporting import estimate_schedule
-        from voyager_compiler.targets import get_backend
 
         class ConvChain(torch.nn.Module):
             def __init__(self, depthwise, stride):
@@ -895,7 +799,7 @@ class ResidencyTest(unittest.TestCase):
                     graph,
                     (x,),
                     config=config,
-                    patterns=get_backend("voyager").fusion_patterns(config),
+                    patterns=fusion_patterns(config),
                 )
                 if not quantized and not depthwise:
                     # Split IC and OC while retaining the full spatial image:
@@ -949,7 +853,6 @@ class ResidencyTest(unittest.TestCase):
             get_anchor_node,
             is_conv2d,
         )
-        from voyager_compiler.targets import get_backend
 
         x = torch.randn(1, 16, 8, 8)
         graph = export_model(torch.nn.Conv2d(16, 16, 3, padding=1).eval(), (x,))
@@ -959,7 +862,7 @@ class ResidencyTest(unittest.TestCase):
             graph,
             (x,),
             config=config,
-            patterns=get_backend("voyager").fusion_patterns(config),
+            patterns=fusion_patterns(config),
         )
         for n in graph.graph.nodes:
             anchor = get_anchor_node(n)
@@ -1023,7 +926,6 @@ class ResidencyTest(unittest.TestCase):
             BufferizationOptions,
         )
         from voyager_compiler.export_utils import export_model
-        from voyager_compiler.targets import get_backend
 
         for quantized in (False, True):
             with self.subTest(int8=quantized):
@@ -1054,7 +956,7 @@ class ResidencyTest(unittest.TestCase):
                     graph,
                     (x,),
                     config=config,
-                    patterns=get_backend("voyager").fusion_patterns(config),
+                    patterns=fusion_patterns(config),
                 )
                 with (
                     tempfile.TemporaryDirectory() as tmp,
@@ -1097,7 +999,6 @@ class ResidencyTest(unittest.TestCase):
             BufferizationOptions,
         )
         from voyager_compiler.codegen.transform.tiling import tiler as tiling
-        from voyager_compiler.targets import get_backend
 
         searches = []
         run_search = tiling._run_search
@@ -1134,7 +1035,7 @@ class ResidencyTest(unittest.TestCase):
                     graph,
                     (x,),
                     config=config,
-                    patterns=get_backend("voyager").fusion_patterns(config),
+                    patterns=fusion_patterns(config),
                 )
                 first = next(
                     n for n in graph.graph.nodes if n.op == "call_module"

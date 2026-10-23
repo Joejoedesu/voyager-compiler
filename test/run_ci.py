@@ -44,12 +44,12 @@ DIFF_EXCERPT_LINES = 60
 #         --quantization_recipe <scheme>
 #         --pe_array_size <unrolling> <extra>
 #         --model_output_dir <run_dir>/<label>
-# Voyager presets live in quantization.voyager; recipes supplies family lookup.
+# Fixed Voyager presets live in quantization.voyager.
 # To add coverage,
-# add a Command and, if needed, register the target/family/backend.
+# add a Command for an existing Voyager model and preset.
 # ---------------------------------------------------------------------------
 
-# Recipes are resolved by the selected hardware family inside test_codegen.
+# Presets are resolved by the fixed Voyager test_codegen configuration.
 # The CI matrix owns only model, target, recipe, geometry and case overrides.
 
 # Reused per-command extra-flag groups.
@@ -67,8 +67,8 @@ class Command:
     """One supported model × hardware × quantization invocation."""
 
     model: str  # test_codegen.py positional argument
-    scheme: str  # key into the family recipe registry
-    # Voyager --pe_array_size; optional for other targets.
+    scheme: str  # fixed Voyager quantization preset
+    # Optional Voyager PE-array geometry override.
     unrolling: str | None = None
     network: str = ""  # output/label name (defaults to model)
     extra: str = ""  # any per-command extra flags

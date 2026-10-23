@@ -1,98 +1,56 @@
-"""Resolve one model/target deployment before loading model or dataset assets."""
+"""Fixed Voyager CLI configuration and metadata; no target registration."""
 
+import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
 
-from voyager_compiler.quantization.recipes import (
-    get_family,
-    get_recipe,
+from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.quantization.voyager import (
+    PRESETS,
+    QUANTIZATION_CONFIGS,
+    configure_model,
+    finalize_options,
 )
-from voyager_compiler.quantization.voyager import ensure_voyager_policy
-from voyager_compiler.targets import get_backend, get_target
+from voyager_compiler.voyager_adapter import interstellar_memory
 
 
 @dataclass(frozen=True)
 class CompilationContext:
-    target: object
-    hardware: object
-    backend: object
-    policy: object
-    recipe: str | None
+    hardware: AcceleratorConfig
 
     def configure_quantizer(self, kind, model, quantizer, args, **options):
-        self.policy.configure_model(
-            kind,
-            model,
-            quantizer,
-            args,
-            qconfigs=self.policy.qconfigs,
-            **options,
-        )
-        if self.policy.quantization_rules is not None:
-            rule_context = dict(
-                target=self.target,
-                hardware=self.hardware,
-                model=args.model,
-                kind=kind,
-                args=args,
-            )
-            quantizer.set_quantization_rules(
-                self.policy.quantization_rules(rule_context),
-                rule_context,
-            )
+        configure_model(kind, model, quantizer, args, **options)
+        quantizer._share_concat_scales = True
 
 
 def resolve_context(args):
-    ensure_voyager_policy()
-    target = get_target(getattr(args, "target_hardware", "voyager"))
-    backend = get_backend(target.backend)
-    policy = get_family(target.family)
+    if getattr(args, "target_hardware", "voyager") != "voyager":
+        raise ValueError("This compiler implements Voyager only")
     qconfig = getattr(args, "qconfig", None)
-    if qconfig is not None and qconfig not in policy.qconfigs:
-        raise ValueError(
-            f"Unknown qconfig {qconfig!r} for family {target.family}"
-        )
-    hardware = target.hardware(args)
-    if hardware.backend != target.backend:
-        raise ValueError("Target hardware and backend disagree")
-    backend.validate(hardware)
-    return CompilationContext(
-        target,
-        hardware,
-        backend,
-        policy,
-        getattr(args, "quantization_recipe", None),
-    )
+    if qconfig is not None and qconfig not in QUANTIZATION_CONFIGS:
+        raise ValueError(f"Unknown Voyager qconfig {qconfig!r}")
+    hardware = AcceleratorConfig.from_args(args)
+    interstellar_memory(hardware)
+    return CompilationContext(hardware)
 
 
 def parse_args(parser, argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
-    ensure_voyager_policy()
     try:
-        target = get_target(args.target_hardware)
-        get_backend(target.backend)
         if args.quantization_recipe:
-            recipe = get_recipe(target, args.quantization_recipe)
-            defaults = recipe.options(args.model)
-            destinations = {a.dest for a in parser._actions}
-            if unknown := defaults.keys() - destinations:
+            if args.quantization_recipe not in PRESETS:
                 raise ValueError(
-                    f"Recipe contains unknown options: {sorted(unknown)}"
+                    f"Unknown Voyager preset {args.quantization_recipe!r}"
                 )
-            # Parsing into a prefilled namespace preserves explicit CLI values,
-            # including --no-* flags, without changing shared parser defaults.
-            import argparse
-
+            defaults = PRESETS[args.quantization_recipe]
             args = parser.parse_args(
                 argv, namespace=argparse.Namespace(**defaults)
             )
-            policy = get_family(target.family)
-            if policy.finalize_options is not None:
-                policy.finalize_options(args)
+            finalize_options(args)
         if (
             getattr(args, "parameter_loading", "on_demand") == "preload"
             and getattr(args, "bufferized_flow", "per_kernel") != "resident"
@@ -107,21 +65,17 @@ def parse_args(parser, argv=None):
 
 
 def write_manifest(args):
-    context = args.compilation_context
-    options = {
-        key: value
-        for key, value in vars(args).items()
-        if key != "compilation_context"
-    }
     record = dict(
         model=args.model,
-        target=context.target.name,
-        family=context.target.family,
-        backend=context.target.backend,
-        quantization_recipe=context.recipe,
+        target="voyager",
+        family="voyager",
+        backend="voyager",
+        quantization_recipe=args.quantization_recipe,
         verification_stage="final_lowered_graph" if args.debug else None,
-        hardware=context.hardware,
-        options=options,
+        hardware=args.compilation_context.hardware,
+        options={
+            k: v for k, v in vars(args).items() if k != "compilation_context"
+        },
     )
 
     def encode(value):
