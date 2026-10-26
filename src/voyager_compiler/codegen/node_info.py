@@ -54,6 +54,7 @@ DYNAMIC_QUANTIZE_OPS = frozenset(
 # The whole quantize family: ops that re-encode a tensor -- change its dtype
 # and qparams -- rather than combine it with another.
 QUANTIZE_FAMILY_OPS = DYNAMIC_QUANTIZE_OPS | {
+    torch.ops.quantized_ops.quantize_symmetric.default,
     torch.ops.quantized_ops.quantize.default,
     torch.ops.quantized_ops.dequantize.default,
 }
@@ -162,7 +163,12 @@ def quant_param_arg_nodes(node: Node, params: set = QUANT_PARAMS) -> set:
     by schema arg name so positions need not be hardcoded.  ``params`` selects
     the family — ``QMAP_PARAMS``, ``CODEBOOK_PARAMS``, or both (the default)."""
     result = set()
-    if getattr(node.target, "namespace", None) != "quantized_ops":
+    from voyager_compiler.extensions import registry
+
+    if (
+        getattr(node.target, "namespace", None) != "quantized_ops"
+        and node.target not in registry.operators
+    ):
         return result
     for i, arg in enumerate(node.target._schema.arguments):
         if arg.name not in params:

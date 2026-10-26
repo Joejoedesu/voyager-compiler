@@ -6,13 +6,10 @@ operate in place and leave the graph executable, so every stage can be checked
 numerically against the original.
 """
 
-import os
 from typing import Callable, Optional, Tuple
 
 import torch
-from google.protobuf import text_format
 from torch.fx import Node
-from torch.utils._pytree import tree_flatten
 
 # Defines torch.ops.quantized_ops.* (and the hardware-layout twins).  This must
 # come first: the imports below reference those targets, and the op namespace
@@ -27,41 +24,77 @@ from voyager_compiler.cli_args import (
 from voyager_compiler.codegen import (
     deduplicate_nodes,
     extract_input_preprocessor,
-    fold_constant_generators,
     fuse_operator,
-    fuse_quantize_dequantize_with_producer,
-    gen_compute_graph,
-    inline_autocast_modules,
     match_and_fuse_rms_norm,
-    normalize_activation_layout,
     normalize_attention_operands,
-    normalize_conv2d_layout,
-    normalize_gemm_weight_layout,
-    pad_matrix_op_dimensions,
-    pad_vector_op_dimensions,
     pad_vit_embeddings_output,
     quantizes_kv_cache,
     remove_fp32_casts,
-    remove_prunable_ops,
     remove_zero_attention_mask,
-    rename_nodes_with_param_names,
     replace_conv2d_with_im2col,
     replace_interpolate,
     scalarize_index_arithmetic,
     split_kv_cache,
 )
-from voyager_compiler.codegen.transform.bufferize import (
-    bufferize_graph,
-    flush_tensor_files,
-    gen_code_bufferized,
-    plan_memory,
-    print_bufferized_graph,
-    print_layer_table,
+from voyager_compiler.codegen import (
+    fold_constant_generators as fold_constant_generators,
+)
+from voyager_compiler.codegen import (
+    fuse_quantize_dequantize_with_producer as fuse_quantize_dequantize_with_producer,
+)
+from voyager_compiler.codegen import (
+    gen_compute_graph as gen_compute_graph,
+)
+from voyager_compiler.codegen import (
+    inline_autocast_modules as inline_autocast_modules,
+)
+from voyager_compiler.codegen import (
+    normalize_activation_layout as normalize_activation_layout,
+)
+from voyager_compiler.codegen import (
+    normalize_conv2d_layout as normalize_conv2d_layout,
+)
+from voyager_compiler.codegen import (
+    normalize_gemm_weight_layout as normalize_gemm_weight_layout,
+)
+from voyager_compiler.codegen import (
+    pad_matrix_op_dimensions as pad_matrix_op_dimensions,
+)
+from voyager_compiler.codegen import (
+    pad_vector_op_dimensions as pad_vector_op_dimensions,
+)
+from voyager_compiler.codegen import (
+    remove_prunable_ops as remove_prunable_ops,
+)
+from voyager_compiler.codegen import (
+    rename_nodes_with_param_names as rename_nodes_with_param_names,
+)
+from voyager_compiler.compiler.bufferize import (
+    bufferize_graph as bufferize_graph,
+)
+from voyager_compiler.compiler.bufferize import (
+    flush_tensor_files as flush_tensor_files,
+)
+from voyager_compiler.compiler.bufferize import (
+    gen_code_bufferized as gen_code_bufferized,
+)
+from voyager_compiler.compiler.bufferize import (
+    plan_memory as plan_memory,
+)
+from voyager_compiler.compiler.bufferize import (
+    print_bufferized_graph as print_bufferized_graph,
+)
+from voyager_compiler.compiler.bufferize import (
+    print_layer_table as print_layer_table,
+)
+from voyager_compiler.compiler.bufferize import (
     shared_dram_layout,
 )
-from voyager_compiler.codegen.transform.tiling import (
-    DEFAULT_RUNTIME_TOLERANCE,
-    build_tiler,
+from voyager_compiler.compiler.search import (
+    DEFAULT_RUNTIME_TOLERANCE as DEFAULT_RUNTIME_TOLERANCE,
+)
+from voyager_compiler.compiler.search import (
+    build_tiler as build_tiler,
 )
 from voyager_compiler.export_utils import (
     export_model,
@@ -71,18 +104,26 @@ from voyager_compiler.export_utils import (
     merge_sibling_linears,
     print_node_scope_tabular,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.modeling import (
     dispatch_model,
     get_device_map,
     insert_align_device_nodes,
 )
 from voyager_compiler.ops.layout import (
-    DEFAULT_GEMM_LAYOUT,
-    DEFAULT_TENSOR_LAYOUT,
-    GEMM_LAYOUTS,
-    GEMV_LAYOUTS,
-    TENSOR_LAYOUTS,
+    DEFAULT_GEMM_LAYOUT as DEFAULT_GEMM_LAYOUT,
+)
+from voyager_compiler.ops.layout import (
+    DEFAULT_TENSOR_LAYOUT as DEFAULT_TENSOR_LAYOUT,
+)
+from voyager_compiler.ops.layout import (
+    GEMM_LAYOUTS as GEMM_LAYOUTS,
+)
+from voyager_compiler.ops.layout import (
+    GEMV_LAYOUTS as GEMV_LAYOUTS,
+)
+from voyager_compiler.ops.layout import (
+    TENSOR_LAYOUTS as TENSOR_LAYOUTS,
 )
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
@@ -119,10 +160,14 @@ from voyager_compiler.quantization.dtypes import (
 )
 from voyager_compiler.shape_prop import (
     ShapeProp,
-    constant_value,
-    fake_like,
     fetch_attr,
     propagate_shape,
+)
+from voyager_compiler.shape_prop import (
+    constant_value as constant_value,
+)
+from voyager_compiler.shape_prop import (
+    fake_like as fake_like,
 )
 from voyager_compiler.utils import with_execution_context
 
@@ -273,99 +318,7 @@ class Pattern(list):
         self.name = name
 
 
-def transform(
-    model: torch.fx.GraphModule,
-    example_args,
-    example_kwargs=None,
-    patterns=None,
-    config=None,
-    tensor_layout=DEFAULT_TENSOR_LAYOUT,
-    gemm_layout=DEFAULT_GEMM_LAYOUT,
-    gemv_layout=DEFAULT_GEMM_LAYOUT,
-    skip_op_fusion=False,
-    fuse_reshape=True,
-    keep_fp32=True,
-):
-    """Lower ``model`` in place through the graph-level passes.
-
-    The passes run on fake copies of the example inputs and read only their
-    shapes (see ``shape_prop``).
-
-    Args:
-        model: The exported graph, rewritten in place.
-        example_args: Example positional inputs.
-        example_kwargs: Example keyword inputs; ``None`` for none.
-        patterns: The fusion patterns ``fuse_operator`` applies, each a list
-            of ``OpMatcher`` from anchor to tail.
-        config: The accelerator's ``AcceleratorConfig``; ``None`` models no
-            hardware and skips padding.
-        tensor_layout: The memory order of the 4-D feature maps that conv2d,
-            the 2-D pools and the ops connected to them read and write:
-            ``"nchw"`` (channels first, PyTorch's order) or ``"nhwc"``
-            (channels last, with HWIO conv weights). GEMM operands are not
-            affected; they follow ``gemm_layout`` and ``gemv_layout``.
-        gemm_layout: The layout of a matrix-matrix GEMM's activation, then
-            its weight, in C (contraction), K (output features) and X
-            (tokens): ``"xc,kc"`` (PyTorch's), ``"xc,ck"`` (the weight
-            [contraction, out]) or ``"cx,ck"`` (also the activations between
-            GEMMs [features, tokens] wherever that transposes less, for a
-            Trainium TensorE; see ``normalize_activation_layout``).
-        gemv_layout: The layout of a matrix-vector GEMM (a single activation
-            row): ``"xc,kc"`` or ``"xc,ck"``.
-        skip_op_fusion: Skip operator fusion.
-        fuse_reshape: Let fusion fold a trailing reshape or permute into
-            its producer's output.
-        keep_fp32: ``False`` computes in 16-bit float where the model casts
-            up to float32 (``remove_fp32_casts``).
-
-    Returns:
-        ``model``.
-    """
-    if example_kwargs is None:
-        example_kwargs = {}
-
-    # A null config (no hardware) skips padding and tiling.
-    if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
-
-    if not keep_fp32:
-        remove_fp32_casts(model)
-
-    flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*map(fake_like, flatten_args))
-
-    fold_constant_generators(model)
-    inline_autocast_modules(model)
-    remove_prunable_ops(model)
-    normalize_attention_operands(model)
-    scalarize_index_arithmetic(model)
-    fuse_quantize_dequantize_with_producer(model)
-
-    if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, config.pe_array_size)
-
-    assert tensor_layout in TENSOR_LAYOUTS, tensor_layout
-    if tensor_layout == "nhwc":
-        normalize_conv2d_layout(model)
-
-    assert gemm_layout in GEMM_LAYOUTS, gemm_layout
-    assert gemv_layout in GEMV_LAYOUTS, gemv_layout
-    gemm_activation, gemm_weight = gemm_layout.split(",")
-    gemv_weight = gemv_layout.split(",")[1]
-    normalize_gemm_weight_layout(model, gemm_weight, gemv_weight)
-    if gemm_activation == "cx":
-        normalize_activation_layout(model)
-
-    if config.pe_array_size is not None:
-        pad_vector_op_dimensions(model, config.vector_lanes)
-
-    if not skip_op_fusion:
-        fuse_operator(model, patterns, fuse_reshape)
-
-    rename_nodes_with_param_names(model)
-    deduplicate_nodes(model)
-
-    return model
+from voyager_compiler.compiler.normalize import transform
 
 
 def compile(
@@ -414,55 +367,18 @@ def compile(
     Returns:
         The ``voyager`` IR ``Model`` written to ``model.txt``.
     """
-    if config is None:
-        config = AcceleratorConfig(pe_array_size=None)
+    from voyager_compiler.pipeline import compile_bufferized
 
-    os.makedirs(output_dir, exist_ok=True)
-
-    flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*map(fake_like, flatten_args))
-
-    gen_compute_graph(model, os.path.join(output_dir, output_file))
-
-    tolerance = (
-        DEFAULT_RUNTIME_TOLERANCE
-        if runtime_tolerance is None
-        else runtime_tolerance
-    )
-    tiler = build_tiler(
-        config, runtime_tolerance=tolerance, accumulate_fp32=accumulate_fp32
-    )
-    backend = config.backend()
-    bufferize_graph(
+    return compile_bufferized(
         model,
-        pipelined=config.double_buffered_l2,
-        tiler=tiler,
-        async_pipeline=config.async_pipeline,
-        bool_mask=bool_mask,
-        builders=backend.builders,
-    )
-    plan_memory(model, config, dram_layout)
-    print_bufferized_graph(model)
-
-    # Without a dump the emitter reads only shapes and dtypes, so it runs on
-    # fake inputs. The deferred constants are installed before it, so the
-    # emitter reads them, and every node computed from them alone, as real
-    # values, and the callers that run or save the graph find them in place.
-    for sub in model.modules():
-        if isinstance(sub, torch.fx.GraphModule):
-            for node in sub.graph.find_nodes(op="get_attr"):
-                constant_value(sub, node)
-    path = os.path.join(output_dir, "tensor_files")
-    params = gen_code_bufferized(
-        model,
-        flatten_args if dump_tensors else list(map(fake_like, flatten_args)),
-        path if dump_tensors else None,
-    )
-
-    with open(os.path.join(output_dir, "model.txt"), "w") as f:
-        f.write(text_format.MessageToString(params))
-    with open(os.path.join(output_dir, "layers.txt"), "w") as f:
-        f.write(print_layer_table(model, params, to_string=True))
-
-    flush_tensor_files()
-    return params
+        example_args,
+        example_kwargs,
+        config,
+        output_dir,
+        output_file,
+        dump_tensors,
+        runtime_tolerance,
+        dram_layout,
+        accumulate_fp32,
+        bool_mask,
+    ).model

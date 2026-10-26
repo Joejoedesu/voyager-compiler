@@ -1,0 +1,14 @@
+# Development regression suite: exact run_ci.py case labels.
+# Reference cases: 1, 2, 4, 5, 6, 9, 13, 14, 15, 17, 21.
+# Match labels exactly; --only prefix matching can include extra variants.
+resnet18/E4M3/16x16
+resnet18/E4M3/32x64
+resnet50/E4M3/32x64
+mobilebert_encoder/E4M3/16x16
+mobilebert_encoder/E4M3/4x8
+resnet18/INT8/16x16
+mobilenet_v2/MXINT8/16x16
+llama_prefill/MXNF4/64x64
+llama_prefill_mp/MXNF4/64x64
+llama_decode/MXNF4/64x64
+vit/MXNF4/64x64

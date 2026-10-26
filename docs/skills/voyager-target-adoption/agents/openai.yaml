@@ -1,0 +1,4 @@
+interface:
+  display_name: "Voyager Target Adoption"
+  short_description: "Bind accelerators with validated search models"
+  default_prompt: "Use $voyager-target-adoption to bind a new accelerator backend to Voyager and validate its hardware model, mapping search, buffer plans, and generated execution."

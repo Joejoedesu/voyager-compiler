@@ -514,6 +514,21 @@ def quantize(
 
 
 quantized_ops_lib.define(
+    "quantize_symmetric(Tensor input, Tensor scale, int quant_min, int quant_max) -> Tensor"
+)
+
+
+@impl(quantized_ops_lib, "quantize_symmetric", "CompositeExplicitAutograd")
+def quantize_symmetric(input, scale, quant_min, quant_max):
+    """FP32 scaling followed by nearest-even integer rounding and saturation.
+
+    Values remain float-coded for graph normalization; physical dtype is metadata.
+    Unlike quantize's lookup table this operation does not round through bfloat16.
+    """
+    return (input.float() / scale.float()).round().clamp(quant_min, quant_max)
+
+
+quantized_ops_lib.define(
     "dequantize(Tensor input, Tensor scale, Tensor? zero_point=None, "
     "SymInt[]? axes=None, int? block_size=None, Tensor? input_qmap=None, "
     "Tensor? output_qmap=None) -> Tensor"

@@ -27,7 +27,7 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import get_arg_value, is_nop
 from voyager_compiler.codegen.reporting.cost import _val
-from voyager_compiler.codegen.transform.bufferize.emit import (
+from voyager_compiler.compiler.bufferize.emit import (
     COMMIT,
     COND,
     WHILE_LOOP,

@@ -11,40 +11,19 @@ from utils.models.llama import QUANTIZATION_CONFIGS
 from utils.models.utils import compile_training_step
 
 from voyager_compiler import (
-    OpMatcher,
     add_compile_args,
     add_quantization_args,
     get_default_quantizer,
 )
-from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
     coverage,
     kernel_rows,
     load_calibration,
     report,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 
 logger = logging.getLogger()
-
-
-def _can_fuse(node):
-    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
-    if hasattr(node, "value") and is_fully_connected(node):
-        input_node = node.args[0]
-        return input_node.meta.get("dtype") is not None
-    return True
-
-
-def _is_constant_div(node):
-    if node.target != torch.ops.aten.div.Tensor:
-        return True
-
-    divisor = node.args[1]
-    if isinstance(divisor, torch.fx.Node):
-        return divisor.value.numel() == 1
-
-    return True
 
 
 def model_input_name(gm):
@@ -52,27 +31,6 @@ def model_input_name(gm):
     tensor files the accuracy tester loads."""
     return next(n.name for n in gm.graph.nodes if n.op == "placeholder")
 
-
-MXU_OPS = [
-    "conv2d",
-    "linear",
-    "matmul",
-    "conv2d_mx",
-    "linear_mx",
-    "matmul_mx",
-]
-QUANT_OPS = [
-    "quantize",
-    "quantize_mx",
-    "quantize_mx_outlier",
-    "quantize_affine",
-]
-# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
-# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
-# op, and its slice width follows the consumers.
-GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 
 # Tolerance for comparing the lowered graph's output against the original's.
 # Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
@@ -83,26 +41,7 @@ GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 OUTPUT_RTOL = 5e-2
 OUTPUT_ATOL = 1e-4
 
-FUSION_PATTERNS = [
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
-        OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("dequantize"),
-        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS),
-    ],
-    [
-        OpMatcher("layer_norm", "rms_norm", "rms_norm_kmajor", "softmax"),
-        OpMatcher(*QUANT_OPS),
-    ],
-]
+from voyager_compiler.targets.voyager.fusion import FUSION_PATTERNS
 
 
 def main():
@@ -278,6 +217,7 @@ def main():
         weight=args.weight,
         bias=args.bias,
         error=args.error,
+        force_scale_power_of_two=args.force_scale_power_of_two,
     )
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
@@ -289,8 +229,10 @@ def main():
             imagenet_dataset = imagenet.retrieve_dataset(1000, "resnet")
             if args.evaluate:
                 torchvision_models.evaluate(model, imagenet_dataset)
-        else:
+        elif args.calibration_steps:
             imagenet_dataset = imagenet.retrieve_dataset(10, "resnet")
+        else:
+            imagenet_dataset = []
 
         gm, old_output, new_output, preprocess_fn = (
             torchvision_models.quantize_and_dump_model(
@@ -405,16 +347,17 @@ def main():
             if args.evaluate:
                 vit.evaluate(model, imagenet_dataset)
         else:
-            imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
-
-        gm, old_output, new_output, preprocess_fn = (
-            vit.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=imagenet_dataset,
-                fusion_patterns=FUSION_PATTERNS,
-                args=args,
+            # ViT also takes its example input from the first image.
+            imagenet_dataset = imagenet.retrieve_dataset(
+                max(1, args.calibration_steps), "vit"
             )
+
+        gm, old_output, new_output, preprocess_fn = vit.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            calibration_data=imagenet_dataset,
+            fusion_patterns=FUSION_PATTERNS,
+            args=args,
         )
 
         if args.dump_dataset:
@@ -439,9 +382,7 @@ def main():
         out_dir = args.report_output_dir
         if out_dir == "." and args.model_output_dir:
             out_dir = args.model_output_dir
-        calibration = (
-            load_calibration(args.calib_in) if args.calib_in else None
-        )
+        calibration = load_calibration(args.calib_in) if args.calib_in else None
         if calibration is not None:
             print(
                 f"[report] {len(calibration.measurements)} measured groups "

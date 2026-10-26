@@ -5,7 +5,7 @@ quantized and transformed the way ``test/test_codegen.py`` does, tiled under
 ``TrainiumModel``, bufferized and planned -- and writes ``model.txt`` to
 ``--out``; ``translate`` turns it into NKI there, beside ``tensors.pt``, the
 value of every HBM box as the bufferized graph computes it (check the
-translation with ``backend/trainium/runtime/check.py``).
+translation with ``targets/trainium/runtime/check.py``).
 
     python benchmarks/trainium/compile_lm.py \\
         --model meta-llama/Llama-3.1-8B-Instruct --phase prefill \\
@@ -40,7 +40,6 @@ from torch.utils._pytree import tree_flatten
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
 )
-from test_codegen import FUSION_PATTERNS  # noqa: E402
 from utils.models import llama  # noqa: E402
 
 from voyager_compiler import (  # noqa: E402
@@ -48,7 +47,12 @@ from voyager_compiler import (  # noqa: E402
     get_default_quantizer,
     transform,
 )
-from voyager_compiler.backend.trainium import (  # noqa: E402
+from voyager_compiler.cli_args import (  # noqa: E402
+    add_compile_args,
+    add_layout_args,
+    add_quantization_args,
+)
+from voyager_compiler.targets.trainium import (  # noqa: E402
     LAYOUT,
     TRN2,
     TRN3,
@@ -58,11 +62,7 @@ from voyager_compiler.backend.trainium import (  # noqa: E402
     record,
     translate,
 )
-from voyager_compiler.cli_args import (  # noqa: E402
-    add_compile_args,
-    add_layout_args,
-    add_quantization_args,
-)
+from voyager_compiler.targets.trainium.fusion import FUSION_PATTERNS
 
 TARGETS = {"trn2": TRN2, "trn3": TRN3}
 DTYPES = {

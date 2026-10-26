@@ -36,6 +36,7 @@ class QScheme(Enum):
     PER_CHANNEL_SYMMETRIC = "per_channel_symmetric"
     MICROSCALING = "microscaling"
     GROUP_WISE_AFFINE = "group_wise_affine"
+    VSQ = "vsq"
 
 
 _ABBREV_MAP = {

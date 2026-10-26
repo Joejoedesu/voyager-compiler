@@ -42,9 +42,8 @@ The quantization flags pick the mode::
 
 Quantized GEMMs are fake-quant, run eagerly, unless ``--compile_step``
 compiles the training step -- forward, loss and backward -- as one program
-(``TrainingStep``) that calls the same fake-quants, or ``--gpu_kernels``
-runs them as real FP8 / NVFP4 kernels in that program, lowered by
-``backend/gpu``'s ``lower_training``.  Under ``--compile_step`` each weight
+(``TrainingStep``) that calls the same fake-quants. Under
+``--compile_step`` each weight
 is quantized once per optimizer step, not once per micro-batch, unless it
 rounds stochastically, and the steps inside a codebook refit window still
 run eagerly.
@@ -95,7 +94,6 @@ from voyager_compiler import (
     prepare_training,
     with_execution_context,
 )
-from voyager_compiler.backend.gpu.training import lower_training
 from voyager_compiler.quantization import (
     CodebookRefitter,
     Weighting,
@@ -213,15 +211,6 @@ def parse_args():
         help="Number of last decoder layers left unquantized.",
     )
     parser.add_argument(
-        "--gpu_kernels",
-        action="store_true",
-        help=(
-            "Run the quantized GEMMs as real FP8 / NVFP4 kernels "
-            "(backend/gpu's lower_training) instead of fake-quant; needs "
-            "--error."
-        ),
-    )
-    parser.add_argument(
         "--compile_step",
         action="store_true",
         help=(
@@ -259,12 +248,6 @@ def parse_args():
     add_experiment_args(parser)
     parser.set_defaults(log_level="INFO")
     args = parser.parse_args()
-    if args.gpu_kernels and args.error is None:
-        parser.error("--gpu_kernels lowers a quantized training step: --error")
-    if args.gpu_kernels and args.codebook_refit_steps:
-        parser.error("a codebook refit hooks fake-quants: no --gpu_kernels")
-    if args.compile_step and args.gpu_kernels:
-        parser.error("--gpu_kernels compiles the step too: no --compile_step")
     return args
 
 
@@ -433,8 +416,7 @@ def main(args):
             )
     step = TrainingStep(
         model,
-        compile=args.compile_step or args.gpu_kernels,
-        lower=lower_training if args.gpu_kernels else None,
+        compile=args.compile_step,
     )
 
     def loss_of(batch):

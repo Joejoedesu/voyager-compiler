@@ -26,10 +26,7 @@ from voyager_compiler.codegen.transform.operator_fusion import (
     duplicate_shared_nodes,
 )
 from voyager_compiler.codegen.transform.rewrites import deduplicate_nodes
-from voyager_compiler.export_utils import (
-    create_getattr_from_value,
-    derived_producer,
-)
+from voyager_compiler.export_utils import create_getattr_from_value
 from voyager_compiler.ops.layout import (
     GEMM_WEIGHT_LAYOUTS,
     NCHW_TO_NHWC,
@@ -161,8 +158,9 @@ def _permute_inputs(
     A conv's weight (or weight scale) is permuted in place, and a 4-D
     activation goes through a permute.  An operand the group's elementwise
     ops broadcast onto its activations (a per-channel scale ``[C, 1, 1]``,
-    a spatial mask ``[1, 1, H, W]``) is ranked up to 4-D first, and a
-    constant one is relaid once, into a buffer of its own."""
+    a spatial mask ``[1, 1, H, W]``) is ranked up to 4-D first. Constant
+    relayouts remain graph requests until shared preparation checks whether
+    their stored representations fit the byte budget."""
     graph = model.graph
 
     # Case A: Input is a weight (Parameter) or weight scale.
@@ -204,27 +202,23 @@ def _permute_inputs(
 
     full = (1,) * (4 - rank) + tuple(node.shape)
     logger.debug(f"Relaying {node} {full} with dims {NCHW_TO_NHWC}")
-    with graph.inserting_after(node):
-        if constant:
-            relaid = create_getattr_from_value(
-                model,
-                graph,
-                node.name + "_nhwc",
-                _relaid(node.value, full, NCHW_TO_NHWC),
-                derived_producer(node, _relaid, full, NCHW_TO_NHWC),
+    view = node
+    if rank < 4:
+        with graph.inserting_after(node):
+            view = graph.call_function(
+                torch.ops.aten.reshape.default, (node, full)
             )
-        else:
-            view = node
-            if rank < 4:
-                view = graph.call_function(
-                    torch.ops.aten.reshape.default, (node, full)
-                )
-                view.meta["dtype"] = node.meta.get("dtype")
-                propagate_shape(view, model)
-            relaid = graph.call_function(
-                torch.ops.aten.permute.default, (view, NCHW_TO_NHWC)
-            )
-            relaid.meta["dtype"] = node.meta.get("dtype")
+        view.meta["dtype"] = node.meta.get("dtype")
+        propagate_shape(view, model)
+    # Each insertion follows its dependency; two inserting_after(node)
+    # creations in one context would reverse reshape/permute graph order.
+    with graph.inserting_after(view):
+        relaid = graph.call_function(
+            torch.ops.aten.permute.default, (view, NCHW_TO_NHWC)
+        )
+    relaid.meta["dtype"] = node.meta.get("dtype")
+    if constant:
+        relaid.meta["constant_name"] = node.name + "_nhwc"
 
     relaid.meta["dims"] = NCHW_TO_NHWC
     for user in readers:
@@ -371,6 +365,8 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
 
         propagate_shape(reshape_node)
         reshape_node.meta["dtype"] = group[-1].meta.get("dtype")
+        if "constant_name" in group[-1].meta:
+            reshape_node.meta["constant_name"] = group[-1].meta["constant_name"]
 
         group[-1].replace_all_uses_with(reshape_node)
 
@@ -431,31 +427,20 @@ def find_upstream_transpose_or_param(
 
 
 def _insert_transposed_input(arg: Node, model: GraphModule):
-    """``arg`` transposed: a transpose of the last two dims is undone, a
-    constant is transposed once, into a buffer of its own, and a computed
-    tensor, or a buffer the graph writes (a KV cache, whose transposed copy
-    would go stale), goes through a transpose op."""
+    """Request a transpose; prepare constants after all layout users agree.
+
+    The common constant folder decides whether replacing the original with
+    the requested layout saves storage. Eagerly making a new attribute here
+    would duplicate a weight still used in its original orientation.
+    """
     if swaps_last_two_dims(arg):
         return arg.args[0]
     with model.graph.inserting_after(arg):
-        if arg.op == "get_attr" and arg.target not in written_buffers(
-            model.graph
-        ):
-            value = fetch_attr(model, arg.target)
-            # A view of the weight, unless it shares a larger storage, which
-            # saving the view would write out whole.
-            transposed = create_getattr_from_value(
-                model,
-                model.graph,
-                arg.name + "_T",
-                value.mT,
-                derived_producer(arg, torch.ops.aten.transpose.int, -2, -1),
-                copy=value.untyped_storage().nbytes() != value.nbytes,
-            )
-        else:
-            transposed = model.graph.call_function(
-                torch.ops.aten.transpose.int, (arg, -2, -1)
-            )
+        transposed = model.graph.call_function(
+            torch.ops.aten.transpose.int, (arg, -2, -1)
+        )
+    if arg.op == "get_attr":
+        transposed.meta["constant_name"] = arg.name + "_T"
     transposed.meta["dtype"] = arg.meta.get("dtype")
     propagate_shape(transposed, model)
     return transposed
@@ -1122,10 +1107,37 @@ def _moved_blocks(island: _Island, shapes: Dict[Node, tuple]) -> float:
 
 def _cost(relayouts: List[Relayout], shapes: Dict[Node, tuple]) -> float:
     """The transposed blocks of ``relayouts``, each operand and target perm
-    once, constants free."""
+    once. An immutable constant is free only when one requested layout
+    replaces all its readers. Otherwise preparation may retain the original
+    and leave a runtime transpose, which this layout heuristic must price.
+    Final shared preparation still owns the full component byte budget.
+    """
+    constants = {}
+    for consumer, arg, src, dst in relayouts:
+        if arg.op == "get_attr":
+            constants.setdefault(arg.target, {}).setdefault(
+                (src, dst), set()
+            ).add(consumer)
+    free = set()
+    if constants:
+        graph = next(
+            arg.graph for _, arg, _, _ in relayouts if arg.op == "get_attr"
+        )
+        mutable = written_buffers(graph)
+        for target, layouts in constants.items():
+            if target in mutable or len(layouts) != 1:
+                continue
+            readers = {
+                user
+                for node in graph.nodes
+                if node.op == "get_attr" and node.target == target
+                for user in node.users
+            }
+            if readers <= next(iter(layouts.values())):
+                free.add(target)
     seen = {}
     for _, arg, src, dst in relayouts:
-        if arg.op == "get_attr":
+        if arg.op == "get_attr" and arg.target in free:
             continue
         shape = (1,) * (len(dst) - len(shapes[arg])) + shapes[arg]
         blocks = transposed_blocks(shape, src, dst) * _data_fraction(arg)
@@ -1211,11 +1223,6 @@ def _islands(
     return [_Island(nodes) for nodes in groups.values()]
 
 
-def _relaid(t: torch.Tensor, shape, dims) -> torch.Tensor:
-    """``t`` viewed at ``shape``, then permuted by ``dims``."""
-    return t.reshape(shape).permute(dims)
-
-
 def _insert_relayout(
     model: GraphModule,
     arg: Node,
@@ -1225,28 +1232,29 @@ def _insert_relayout(
 ) -> Node:
     """``arg``, stored in ``src``, stored in ``dst`` instead: ranked up
     first if it broadcasts, a reshape when only unit axes move, else a
-    permute.  A constant is relaid into a buffer of its own."""
+    permute. Shared preparation decides whether a constant may be stored
+    in the requested representation without duplicating a retained original.
+    """
     graph = model.graph
     lead = len(dst) - len(shape)
     full = (1,) * lead + shape
     phys = tuple(full[a] for a in src)
     dims = tuple(src.index(a) for a in dst)
     with graph.inserting_after(arg):
-        if arg.op == "get_attr":
-            return create_getattr_from_value(
-                model,
-                graph,
-                arg.name + "_kmajor",
-                _relaid(arg.value, phys, dims),
-                derived_producer(arg, _relaid, phys, dims),
-            )
         if [a for a in src if full[a] > 1] == [a for a in dst if full[a] > 1]:
             out = tuple(full[a] for a in dst)
-            return graph.call_function(aten.reshape.default, (arg, out))
-        view = arg
-        if lead:
-            view = graph.call_function(aten.reshape.default, (arg, phys))
-        return graph.call_function(aten.permute.default, (view, dims))
+            relaid = graph.call_function(aten.reshape.default, (arg, out))
+        else:
+            view = arg
+            if lead:
+                view = graph.call_function(aten.reshape.default, (arg, phys))
+                view.meta["dtype"] = arg.meta.get("dtype")
+            with graph.inserting_after(view):
+                relaid = graph.call_function(aten.permute.default, (view, dims))
+    relaid.meta["dtype"] = arg.meta.get("dtype")
+    if arg.op == "get_attr":
+        relaid.meta["constant_name"] = arg.name + "_kmajor"
+    return relaid
 
 
 def _relay_buffer(model: GraphModule, target: str, src: Perm, dst: Perm):
@@ -1277,13 +1285,13 @@ def _rewrite(
         if weight is not None:
             # The weight scales the normalized dim, now the second-last.
             with model.graph.inserting_after(weight):
-                weight = create_getattr_from_value(
-                    model,
-                    model.graph,
-                    weight.name + "_kmajor",
-                    weight.value.reshape(-1, 1),
-                    derived_producer(weight, torch.reshape, (-1, 1)),
+                relaid = model.graph.call_function(
+                    aten.reshape.default, (weight, (-1, 1))
                 )
+            relaid.meta["dtype"] = weight.meta.get("dtype")
+            if weight.op == "get_attr":
+                relaid.meta["constant_name"] = weight.name + "_kmajor"
+            weight = relaid
         node.target = quantized_ops.rms_norm_kmajor.default
         node.args = (node.args[0], weight, eps)
 

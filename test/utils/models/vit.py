@@ -1,6 +1,5 @@
 import torch
 from tqdm import tqdm
-
 from transformers import ViTForImageClassification
 from transformers.utils import logging
 
@@ -8,22 +7,22 @@ from voyager_compiler import (
     DerivedQuantizationSpec,
     QuantizationConfig,
     QuantizationSpec,
-    convert_pt2e,
-    export_model,
-    replace_conv2d_with_im2col,
-    prepare_pt2e,
-    transform,
     compile,
+    convert_pt2e,
     derive_bias_qparams_fn,
+    export_model,
     extract_input_preprocessor,
     fuse_operator,
+    prepare_pt2e,
+    replace_conv2d_with_im2col,
+    transform,
 )
 from voyager_compiler.codegen import (
     pad_vit_embeddings_output,
     remove_zero_attention_mask,
 )
-from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
+from voyager_compiler.quantization import parse_codebook_dtype
 
 from .utils import get_compile_args, get_transform_args
 
@@ -125,9 +124,11 @@ def quantize_and_dump_model(
             )
             qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
         quantizer.set_module_name(
-            "^patch_embed.proj$"
-            if timm_model
-            else "^vit.embeddings.patch_embeddings.projection$",
+            (
+                "^patch_embed.proj$"
+                if timm_model
+                else "^vit.embeddings.patch_embeddings.projection$"
+            ),
             qconfig,
         )
 
@@ -136,9 +137,7 @@ def quantize_and_dump_model(
         args.pe_array_size[1] if args.pe_array_size is not None else None
     )
 
-    embeddings = (
-        TimmEmbeddings(model) if timm_model else model.vit.embeddings
-    )
+    embeddings = TimmEmbeddings(model) if timm_model else model.vit.embeddings
 
     gm = export_model(model, example_args)
     remove_zero_attention_mask(gm, example_args)
@@ -150,6 +149,13 @@ def quantize_and_dump_model(
         replace_conv2d_with_im2col(gm)
 
     gm = prepare_pt2e(gm, quantizer)
+
+    if args.numerics_recipe == "voyager_reference_20260927":
+        from voyager_compiler.targets.voyager.numerics import (
+            remove_softmax_dtype_cast,
+        )
+
+        remove_softmax_dtype_cast(gm)
 
     for i in tqdm(range(args.calibration_steps), desc="Calibrating ViT"):
         inputs = calibration_data[i]["image"]

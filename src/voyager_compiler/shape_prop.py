@@ -18,6 +18,7 @@ emitter's tensor dump and a numeric check see real values.
 """
 
 import logging
+import operator
 from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Optional
 
@@ -40,6 +41,7 @@ __all__ = [
     "run_op",
     "set_node_value",
     "written_buffers",
+    "written_values",
 ]
 
 # One mode for every fake value: fakes of two modes cannot meet in an op.
@@ -98,30 +100,80 @@ def run_op(fn, args, kwargs):
         return fn(*args, **kwargs)
 
 
-def written_buffers(graph) -> set:
-    """Targets of the ``get_attr`` buffers the graph writes in place: the
-    destination of an in-place ATen op (a KV-cache ``index_copy_``), or an
-    operand of a ``cond`` / ``while_loop`` region, whose body may write it.
-    Such a buffer must not be replaced by a compile-time copy."""
-    written = set()
+def written_values(graph) -> set:
+    """Values written directly, through views, or by opaque regions.
+
+    Include computed tensors: preparing ``p = constant * scale`` once is
+    unsafe if a later operation mutates p on every invocation.
+
+    Follow schema aliases (conservatively including may-alias reshapes), all
+    writable arguments including ``out=``, and aggregate indexing. Distinct
+    attributes sharing an eager backing are mutable together. An opaque call
+    may write its operands; treating it as read-only would freeze stale data.
+    """
+    written, roots, storage = set(), {}, {}
+
+    def origins(value):
+        return set().union(
+            *(
+                roots.get(n, set())
+                for n in tree_flatten(value)[0]
+                if isinstance(n, Node)
+            )
+        )
+
     for node in graph.nodes:
-        if node.op != "call_function":
+        if node.op == "get_attr":
+            roots[node] = {node}
+            value = getattr(node, "value", None)
+            if isinstance(value, torch.Tensor):
+                storage.setdefault(value.untyped_storage()._cdata, set()).add(
+                    node
+                )
             continue
-        target = node.target
-        if target in _HOPS or target in _region_ops():
-            operands = node.all_input_nodes
-        elif (
-            isinstance(target, torch._ops.OpOverload)
-            and target._schema.name.endswith("_")
-            and node.args
-        ):
-            operands = [node.args[0]]
+        schema = getattr(node.target, "_schema", None)
+        if schema is not None:
+            returned = set().union(
+                *(
+                    r.alias_info.after_set
+                    for r in schema.returns
+                    if r.alias_info
+                )
+            )
+            aliases = set()
+            for i, arg in enumerate(schema.arguments):
+                value = (
+                    node.args[i]
+                    if i < len(node.args)
+                    else node.kwargs.get(arg.name)
+                )
+                sources = origins(value)
+                if arg.alias_info:
+                    if arg.alias_info.is_write:
+                        written.update(sources)
+                    if (
+                        returned.intersection(arg.alias_info.after_set)
+                        or "*" in returned
+                    ):
+                        aliases.update(sources)
+            roots[node] = aliases | {node}
+        elif node.target is operator.getitem:
+            roots[node] = origins(node.args[0]) | {node}
+        elif node.op in ("call_module", "call_method", "call_function"):
+            roots[node] = origins((node.args, node.kwargs))
+            written.update(roots[node])
+            roots[node].add(node)
         else:
-            continue
-        for operand in operands:
-            if isinstance(operand, Node) and operand.op == "get_attr":
-                written.add(operand.target)
+            roots[node] = {node}
+    for targets in storage.values():
+        if targets & written:
+            written.update(targets)
     return written
+
+
+def written_buffers(graph) -> set:
+    """Attribute names whose data or aliases the graph may write."""
+    return {n.target for n in written_values(graph) if n.op == "get_attr"}
 
 
 def fetch_attr(module, target):

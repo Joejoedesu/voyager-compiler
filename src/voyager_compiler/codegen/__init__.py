@@ -5,7 +5,6 @@ pipeline applies them.
 """
 
 from voyager_compiler.codegen.subgraph import rename_nodes_with_param_names
-from voyager_compiler.codegen.transform.bufferize import gen_compute_graph
 from voyager_compiler.codegen.transform.data_layout import (
     eliminate_reshape_with_no_effect,
     normalize_activation_layout,
@@ -43,7 +42,8 @@ from voyager_compiler.codegen.transform.rewrites import (
 from voyager_compiler.codegen.transform.scalarize import (
     scalarize_index_arithmetic,
 )
-from voyager_compiler.codegen.transform.tiling.grid_search import (
+from voyager_compiler.compiler.bufferize import gen_compute_graph
+from voyager_compiler.compiler.search.tile_shapes import (
     gemv_op_tiling,
     pool_op_tiling,
     vector_op_tiling,

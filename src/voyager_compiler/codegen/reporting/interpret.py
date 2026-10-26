@@ -34,6 +34,7 @@ from voyager_compiler.codegen.node_info import (
     is_compute_op,
     is_nop,
 )
+from voyager_compiler.codegen.reporting.busy import busy_unions
 from voyager_compiler.codegen.reporting.calibration import kernel_groups
 from voyager_compiler.codegen.reporting.cost import _shape, _val, tile_bytes
 from voyager_compiler.codegen.reporting.model import (
@@ -42,7 +43,6 @@ from voyager_compiler.codegen.reporting.model import (
     ScheduleResult,
 )
 from voyager_compiler.codegen.reporting.periods import MAX_PERIOD, PeriodFinder
-from voyager_compiler.codegen.reporting.busy import busy_unions
 from voyager_compiler.codegen.reporting.scheduler import (
     T_LOOP,
     T_SKIP,
@@ -56,12 +56,11 @@ from voyager_compiler.codegen.reporting.structure import (
     Structure,
     loop_structure,
 )
-from voyager_compiler.codegen.transform.bufferize.bufferization import (
+from voyager_compiler.compiler.bufferize.bufferization import (
     _produces_tensor,
     _viewed_buffer,
 )
-from voyager_compiler.codegen.transform.bufferize.utils import CSR_FILL_META
-from voyager_compiler.codegen.transform.bufferize.emit import (
+from voyager_compiler.compiler.bufferize.emit import (
     COMMIT,
     COND,
     WHILE_LOOP,
@@ -69,7 +68,8 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
     _loop_extents,
     _norm_extent,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.compiler.bufferize.utils import CSR_FILL_META
+from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.shape_prop import run_op
 
 _ALLOC = torch.ops.voyager.alloc.default

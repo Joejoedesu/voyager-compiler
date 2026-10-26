@@ -40,8 +40,8 @@ persistent cache, so ``kv_bits`` does not apply to it.
 """
 
 import argparse
-import json
 import functools
+import json
 import multiprocessing
 import operator
 import os
@@ -101,16 +101,16 @@ from voyager_compiler.codegen.reporting import (
     write_excel_report,
     write_perfetto,
 )
-from voyager_compiler.codegen.transform.bufferize import (
+from voyager_compiler.compiler.bufferize import (
     bufferize_graph,
     plan_memory,
     print_bufferized_graph,
 )
-from voyager_compiler.codegen.transform.tiling.tiler import (
+from voyager_compiler.compiler.search.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_tiler,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.quantization.fake_quantize import (
     FakeQuantizeBase,
     FusedAmaxObsFakeQuantize,
@@ -841,12 +841,9 @@ def _frontend(cfg: SweepConfig):
         gm, model, example_args, example_kwargs = build_prefill(cfg)
     # Only a cache stored quantized -- KIVI's, or one the attention matmuls
     # read in their MX format -- is split into chunks and a residual.
-    split = (
-        is_decode
-        and (
-            cfg.kv_bits != 16
-            or quantizes_kv_cache(gm, build_quantizer(cfg, split=False))
-        )
+    split = is_decode and (
+        cfg.kv_bits != 16
+        or quantizes_kv_cache(gm, build_quantizer(cfg, split=False))
     )
     if split:
         split_kv_cache(gm, cfg.group, cfg.kv_len)

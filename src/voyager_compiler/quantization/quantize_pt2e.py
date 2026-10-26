@@ -16,6 +16,7 @@ from torchao.quantization.pt2e.qat_utils import _fuse_conv_bn_qat
 from torchao.quantization.pt2e.quantizer import (
     EdgeOrNode,
     QuantizationSpecBase,
+    SharedQuantizationSpec,
 )
 from torchao.utils import _assert_and_get_unique_device
 
@@ -111,11 +112,21 @@ def _get_obs_or_fq_map(
     obs_or_fq_map: Dict[EdgeOrNode, ObserverOrFakeQuantize] = {}
     group_id_to_obs_or_fq: Dict[Tuple, ObserverOrFakeQuantize] = {}
     for edge_or_node, qspec in edge_or_node_to_qspec.items():
+        seen = set()
+        while isinstance(qspec, SharedQuantizationSpec):
+            ref = qspec.edge_or_node
+            if ref in seen:
+                raise ValueError("Cyclic shared quantization specification")
+            seen.add(ref)
+            qspec = edge_or_node_to_qspec[ref]
         # torchao's union-find groups readers by its own spec attributes
         # only; split each group by the fields it does not compare.
         group_id = (edge_or_node_to_group_id[edge_or_node],) + tuple(
             getattr(qspec, field, None) for field in _SHARED_FIELDS
         )
+        extra_identity = getattr(qspec, "additional_sharing_key", None)
+        if extra_identity is not None:
+            group_id += (extra_identity(),)
         if group_id not in group_id_to_obs_or_fq:
             # TODO: maybe edge_or_node_to_qspec should be
             # edge_or_node_to_root_qspec, this will simplify the implementation
@@ -237,6 +248,7 @@ def get_default_quantizer(
     bias: Optional[str] = None,
     error: Optional[str] = None,
     random_hadamard_transform: Tuple[str, ...] = (),
+    force_scale_power_of_two: bool = False,
     **kwargs: Any,
 ) -> XNNPACKQuantizer:
     """Build a quantizer for conv2d, linear and matmul from spec strings.
@@ -267,6 +279,11 @@ def get_default_quantizer(
         None if spec is None else QuantizationSpec.from_str(spec)
         for spec in (input_activation, output_activation, weight, error)
     )
+    if force_scale_power_of_two:
+        input_activation, output_activation, weight, error = (
+            None if spec is None else replace(spec, power_2_scale=True)
+            for spec in (input_activation, output_activation, weight, error)
+        )
     scaled = (QScheme.PER_TENSOR_SYMMETRIC, QScheme.PER_CHANNEL_SYMMETRIC)
     # We will specify derived_from later in the quantizer.
     if bias is not None or all(
@@ -331,16 +348,17 @@ def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e
 
     # replace the default implementation of _create_obs_or_fq_from_qspec
-    prepare._get_obs_or_fq_map = _get_obs_or_fq_map
-
     if not isinstance(model, GraphModule):
         model = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
-
-    model = prepare_pt2e(model, quantizer)
-    # Both device lookups are memoized on the module they are given; the
-    # intermediate graph prepare passes in would keep every parameter alive.
-    assert_and_get_unique_device.cache_clear()
-    _assert_and_get_unique_device.cache_clear()
+    original = prepare._get_obs_or_fq_map
+    prepare._get_obs_or_fq_map = _get_obs_or_fq_map
+    try:
+        model = prepare_pt2e(model, quantizer)
+    finally:
+        prepare._get_obs_or_fq_map = original
+        # Intermediate modules must not keep every parameter alive.
+        assert_and_get_unique_device.cache_clear()
+        _assert_and_get_unique_device.cache_clear()
     return model
 
 
@@ -473,6 +491,7 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     node: Node,
     modules: Dict[str, torch.nn.Module],
     output_dtype: str = None,
+    integer_rounding: bool = False,
 ):
     graph = model.graph
     assert modules is not None
@@ -480,16 +499,33 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     activation_post_process = modules[node.target]
     device = assert_and_get_unique_device(activation_post_process)
 
-    dtype = next(iter(model.parameters())).dtype
+    dtype = next(
+        iter(model.parameters()), torch.empty((), dtype=torch.float32)
+    ).dtype
     scale = activation_post_process.calculate_qparams().to(dtype)
+    from voyager_compiler.quantization.qspec import int_range
+
+    bounds = (
+        int_range(activation_post_process.dtype) if integer_rounding else None
+    )
+    if integer_rounding and bounds is None:
+        raise ValueError(
+            "Direct integer rounding requires an integer quantization dtype"
+        )
 
     orig_fq_users = list(node.users.keys())
     input_node = node.args[0]
     if _is_weight(model, input_node):
         # Quantize weight and remove the fq module
         param = fetch_attr(model, input_node.target)
-        param.data = torch.ops.quantized_ops.quantize(
-            param.data, scale, qmap=activation_post_process.qmap
+        param.data = (
+            torch.ops.quantized_ops.quantize_symmetric(
+                param.data, scale, *bounds
+            )
+            if bounds
+            else torch.ops.quantized_ops.quantize(
+                param.data, scale, qmap=activation_post_process.qmap
+            )
         )
         node.replace_all_uses_with(input_node)
 
@@ -517,8 +553,23 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                 )
             )
             quantized_node = graph.call_function(
-                torch.ops.quantized_ops.quantize.default,
-                (node.args[0], qparam_node, None, None, None, get_attr_node),
+                (
+                    torch.ops.quantized_ops.quantize_symmetric.default
+                    if bounds
+                    else torch.ops.quantized_ops.quantize.default
+                ),
+                (
+                    (node.args[0], qparam_node, *bounds)
+                    if bounds
+                    else (
+                        node.args[0],
+                        qparam_node,
+                        None,
+                        None,
+                        None,
+                        get_attr_node,
+                    )
+                ),
             )
 
         # Annotate input dtype
@@ -553,13 +604,21 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                 != torch.ops.quantized_ops.dequantize.default
             ):
                 # Insert a dequantize node after the gemm operation
-                quant_map = get_quantization_map(output_dtype, device)
+                quant_map = (
+                    None
+                    if integer_rounding
+                    else get_quantization_map(output_dtype, device)
+                )
                 with graph.inserting_before(maybe_dq_node):
                     qparam_node = create_getattr_from_value(
                         model, graph, user_node.name + "_scale", scale
                     )
-                    get_attr_node = create_getattr_from_value(
-                        model, graph, "qmap", quant_map
+                    get_attr_node = (
+                        None
+                        if quant_map is None
+                        else create_getattr_from_value(
+                            model, graph, "qmap", quant_map
+                        )
                     )
                     dequantized_node = graph.call_function(
                         torch.ops.quantized_ops.dequantize.default,
@@ -644,7 +703,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     assert modules is not None
     assert isinstance(node.target, str)
     activation_post_process = modules[node.target]
-    device = assert_and_get_unique_device(activation_post_process)
+    assert_and_get_unique_device(activation_post_process)
 
     input_node = node.args[0]
     is_weight = _is_weight(model, input_node)
@@ -1590,6 +1649,8 @@ def convert_pt2e(
     model: GraphModule,
     output_dtype: str = None,
     eliminate_no_effect: bool = True,
+    *,
+    integer_rounding: bool = False,
 ):
     if model.meta.get("frozen_weights"):
         raise ValueError(
@@ -1626,7 +1687,7 @@ def convert_pt2e(
             )
         else:
             _replace_observer_with_quantize_dequantize_node_decomposed(
-                model, node, modules, output_dtype
+                model, node, modules, output_dtype, integer_rounding
             )
 
     if eliminate_no_effect:

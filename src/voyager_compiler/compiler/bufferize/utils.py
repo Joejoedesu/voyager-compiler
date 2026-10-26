@@ -1,0 +1,666 @@
+"""
+Shared helpers for the bufferization builders (``gemm`` / ``pointwise`` /
+``attention``).
+
+Tile DMA goes through ``voyager.async_copy`` (the guarded prefetch / store) and
+``voyager.insert`` (the in-kernel whole-slot writes); the helpers here are
+the remaining shared pieces: the fused pointwise tail, the lenient export
+verifier, exported-graph cleanup, tagging each ``while_loop`` with its
+per-dimension tile-grid extents (consumed by the loop-aware code generator),
+and stamping a CSR block copy with the occupancy the reporting model prices
+it at.
+"""
+
+import contextlib
+import operator
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
+
+import torch
+import torch._export.verifier as _verifier
+from torch.fx import GraphModule, Node
+
+from voyager_compiler.codegen.node_info import (
+    compute_tiled_shape,
+    get_arg_value,
+    is_nop,
+    quant_param_arg_nodes,
+)
+from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
+from voyager_compiler.compiler.bufferize.ops import MemoryLevel
+from voyager_compiler.compiler.search import Tiler
+
+voyager = torch.ops.voyager
+_WHILE_LOOP = torch.ops.higher_order.while_loop
+_COND = torch.ops.higher_order.cond
+_COMMIT = torch.ops.higher_order.commit
+_WITH_SCRATCH = torch.ops.higher_order.with_scratch
+# Stamped on a CSR block's ``async_copy`` -- sized at the block's budget but
+# moving ``count`` entries at run time -- as the budget's mean occupancy over
+# the example input, so the reporting model prices the bytes actually moved.
+CSR_FILL_META = "csr_fill"
+
+
+@dataclass(frozen=True)
+class BuildContext:
+    """The settings every builder may read; one per ``bufferize_graph``.
+
+    Attributes:
+        tiler: The ``Tiler`` supplying per-node tile factors, or ``None``.
+        num_slots: Buffer slots per pipelined operand (1: single-buffered).
+        async_pipeline: A pipelined GEMM (dense and sparse) / conv dispatches
+            each tile's compute asynchronously; off => the synchronous
+            ``PipelinedKernel``.
+        accumulate_fp32: A GEMM (dense and sparse) split along K accumulates
+            in float32 rather than its output dtype.
+        single_buffer_tail: Single-buffer a >1-tile reduction's output and
+            fused post-op operands.
+        flash_attention_v3: Lower attention with the FA3 pipeline; off => the
+            baseline flash-attention builder.
+        bool_mask: Store an ``is_causal`` attention's mask table as int1
+            codes plus a scale; off => the additive fill.
+    """
+
+    tiler: Optional[Tiler]
+    num_slots: int
+    async_pipeline: bool
+    accumulate_fp32: bool
+    single_buffer_tail: bool
+    flash_attention_v3: bool
+    bool_mask: bool
+    preserve_reshape_tail: bool = False
+
+
+def effect_cond(
+    pred: torch.Tensor | torch.SymBool | bool,
+    action: Callable[[], None],
+) -> None:
+    """Run the side-effecting ``action()`` when ``pred`` holds, else nothing —
+    a ``torch.cond`` guard whose two branches return the *same* constant.
+
+    Returning different ints from the branches (the ``do`` returns 1 / ``skip``
+    returns 0 idiom) makes ``torch.cond`` mint an unbacked symint for the
+    discarded result; inside a ``()``-returning ``voyager.commit`` that dangling
+    symbol trips export's ``PendingUnbackedSymbolNotFound``.  Matched constants
+    mint none.  ``action``'s own return is ignored; ``has_side_effect(cond)``
+    keeps the guard.
+    """
+
+    def true_branch():
+        action()
+        return 0
+
+    def false_branch():
+        return 0
+
+    torch.cond(pred, true_branch, false_branch)
+
+
+def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
+    """The GraphModule attribute named ``target`` on ``gm`` (a loop body/cond
+    or fused submodule), or None if ``target`` is not a submodule."""
+    try:
+        sub = gm.get_submodule(str(target))
+    except AttributeError:
+        return None
+    return sub if isinstance(sub, GraphModule) else None
+
+
+def _passed_whole(node: Node, codebooks: set) -> bool:
+    """An operand handed to the op whole rather than tiled into a slot, and so
+    exempt from the Scratchpad rule: a codebook / qmap (a *param*, which carries
+    no space at all), or a scalar (read from DRAM).  ``_build_for_untiled``
+    loads neither."""
+    if node in codebooks:
+        return True
+    val = node.meta.get("val", getattr(node, "value", None))
+    return isinstance(val, torch.Tensor) and val.numel() == 1
+
+
+def _collect_codebook_nodes(gm: GraphModule) -> set:
+    """Every codebook / qmap node in ``gm`` — recursing into ``while_loop``
+    bodies, ``cond`` branches, and fused ``call_module`` submodules.
+
+    Codebook-ness flows bottom-up: an op flags its codebook args
+    (``quant_param_arg_nodes``) and an operand bound to a codebook sub-graph
+    placeholder is itself a codebook — so a top-level ``code`` / ``qmap``
+    get_attr threaded through the loops is caught.
+    """
+    codebooks = set()
+
+    def _thread(operands, sub):
+        if sub is None:
+            return
+        sub_phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+        sub_cb = _collect_codebook_nodes(sub)
+        codebooks.update(sub_cb)
+        # A sub placeholder can only be a codebook at sub's own level, so
+        # membership in the whole sub set is membership among its placeholders.
+        for operand, ph in zip(operands, sub_phs):
+            if isinstance(operand, Node) and ph in sub_cb:
+                codebooks.add(operand)
+
+    for n in gm.graph.nodes:
+        if n.meta.get("instruction_constant"):
+            if n.op != "get_attr":
+                raise ValueError(
+                    f"{n.name}: instruction constants must be captured attributes"
+                )
+            codebooks.add(n)
+        if n.op == "call_function":
+            codebooks.update(quant_param_arg_nodes(n))
+            if n.target is _WHILE_LOOP:
+                operands = list(n.args[2])
+                if len(n.args) > 3:
+                    operands += list(n.args[3])
+                _thread(operands, _subgraph(gm, n.args[1].target))
+            elif n.target is _COND:
+                # Both cond branches share the operand list (args[3]); thread
+                # codebook-ness into each, exactly like a while_loop body — a
+                # tail op (e.g. quantize_mx) inside a finalize cond consumes its
+                # codebook through a branch placeholder.
+                operands = list(n.args[3]) if len(n.args) > 3 else []
+                _thread(operands, _subgraph(gm, n.args[1].target))
+                _thread(operands, _subgraph(gm, n.args[2].target))
+            elif n.target in (_COMMIT, _WITH_SCRATCH):
+                _thread(list(n.args[1:]), _subgraph(gm, n.args[0].target))
+        elif n.op == "call_module":
+            _thread(list(n.args), _subgraph(gm, n.target))
+
+    return codebooks
+
+
+@dataclass
+class _InputSpec:
+    """Per-operand tile spec, computed once from the output + operand shapes.
+
+    A whole (un-indexed) operand — a true scalar, or a quantization codebook /
+    qmap — has **no** spec (``None`` in the spec list), not an _InputSpec: it is
+    passed through, never tiled or DMA-loaded.  So an _InputSpec always
+    describes a genuinely tiled operand.
+
+    Fields:
+      ``tile_sizes``   per-dim tile sizes for this operand.
+      ``index_map``    output/grid dim each operand dim maps to, or ``None`` for
+                       an axis loaded whole / mapped to no grid dim (e.g. a conv
+                       weight's kH/kW, never tiled).
+      ``is_broadcast`` dim is size 1 in operand, >1 in output.
+      ``repeat``       grid steps this operand's dim holds still for: its block
+                       index is ``grid_index // repeat[d]``, so consecutive grid
+                       points read the *same* tile.  A GQA operand repeats over
+                       the query heads (8 KV heads feeding 32 query heads =>
+                       ``repeat`` 4 on the head dim), which is a broadcast that
+                       ``is_broadcast`` cannot say: the dim is 8, not 1.
+                       ``None`` => all ones.
+      ``strides``      step between tiles (``None`` => == ``tile_sizes``).
+      ``pad``          per-dim low padding (start -= pad).
+      ``pad_value``    out-of-bounds fill for a padded load.
+      ``transposed``   load swaps the tile's last two dims (a fused weight ᵀ).
+      ``num_slots``    per-operand software-pipeline depth (SRAM slots /
+                       prefetch distance ``num_slots - 1``); ``None`` inherits
+                       the scheduler's default.  Lets a reused / low-reuse
+                       operand pick a shallower or deeper pipeline than its
+                       peers.
+      ``first_use_at_exit``
+                       guarded operand first read at its sweep's **last** step,
+                       so the load-wait is deferred to block-exit (overlaps the
+                       sweep with a single buffer).  Builder-set only where
+                       exit-only use is provable; default ``False`` =
+                       wait-at-entry.
+      ``load``         issues the tile's copy in place of ``voyager.async_copy``
+                       (``_BufferedRef._load_tile``): called with what
+                       ``load_buffers`` returned, the slot, then
+                       ``async_copy``'s arguments; ``None`` => the DMA.
+      ``load_buffers`` ``() -> buffers`` of ``load``, called once before
+                       the loop.
+    """
+
+    tile_sizes: Tuple[int, ...]
+    index_map: Tuple[int, ...]
+    is_broadcast: Tuple[bool, ...]
+    repeat: Optional[Tuple[int, ...]] = None
+    strides: Optional[Tuple[int, ...]] = None
+    pad: Optional[Tuple[int, ...]] = None
+    pad_value: Optional[float] = None
+    transposed: bool = False
+    num_slots: Optional[int] = None
+    first_use_at_exit: bool = False
+    load: Optional[Callable] = None
+    load_buffers: Optional[Callable] = None
+
+
+@dataclass
+class _OutputSpec:
+    """Per-output tile spec — the store-side mirror of ``_InputSpec``.
+
+    Carries the DRAM buffer (``shape`` / ``dtype``) plus how the output tiles
+    onto the grid (``tile_sizes`` + ``index_map``), exactly like an input.  The
+    grid has no single ``tile_sizes``: it is reconstructed from the operand
+    specs — the grid-defining output sets the tile for the dims it spans, and
+    any extra (reduction) grid dim, e.g. conv's input channel C, takes its tile
+    from the input that spans it.  An output whose ``index_map`` omits a grid
+    dim does not see it in the store — that is how a reduction's C dim is
+    dropped.
+
+    Fields:
+      ``shape``      the DRAM output buffer shape.
+      ``tile_sizes`` per-dim output tile (the grid step for its dims).
+      ``index_map``  grid dim each output dim maps to.
+      ``dtype``      output dtype.
+      ``num_slots``  per-output software-pipeline depth (``None`` inherits the
+                     scheduler default); see ``_InputSpec.num_slots``.
+      ``first_use_at_exit``
+                     guarded output first written at its sweep's **last** step
+                     (e.g. a reduction's ``post_process``), so the reuse-drain
+                     is deferred to block-exit (lets the store overlap the next
+                     tile's sweep with a single buffer).  Builder-set; default
+                     ``False`` = drain-at-entry.  See ``_InputSpec``.
+    """
+
+    shape: Tuple[int, ...]
+    tile_sizes: Tuple[int, ...]
+    index_map: Tuple[int, ...]
+    dtype: torch.dtype
+    num_slots: Optional[int] = None
+    first_use_at_exit: bool = False
+
+
+@dataclass(frozen=True)
+class _ScratchSpec:
+    """A persistent on-chip scratch ref — a third class of on-chip object
+    next to the SRAM input / output slots.  Unlike them it is *local state*:
+    allocated once and reused every grid step, not DMA-managed, and not
+    carried in the loop state.  The kernel mutates it in place (e.g. a
+    tiled-reduction accumulator).  Mirrors Pallas's ``scratch_shapes``
+    appended after the normal input/output refs.
+
+    ``num_slots == 2`` double-buffers the scratch in the async pipeline: its
+    lifetime is one output tile, so the scheduler hands the kernel the slot
+    at the output tile's ordinal (``store_count % num_slots``), exactly how
+    the out slots rotate.  No synchronization is added — the lagged retire
+    already orders a slot's reuse (tile ``t + 2``) behind the finalize that
+    last read it (tile ``t``), because a commit is dispatched only after
+    every commit two steps back has been observed complete.  The synchronous
+    pipeline hands the kernel all ``num_slots`` slots, and the kernel picks
+    the one each of its ops uses.
+
+    ``space`` is the ``MemoryLevel`` the scratch is allocated in: the SRAM
+    scratchpad, or a ``LOCAL`` buffer beside the array.
+    """
+
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+    num_slots: int = 1
+    space: int = MemoryLevel.SRAM
+
+
+def _compute_input_spec(
+    tiling: tuple, input_shape: tuple, grid_map: Optional[tuple] = None
+) -> Optional[_InputSpec]:
+    """Derive the tile spec for one operand (NumPy/PyTorch right-align rules),
+    or ``None`` for a 0-D / single-element operand that is passed whole (not
+    tiled / loaded).
+
+    ``tiling`` is the per-output-dim tile-factor vector; the operand's tile is
+    ``compute_tiled_shape(input_shape, tiling)``.  ``grid_map`` maps each output
+    dim to the grid dim it tiles along; ``None`` means the grid *is* the output
+    (pointwise / pool), so the operand's dim ``offset + d`` is its grid dim
+    directly.  GEMM / conv pass their output->grid map (e.g. a transposed-conv
+    NHWC permutation), since their grid carries a reduction dim the output
+    doesn't span.
+    """
+    # 0-D or single-element tensors are passed through (no spec).
+    if len(input_shape) == 0 or (len(input_shape) == 1 and input_shape[0] == 1):
+        return None
+
+    ndim_in = len(input_shape)
+    offset = len(tiling) - ndim_in
+
+    ts_for_inp = compute_tiled_shape(input_shape, tiling)
+    index_map = tuple(
+        (offset + d) if grid_map is None else grid_map[offset + d]
+        for d in range(ndim_in)
+    )
+    is_broadcast = tuple(s == 1 for s in input_shape)
+
+    return _InputSpec(ts_for_inp, index_map, is_broadcast)
+
+
+def _out_of_place(target):
+    """The out-of-place aten overload of an in-place one (``add_.Tensor`` ->
+    ``add.Tensor``), or ``target`` unchanged if it is not a convertible
+    in-place op.
+    """
+    if not isinstance(target, torch._ops.OpOverload):
+        return target
+    name = target._schema.name  # e.g. "aten::add_"
+    if "::" not in name or not name.endswith("_"):
+        return target
+    ns, op = name.split("::")
+    packet = getattr(getattr(torch.ops, ns, None), op[:-1], None)
+    if packet is None:
+        return target
+    return getattr(packet, target._overloadname, target)
+
+
+def _build_fused_gm(submod, anchor_node, fused_ops, fused_inputs):
+    """The post-anchor fused pointwise ops as a ``GraphModule``
+    ``[acc, *fused_inputs] -> submodule output(s)``.
+
+    ``anchor_node``'s output is rewired to the ``acc`` placeholder;
+    ``fused_inputs`` are the submodule placeholders the ``fused_ops`` consume
+    (e.g. a residual / scale).  Export inlines this, so the fused ops become
+    standalone nodes in the loop body, applied to the anchor's result tile.
+    """
+    g = torch.fx.Graph()
+    remap = {anchor_node: g.placeholder("acc")}
+    for n in fused_inputs:
+        remap[n] = g.placeholder(n.name)
+    inputs = set(remap.values())  # the [acc, *fused_inputs] placeholders
+    for n in fused_ops:
+        new = g.node_copy(n, lambda x: remap[x])
+        # An in-place fused op touching a fused input can mutate a while_loop
+        # input (a residual is passed whole when the node is untiled), which
+        # HOPs reject — so de-inplace it (add_ -> add); same result, no
+        # mutation.
+        if any(a in inputs for a in new.all_input_nodes):
+            new.target = _out_of_place(n.target)
+        remap[n] = new
+    out = next(n for n in submod.graph.nodes if n.op == "output").args[0]
+    if isinstance(out, (list, tuple)):
+        g.output(tuple(remap[o] for o in out))
+    else:
+        g.output(remap[out])
+    g.lint()
+    return torch.fx.GraphModule(torch.nn.Module(), g)
+
+
+@contextlib.contextmanager
+def _lenient_verifier():
+    """
+    Tolerate a missing ``val`` on *unused* subgraph placeholders during export.
+
+    A ``while_loop`` cond subgraph receives every operand as an additional-input
+    even when it only reads the loop counter; torch.export does not populate a
+    ``val`` for the operands the cond never touches, which the export verifier
+    rejects.  Those placeholders are never executed, so it is safe to skip the
+    check for them (genuine missing-val errors on used nodes still raise).
+    """
+    orig = _verifier._check_val
+
+    def _check(node):
+        try:
+            orig(node)
+        except Exception:
+            if node.op == "placeholder" and not node.users:
+                return
+            raise
+
+    _verifier._check_val = _check
+    try:
+        yield
+    finally:
+        _verifier._check_val = orig
+
+
+def _is_writeout_wrapper(n: Node) -> bool:
+    """A ``clone`` / multi-output ``getitem`` that only feeds output stores --
+    the boundary between an op's compute and the slot write.  It is peeled off
+    a store's source and left outside the outlined module."""
+    return (
+        n.op == "call_function"
+        and n.target in (torch.ops.aten.clone.default, operator.getitem)
+        and bool(n.users)
+        and all(u.target is voyager.insert.default for u in n.users)
+    )
+
+
+def _on_datapath(n: Node) -> bool:
+    """A node the fused kernel computes over -- compute, cast, or relayout.
+
+    A kernel reads tiles from SRAM and ends each result in a ``voyager.insert``,
+    so the buffer primitives are the boundary: everything outside the two
+    compute namespaces stops the walk (``voyager.*``, the HOPs, ``getitem``,
+    loop-counter arithmetic), as does everything that is not a
+    ``call_function`` (placeholders, ``get_attr``).  Target-based, not
+    value-based -- the freshly exported body carries no shapes yet.
+
+    ``_local_scalar_dense`` is the datapath -> control-processor boundary and
+    stops the walk with them.  What it reads out of a buffer is an index, a
+    count or a running offset, and everything computed from it is control logic
+    the emitter tags ``op: "cpu"`` -- not work the array does.  Excluding it
+    keeps a counter's arithmetic out of the outlined op whether the counter
+    is a Python int (whose ``operator.*`` ops are already outside both
+    namespaces) or a 0-D tensor (whose ``aten`` ops would otherwise be walked
+    straight through).
+    """
+    if n.op != "call_function":
+        return False
+    if n.target is torch.ops.aten._local_scalar_dense.default:
+        return False
+    return getattr(n.target, "namespace", None) in ("aten", "quantized_ops")
+
+
+def _dps_op_nodes(seed: Node) -> set:
+    """The nodes forming one destination-passing op: ``seed`` (the node whose
+    result is ``insert``ed) plus its datapath ancestors, up to the load
+    boundary.
+
+    Grown *upward only*: an op owns exactly the compute its stored tile
+    depends on.  The tile loads (placeholders, ``subview``s) end each branch,
+    and another op's store, which this one reads back through a buffer rather
+    than an SSA edge, is never crossed -- so the ops a reduction splits across
+    bodies come out disjoint without the walk knowing they exist.
+    """
+    nodes, stack = set(), [seed]
+    while stack:
+        n = stack.pop()
+        if n in nodes or not _on_datapath(n):
+            continue
+        nodes.add(n)
+        stack.extend(n.all_input_nodes)
+    return nodes
+
+
+def outline_dps_ops(gm: GraphModule) -> None:
+    """Outline each cluster of compute ending at a store into its own nested
+    ``call_module`` -- one destination-passing op apiece -- recursing through
+    the loop / cond / commit bodies.
+
+    A bufferized kernel is a set of such ops -- a GEMM tile, a fused tail, a
+    reduction's per-round accumulate -- each ending in one ``voyager.insert``.
+    The store is the anchor: seed from every ``insert`` and grow the datapath
+    above it (:func:`_dps_op_nodes`).  Nothing here decides whether an op is a
+    GEMM, a tail, or an accumulate, nor whether the reduction is single-tile,
+    software-pipelined, or async-flattened -- the buffer stores that separate
+    those cases are exactly the op boundaries, so one rule spans them all.
+    """
+    for node in list(gm.graph.nodes):
+        if node.op == "get_attr":
+            sub = getattr(gm, str(node.target), None)
+            if isinstance(sub, GraphModule):
+                outline_dps_ops(sub)
+
+    # An op's result leaves the body one of two ways: an in-kernel ``insert``
+    # (a tile store) or the body's ``output`` -- a cond branch / loop body whose
+    # returned value the parent stores.  Seed from both: a reduction's
+    # ``accumulate`` branch only *returns* ``gemm + scratch`` with no insert of
+    # its own, yet its ``gemm``->``add`` must still fuse into one op.  A returned
+    # buffer (a carried alloc, a sub-loop getitem) is not on the datapath and is
+    # skipped.  A multi-output node (quantize_mx) is stored by several inserts,
+    # or returned by a with_scratch region through its getitems, that all peel
+    # to the same seed, so it stays a single outlined op, its getitem users
+    # left outside.
+    seeds = []
+
+    def _add_seed(src):
+        while _is_writeout_wrapper(src):
+            src = src.args[0]
+        if _on_datapath(src) and src not in seeds:
+            seeds.append(src)
+
+    for n in gm.graph.nodes:
+        if n.target is voyager.insert.default:
+            _add_seed(n.args[0])
+        elif n.op == "output":
+            for o in n.all_input_nodes:
+                _add_seed(o.args[0] if o.target is operator.getitem else o)
+
+    consumed = set()
+    for seed in seeds:
+        if seed in consumed:
+            continue
+        nodes = _dps_op_nodes(seed)
+        # A view / same-dtype cast is no work -- the code generator drops it --
+        # so an op with a single real node stores through its own insert and
+        # needs no wrapping.  Skip an op overlapping one already outlined (a
+        # shared operand's compute), which would double-extract it.
+        real = [n for n in nodes if not is_nop(n)]
+        if len(real) < 2 or nodes & consumed:
+            continue
+        create_and_insert_subgraph(list(nodes), gm)
+        consumed |= nodes
+
+    gm.graph.lint()
+    gm.recompile()
+
+
+def _strip_assert_scalars(gm: torch.fx.GraphModule) -> None:
+    """Drop export's deferred ``aten._assert_scalar`` range-checks — and the
+    ``getitem`` / ``ge`` / ``le`` nodes that feed only them — recursing into
+    ``while_loop`` / ``cond`` body subgraphs.
+
+    A guarded ``torch.cond`` (the async-DMA wait guards) returns an ``int``
+    (1 / 0) to stay alive; export materializes that as an unbacked symint and
+    emits ``u >= 0`` / ``u <= 1`` deferred assertions on it.  They are provably
+    true no-ops and only clutter codegen.  The cond itself stays (it carries the
+    wait's side effect); only its dead int-output scaffolding is removed.
+    """
+    assert_op = torch.ops.aten._assert_scalar.default
+    for n in list(gm.graph.nodes):
+        if n.op == "call_function" and n.target is assert_op:
+            gm.graph.erase_node(n)
+    # Reverse sweep: the bool (``ge`` / ``le``) feeds only the now-gone assert,
+    # then the cond's ``getitem`` feeds only those bools — erase once userless.
+    sweep = {operator.ge, operator.le, operator.getitem}
+    changed = True
+    while changed:
+        changed = False
+        for n in reversed(list(gm.graph.nodes)):
+            if n.op == "call_function" and n.target in sweep and not n.users:
+                gm.graph.erase_node(n)
+                changed = True
+    for n in gm.graph.nodes:
+        if n.op == "get_attr":
+            sub = getattr(gm, str(n.target), None)
+            if isinstance(sub, torch.fx.GraphModule):
+                _strip_assert_scalars(sub)
+    gm.graph.lint()
+    gm.recompile()
+
+
+def _unpack_scratch_results(gm: torch.fx.GraphModule) -> None:
+    """Make each ``with_scratch`` returning one value return it bare rather
+    than as the one-element tuple export traces, recursing into every
+    subgraph, so the op it wraps is stored straight from the region with no
+    ``getitem`` between.  A region body several ``with_scratch`` share is
+    unpacked once."""
+    for n in list(gm.graph.nodes):
+        if n.op == "get_attr":
+            sub = getattr(gm, str(n.target), None)
+            if isinstance(sub, torch.fx.GraphModule):
+                _unpack_scratch_results(sub)
+        if n.target is not _WITH_SCRATCH or len(n.meta["val"]) != 1:
+            continue
+        sub = getattr(gm, str(n.args[0].target))
+        output = next(x for x in sub.graph.nodes if x.op == "output")
+        if isinstance(output.args[0], (tuple, list)):
+            output.args = (output.args[0][0],)
+            sub.recompile()
+        n.meta["val"] = n.meta["val"][0]
+        for user in list(n.users):
+            user.replace_all_uses_with(n)
+            gm.graph.erase_node(user)
+    gm.recompile()
+
+
+def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    """
+    Erase the unused tile-size int placeholders left by exporting with the tile
+    sizes as positional args.  Loop counters are plain ints, so there are no
+    lifted index-constant tensors to clean up.
+    """
+    for n in list(gm.graph.nodes):
+        if n.op == "placeholder" and not n.users:
+            gm.graph.erase_node(n)
+    # Only ``aten`` ops are safe to drop as dead code.  The ``voyager.*``
+    # primitives (notably the side-effecting ``async_copy`` / ``insert``) and
+    # the ``while_loop`` / ``cond`` HOPs carry side effects that DCE can't see — a
+    # bufferized loop writes its output through ``insert`` / ``async_copy``
+    # into an *additional-input* buffer, so the loop has no FX users and default
+    # DCE would delete it.  Treating every non-``aten`` node as impure keeps the
+    # loop machinery while still cleaning up dead ``aten`` compute.
+    gm.graph.eliminate_dead_code(
+        is_impure_node=lambda n: n.is_impure()
+        or (
+            n.op == "call_function"
+            and getattr(n.target, "namespace", None) != "aten"
+        )
+    )
+    gm.graph.lint()
+    gm.recompile()
+    # Drop export's deferred ``_assert_scalar`` range-checks on the guarded-wait
+    # conds' int outputs (no-ops for codegen; the impure-aware DCE keeps them).
+    _strip_assert_scalars(gm)
+    _unpack_scratch_results(gm)
+    return gm
+
+
+def _tag_loop_extents(gm, extents_per_level, depth=0) -> bool:
+    """Tag the nested ``while_loop`` chain with the per-dimension tile-grid
+    extents.
+
+    ``extents_per_level[d]`` is the list of extents (each a bare ``end`` count
+    or an ``(start, end, step)`` tuple) for the while_loop at nesting depth
+    ``d``.  The builders flatten an N-D grid into one ``while_loop``, so a level
+    with N extents is later emitted as N nested ``Loop`` protos.  Assumes one
+    loop per nesting level (a linear chain), which holds for these builders;
+    a level's loop may sit inside a ``cond`` branch, as a guarded gather does.
+
+    Returns:
+        Whether a loop at depth ``depth`` was found in ``gm``.
+    """
+    if depth >= len(extents_per_level):
+        return False
+    named = dict(gm.named_modules())
+    for n in gm.graph.nodes:
+        if n.op != "call_function":
+            continue
+        if n.target is torch.ops.higher_order.while_loop:
+            n.meta["loop_extents"] = extents_per_level[depth]
+            body = named.get(str(n.args[1].target))
+            if isinstance(body, torch.fx.GraphModule):
+                _tag_loop_extents(body, extents_per_level, depth + 1)
+            return True
+        if n.target is torch.ops.higher_order.cond:
+            for branch in n.args[1:3]:
+                sub = named.get(str(branch.target))
+                if not isinstance(sub, torch.fx.GraphModule):
+                    continue
+                if _tag_loop_extents(sub, extents_per_level, depth):
+                    return True
+    return False
+
+
+def stamp_csr_fill(gm, fill: float) -> None:
+    """Stamp ``CSR_FILL_META`` on every counted ``async_copy`` in ``gm``."""
+    for m in gm.modules():
+        if not isinstance(m, torch.fx.GraphModule):
+            continue
+        for n in m.graph.nodes:
+            if (
+                n.op == "call_function"
+                and n.target is voyager.async_copy.default
+                and get_arg_value(n, 11, "count", None) is not None
+            ):
+                n.meta[CSR_FILL_META] = fill

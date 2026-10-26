@@ -42,7 +42,7 @@ from voyager_compiler.codegen.reporting.model import (
     OpInfo,
     TimingRecord,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 
 # Trace entry tags.
 T_COMPUTE = 1

@@ -44,8 +44,9 @@ from unittest.mock import patch
 import torch
 from torch import nn
 from torch._decomp import core_aten_decompositions
-from torch._functorch import config as functorch_config
+from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.backends.common import aot_autograd
+from torch._functorch import config as functorch_config
 from torch._functorch._aot_autograd.descriptors import (
     BufferAOTInput,
     GradAOTOutput,
@@ -59,7 +60,6 @@ from torch._functorch.aot_autograd import (
     make_boxed_func,
 )
 from torch._functorch.partitioners import default_partition
-from torch._dispatch.python import enable_python_dispatcher
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.export._unlift import _check_inputs_match
 from torch.fx import CodeGen, Graph, GraphModule, Node
@@ -2005,7 +2005,7 @@ class TrainingStep:
         compile: Run the steps the caller does not ask to run eagerly as the
             compiled program; otherwise every step runs eagerly.
         lower: Rewrites the program's quantized GEMMs as real kernels in
-            place, such as ``backend.gpu.lower_training``; None keeps the
+            place; None keeps the
             fake-quants.
     """
 

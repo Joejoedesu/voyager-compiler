@@ -15,14 +15,6 @@ import torch
 from torch.fx import GraphModule, Node
 
 import interstellar
-
-# Reporting estimates with Voyager's formulas for now; they are to be made
-# backend-general.
-from voyager_compiler.backend.voyager.vector import (
-    gemv_lanes,
-    pool_taps,
-    vector_op_utilization,
-)
 from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
@@ -33,7 +25,15 @@ from voyager_compiler.codegen.node_info import (
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
+
+# Reporting estimates with Voyager's formulas for now; they are to be made
+# backend-general.
+from voyager_compiler.targets.voyager.implementations.vector import (
+    gemv_lanes,
+    pool_taps,
+    vector_op_utilization,
+)
 
 
 def _val(node):

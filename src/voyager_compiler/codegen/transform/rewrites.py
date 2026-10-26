@@ -1,9 +1,11 @@
 import logging
+import math
 import re
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx import Graph, GraphModule, Interpreter, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
@@ -13,6 +15,7 @@ from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 from voyager_compiler.codegen.aten_classifier import is_elementwise_op
 from voyager_compiler.codegen.node_info import (
     _pair,
+    dtype_byte_size,
     get_arg_value,
     is_gemm_op,
     is_nop,
@@ -30,9 +33,9 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 from voyager_compiler.shape_prop import (
     fetch_attr,
     propagate_shape,
-    set_node_value,
-    written_buffers,
     run_op,
+    set_node_value,
+    written_values,
 )
 
 logger = logging.getLogger(__name__)
@@ -360,7 +363,9 @@ def replace_conv2d_with_im2col(model: GraphModule):
     return model
 
 
-def extract_input_preprocessor(model: GraphModule, input_name=None):
+def extract_input_preprocessor(
+    model: GraphModule, input_name=None, *, additional_ops=()
+):
     """
     Extract the input preprocessing operations from the given FX GraphModule
     and create a separate GraphModule.
@@ -387,13 +392,18 @@ def extract_input_preprocessor(model: GraphModule, input_name=None):
 
     user = next(iter(placeholder.users))
 
-    while is_nop(user) or user.target in [
-        torch.ops.aten.permute.default,
-        torch.ops.aten.transpose.int,
-        torch.ops.aten.im2col.default,
-        torch.ops.aten.pad.default,
-        torch.ops.quantized_ops.quantize.default,
-    ]:
+    while (
+        is_nop(user)
+        or user.target in additional_ops
+        or user.target
+        in [
+            torch.ops.aten.permute.default,
+            torch.ops.aten.transpose.int,
+            torch.ops.aten.im2col.default,
+            torch.ops.aten.pad.default,
+            torch.ops.quantized_ops.quantize.default,
+        ]
+    ):
         preprocess_nodes.extend(
             n for n in user.all_input_nodes if n not in preprocess_nodes
         )
@@ -479,61 +489,196 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     model.recompile()
 
 
-def _producer_graph(node: Node, producers: Dict[Node, Graph]) -> Graph:
-    """The graph computing ``node``'s constant from the model's own buffers:
-    ``node`` over its inputs, each a ``get_attr`` of an original buffer or
-    the copied-in producer of a constant this pass folded earlier."""
-    graph = Graph()
-    remap = {}
-    for inp in node.all_input_nodes:
-        src = producers.get(inp)
-        if src is None:
-            remap[inp] = graph.get_attr(inp.target)
+# Deliberately finite: an unrecognized function, random op or stateful op
+# must not become a constant just because its FX inputs happen to be static.
+_STATIC_TRANSFORMS = {
+    "view",
+    "reshape",
+    "_unsafe_view",
+    "flatten",
+    "unflatten",
+    "squeeze",
+    "unsqueeze",
+    "transpose",
+    "permute",
+    "t",
+    "movedim",
+    "swapaxes",
+    "swapdims",
+    "alias",
+    "detach",
+    "clone",
+    "contiguous",
+    "lift_fresh_copy",
+    "slice",
+    "narrow",
+    "select",
+    "index_select",
+    "gather",
+    "expand",
+    "_to_copy",
+    "to",
+    "type_as",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "neg",
+    "abs",
+    "clamp",
+    "clamp_min",
+    "clamp_max",
+    "minimum",
+    "maximum",
+    "reciprocal",
+    "sqrt",
+    "rsqrt",
+    "pow",
+    "exp",
+    "log",
+    "sin",
+    "cos",
+    "sum",
+    "mean",
+    "amax",
+    "amin",
+}
+_CONSTANT_GENERATORS = {
+    "arange",
+    "zeros",
+    "ones",
+    "full",
+    "eye",
+    "scalar_tensor",
+}
+_CASTS = {"_to_copy", "to", "type_as"}
+
+
+def constant_storage_bytes(node: Node) -> int:
+    """Encoded payload bytes of one independently stored constant.
+
+    Quantized metadata, explicit physical padding and sub-byte rounding count.
+    Distinct attributes are charged separately even if their eager tensors
+    alias: the emitter stores them separately. This is not compiler peak RAM
+    or a promise about a target's later packing/alignment overhead.
+    """
+    value = node.value
+    count = max(
+        value.numel(), math.prod(node.meta.get("physical_shape", value.shape))
+    )
+    dtype = node.meta.get("dtype") or value.dtype
+    return math.ceil(count * dtype_byte_size(dtype))
+
+
+def _static_op_name(node):
+    schema = getattr(node.target, "_schema", None)
+    if (
+        schema is None
+        or schema.is_mutable
+        or not schema.name.startswith("aten::")
+    ):
+        return None
+    return schema.name.removeprefix("aten::")
+
+
+def _constant_producer(node, model):
+    """Retain a deferred generator's recipe without depending on dead attrs."""
+    root, graph, remap = torch.nn.Module(), Graph(), {}
+    for i, inp in enumerate(node.all_input_nodes):
+        name = f"input_{i}"
+        if (producer := inp.meta.get("producer")) is not None:
+            root.add_module(name, producer)
+            remap[inp] = graph.call_module(name)
+        else:
+            root.register_buffer(name, fetch_attr(model, inp.target))
+            remap[inp] = graph.get_attr(name)
+    graph.output(graph.node_copy(node, lambda n: remap[n]))
+    return GraphModule(root, graph)
+
+
+def _fold_constant(model, node, *, generated=False):
+    graph = model.graph
+    resolve = lambda n: fetch_attr(model, n.target)
+    const = run_op(
+        node.target, map_arg(node.args, resolve), map_arg(node.kwargs, resolve)
+    )
+    # Real parameter-derived values need no recipe holding the old weights.
+    producer = (
+        _constant_producer(node, model)
+        if isinstance(const, FakeTensor)
+        else None
+    )
+    src = next((n.target for n in node.all_input_nodes), "const")
+    prefix = (
+        node.meta.get("constant_name")
+        or re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
+    )
+    # A compact contiguous buffer avoids retaining a slice's larger backing.
+    const = const.contiguous()
+    with graph.inserting_before(node):
+        attr = create_getattr_from_value(model, graph, prefix, const, producer)
+    for key in ("dtype", "physical_shape"):
+        if key in node.meta:
+            attr.meta[key] = node.meta[key]
+    set_node_value(attr, const)
+    if generated:
+        attr.meta["constant_generator"] = True
+    inputs = node.all_input_nodes
+    node.replace_all_uses_with(attr)
+    graph.erase_node(node)
+    for inp in inputs:
+        if inp.op != "get_attr" or inp.users:
             continue
-        local = {}
-        for n in src.nodes:
-            if n.op == "output":
-                remap[inp] = local[n.args[0]]
-                break
-            local[n] = graph.node_copy(n, lambda x: local[x])
-    graph.output(graph.node_copy(node, lambda x: remap[x]))
-    return graph
+        graph.erase_node(inp)
+        if any(
+            n.op == "get_attr" and n.target == inp.target for n in graph.nodes
+        ):
+            continue
+        # An opaque module can still use an attribute internally.
+        if any(
+            n.op == "call_module" and inp.target.startswith(str(n.target) + ".")
+            for n in graph.nodes
+        ):
+            continue
+        path, _, name = str(inp.target).rpartition(".")
+        owner = fetch_attr(model, path) if path else model
+        delattr(owner, name)
+    return attr
 
 
-def fold_constant_generators(model: GraphModule):
-    """Constant-fold ``call_function`` nodes whose inputs are all constants:
-    input-free generators (``arange`` / ``zeros`` / …) and, transitively, any op
-    fed only by already-folded constants — so a whole constant subgraph (e.g.
-    RoPE's ``arange -> … -> cos/sin`` position setup) collapses to one
-    ``get_attr`` buffer and is not lowered or scheduled as a compute op.
+def fold_constant_generators(model: GraphModule, *, phase="normalize"):
+    """Prepare static tensors without growing their stored representations.
 
-    Walking in program order, a node is constant iff every FX-Node input is a
-    ``get_attr`` (an initial buffer or one this pass just created) that the
-    graph never writes.  A ``full_like`` reads only its input's shape, so it
-    becomes a ``full`` of that shape first.  A constant is evaluated by the
-    shape-propagation rule: real when it descends from parameters alone, a
-    fake stand-in when it descends from a generator, as a causal mask does.
-    Either way the chain that produced it is kept on the new ``get_attr``
-    node as ``meta['producer']``, a graph over the model's own buffers, so a
-    real run can compute the tensor when it needs it.  A buffer this pass
-    created is deleted as soon as its last reader folds; its producer lives
-    on inside its readers'.
+    Retain existing deterministic generator setup (including transitive mask
+    and position-table computation and shape-only ``full_like``). It creates
+    constants; its final prepared bytes are reported separately. Then discover
+    bounded, pure parameter-only transform components, and fold a component
+    only when its final outputs
+    cost no more bytes than the input attributes it makes entirely unused.
+    Shared originals, duplicate get_attrs and every escaping output count.
+    Intermediate transforms are not charged as stored final representations.
 
-    Args:
-        model: The graph to fold, in place.
+    Supported transforms cover shape/layout, subsetting, non-widening casts,
+    elementwise arithmetic and reductions. Parameter preparation excludes
+    expanding materialization and dequantization. Neither path bakes random,
+    unrecognized custom or stateful functions, or reads from mutable buffers.
+    Rejected operations remain ordinary graph operations for bufferization.
+    This runs again after layout selection so target-requested transposes use
+    the same policy. It is not a cost search over prepacking alternatives.
     """
     graph = model.graph
-    # A buffer the graph writes -- a KV cache, or a ``cond`` operand -- is
-    # not a constant: what reads it must run every step.
-    written = written_buffers(graph)
-    constants = {
-        n for n in graph.nodes if n.op == "get_attr" and n.target not in written
-    }
-    producers: Dict[Node, Graph] = {}
-
-    def resolve(n: Node):
-        return fetch_attr(model, n.target)
-
+    # Exported tensor literals often have lift_fresh_copy -> detach_. For a
+    # fresh, already non-grad value the latter changes no state; functionalize
+    # that identity so it cannot block deterministic constant setup.
+    for node in graph.nodes:
+        if node.target is torch.ops.aten.detach_.default:
+            source = node.args[0]
+            if (
+                source.target is torch.ops.aten.lift_fresh_copy.default
+                and not getattr(source.value, "requires_grad", True)
+                and not getattr(source.meta.get("val"), "requires_grad", False)
+            ):
+                node.target = torch.ops.aten.detach.default
     for node in list(graph.nodes):
         if node.target is torch.ops.aten.full_like.default:
             value = node.value
@@ -547,50 +692,151 @@ def fold_constant_generators(model: GraphModule):
             node.replace_all_uses_with(full)
             graph.erase_node(node)
             node = full
-        if node.op != "call_function" or any(
-            inp not in constants for inp in node.all_input_nodes
-        ):
-            continue
-        # Folding a dequantize offsets the benefit of quantizing the params.
-        if node.target is torch.ops.quantized_ops.dequantize.default:
-            continue
-        if not isinstance(getattr(node, "value", None), torch.Tensor):
-            continue
-        # Folding a real expand materializes the replication it stands for,
-        # which bufferization would otherwise absorb into indexing; one that
-        # only fills in ``-1`` dims is a view of its input and folds through.
-        if (
-            node.target is torch.ops.aten.expand.default
-            and node.value.shape != node.args[0].value.shape
-        ):
-            continue
-        args = map_arg(node.args, resolve)
-        kwargs = map_arg(node.kwargs, resolve)
-        const = run_op(node.target, args, kwargs)
-        inputs = node.all_input_nodes
-        producer = _producer_graph(node, producers)
-        src = next((n.target for n in inputs), "const")
-        prefix = re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
-        with graph.inserting_before(node):
-            attr = create_getattr_from_value(
-                model, graph, prefix, const, GraphModule(model, producer)
-            )
-        attr.meta["dtype"] = node.meta.get("dtype")
-        set_node_value(attr, const)
-        node.replace_all_uses_with(attr)
-        graph.erase_node(node)
-        constants.add(attr)
-        producers[attr] = producer
-        for inp in inputs:
-            if inp in producers and not inp.users:
-                delattr(model, inp.target)
-                graph.erase_node(inp)
-                del producers[inp]
-                constants.discard(inp)
 
+    mutated = written_values(graph)
+    written = {n.target for n in mutated if n.op == "get_attr"}
+    roots = {
+        n
+        for n in graph.nodes
+        if n.op == "get_attr"
+        and n.target not in written
+        and isinstance(getattr(n, "value", None), torch.Tensor)
+    }
+    candidates, parent = set(), {}
+    known = set(roots)
+    generated = {n for n in roots if n.meta.get("constant_generator")}
+
+    def find(n):
+        parent.setdefault(n, n)
+        if parent[n] is not n:
+            parent[n] = find(parent[n])
+        return parent[n]
+
+    # Two get_attrs for the same attribute are one deployment allocation.
+    by_target = {}
+    for n in roots:
+        if n.target in by_target:
+            parent[find(n)] = find(by_target[n.target])
+        by_target[n.target] = n
+    for node in graph.nodes:
+        name = _static_op_name(node) if node.op == "call_function" else None
+        inputs = node.all_input_nodes
+        if (
+            node in mutated
+            or any(n not in known for n in inputs)
+            or not isinstance(getattr(node, "value", None), torch.Tensor)
+        ):
+            continue
+        # Existing deterministic generator setup (causal masks, position
+        # tables) is constant creation, not optional weight prepacking.
+        # Preserve the entire setup chain, including broadcasts/matmuls.
+        generator = (not inputs and name in _CONSTANT_GENERATORS) or (
+            (
+                name is not None
+                or node.target is torch.ops.quantized_ops.quantize.default
+            )
+            and any(n in generated for n in inputs)
+        )
+        tags = getattr(node.target, "tags", ())
+        if generator and not any(
+            tag in tags
+            for tag in (
+                torch.Tag.nondeterministic_seeded,
+                torch.Tag.nondeterministic_bitwise,
+            )
+        ):
+            if name == "expand" and node.value.shape != inputs[0].value.shape:
+                continue
+            generated.add(node)
+            known.add(node)
+            continue
+        if name not in _STATIC_TRANSFORMS or not inputs:
+            continue
+        # No per-op enlargement, including broadcast products and casts.
+        if constant_storage_bytes(node) > max(
+            constant_storage_bytes(n) for n in inputs
+        ):
+            continue
+        if (
+            name in _CASTS
+            and node.value.element_size() > inputs[0].value.element_size()
+        ):
+            continue
+        if name == "expand" and node.value.shape != inputs[0].value.shape:
+            continue
+        candidates.add(node)
+        known.add(node)
+        for inp in inputs:
+            parent[find(inp)] = find(node)
+
+    components = {}
+    for node in graph.nodes:
+        if node in candidates or node in roots and node in parent:
+            components.setdefault(find(node), set()).add(node)
+    accepted, decisions = set(), []
+    for members in components.values():
+        ops = members & candidates
+        if not ops:
+            continue
+        outputs = [
+            n
+            for n in graph.nodes
+            if n in ops and any(u not in ops for u in n.users)
+        ]
+        sources = {n.target for n in members & roots}
+        released = {
+            target
+            for target in sources
+            if all(
+                u in ops for n in roots if n.target == target for u in n.users
+            )
+        }
+        before = sum(constant_storage_bytes(by_target[t]) for t in released)
+        after = sum(constant_storage_bytes(n) for n in outputs)
+        permitted = after <= before
+        decisions.append(
+            dict(
+                inputs=sorted(sources),
+                outputs=[n.name for n in outputs],
+                released_bytes=before,
+                prepared_bytes=after,
+                folded=permitted,
+                reason=(
+                    "no_storage_growth"
+                    if permitted
+                    else "retained_inputs_or_extra_outputs"
+                ),
+            )
+        )
+        if permitted:
+            accepted.update(ops)
+
+    prepared_generators = set()
+    for node in list(graph.nodes):
+        if node.op != "call_function" or any(
+            n.op != "get_attr" for n in node.all_input_nodes
+        ):
+            continue
+        if node in accepted or node in generated:
+            attr = _fold_constant(model, node, generated=node in generated)
+            if node in generated:
+                prepared_generators.add(attr)
     graph.eliminate_dead_code()
     graph.lint()
     model.recompile()
+    # Keep empty module namespaces: later parameter-based node naming uses
+    # them to avoid collisions. Prepared attributes were retired above.
+    model.meta.setdefault("constant_folding", []).append(
+        dict(
+            phase=phase,
+            generator_bytes=sum(
+                constant_storage_bytes(n)
+                for n in graph.nodes
+                if n in prepared_generators
+            ),
+            components=decisions,
+        )
+    )
 
 
 def remove_zero_attention_mask(model: GraphModule, example_inputs):

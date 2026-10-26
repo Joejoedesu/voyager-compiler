@@ -1,0 +1,85 @@
+{
+  "implementation": {
+    "repository": "https://github.com/Joejoedesu/voyager-compiler",
+    "checkout": "/home/zhouhua/Research/ML/AGEN-voyager/voyager",
+    "branch": "integration/agent-framework",
+    "base_commit": "cef1e7e42b31e1cfcc01a1e4e02cedab11e3e9ef"
+  },
+  "design": {
+    "path": "reports/voyager-final-architecture-assets/architecture.json",
+    "sha256": "b01af72dc658a5727b7c7e240d4f8daa82cbafafe0b9bc67c85fc8a79885777b"
+  },
+  "voyager": {
+    "baseline": {
+      "path": "reference-point/baseline.json",
+      "sha256": "2df010a5628c7ef5f5112c9dd3bd3683d838cc9d11aa42ca7639299f52da522c"
+    },
+    "commands": {
+      "path": "reference-point/metadata/baseline-2026-09-27_01-41-40/commands.txt",
+      "sha256": "4e0741fc13b36392bbe05dfc79816fc5fcb6f69bce144615757e476ac9fc0dea"
+    },
+    "run": "2026-09-27_01-41-40",
+    "acceptance": [
+      "identical selected model hashes",
+      "unchanged selected case statuses",
+      "unchanged selected numerical summaries",
+      "no selected case compilation failures"
+    ],
+    "snapshot_cases": 26,
+    "snapshot_generated_models": 25,
+    "snapshot_runner_exit_code": 1,
+    "selected_cases": [
+      "resnet18/E4M3/16x16",
+      "resnet18/E4M3/32x64",
+      "resnet50/E4M3/32x64",
+      "mobilebert_encoder/E4M3/16x16",
+      "mobilebert_encoder/E4M3/4x8",
+      "resnet18/INT8/16x16",
+      "mobilenet_v2/MXINT8/16x16",
+      "llama_prefill/MXNF4/64x64",
+      "llama_prefill_mp/MXNF4/64x64",
+      "llama_decode/MXNF4/64x64",
+      "vit/MXNF4/64x64"
+    ],
+    "suite": {
+      "path": "validation/voyager-suite.txt",
+      "sha256": "9e85469f4c5db5587f60347707ed4515cbc1f65af55f26458ffc8b1ed8e651e4"
+    },
+    "expected_selected_compile_failures": 0,
+    "artifact_replacements": {
+      "llama_decode/MXNF4/64x64": {
+        "path": "reference-point/voyager-decode-corrected-2026-10-23/reference.json",
+        "sha256": "fbdea581d775635a83446a57dd521845ad6a88bfbbb15d4dc0f84959ef7eef38"
+      }
+    }
+  },
+  "alpha_yolo": {
+    "directory": "reference-point/alpha-yolov5n05-2026-10-23",
+    "provenance": {
+      "path": "reference-point/alpha-yolov5n05-2026-10-23/provenance.json",
+      "sha256": "09819cd2f21f27c642132a84c0d22c81ad8f4e03df9844936e265405db4d8a57"
+    },
+    "validation": {
+      "path": "reference-point/alpha-yolov5n05-2026-10-23/validation.json",
+      "sha256": "18442be058984b7019d63180bbae7c2b06b4de39f68e02afef55e2ea349d0d67"
+    },
+    "artifact_checksums": {
+      "path": "reference-point/alpha-yolov5n05-2026-10-23/checksums.sha256",
+      "sha256": "dc44877d33fbea49e81b4f47a9b32122acccf56cb36dcaedf6820055f2417fdd"
+    },
+    "input_shape": [
+      1,
+      1,
+      192,
+      192
+    ],
+    "calibration_steps": 0,
+    "seed": 0,
+    "checkpoint_sha256": "9f7cdbcf5cd63f454c47b18e7400a69630b96a01efb7559367e91b6e962ad3bd",
+    "required_emitted_layers": 144,
+    "required_numerical_outputs": 3,
+    "scope": "Compiler/reference collateral; no claim of device execution or accuracy"
+  },
+  "reference_policy": "Read-only frozen inputs; capture implementation runs in fresh directories and record actual imported compiler paths.",
+  "result_policy": "Run status is recorded in fresh candidate comparison.json files, separately from these reference pins."
+}

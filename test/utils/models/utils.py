@@ -1,6 +1,7 @@
 import os
 
 import torch
+
 from voyager_compiler import (
     capture_training,
     compile,
@@ -10,16 +11,22 @@ from voyager_compiler import (
     transform,
     update_program,
 )
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.shape_prop import ShapeProp
 
 
 def get_transform_args(args, fusion_patterns):
+    policy = getattr(args, "layout_policy", None)
+    tensor_layout = args.tensor_layout
+    gemm_layout = args.gemm_layout
+    if policy is not None:
+        tensor_layout = "nhwc" if policy == "systolic" else "nchw"
+        gemm_layout = "xc,ck" if policy == "systolic" else "xc,kc"
     return {
         "patterns": fusion_patterns,
         "config": AcceleratorConfig.from_args(args),
-        "tensor_layout": args.tensor_layout,
-        "gemm_layout": args.gemm_layout,
+        "tensor_layout": tensor_layout,
+        "gemm_layout": gemm_layout,
         "gemv_layout": args.gemv_layout,
         "fuse_reshape": not args.disable_reshape_fusion,
         "keep_fp32": not args.remove_fp32_casts,

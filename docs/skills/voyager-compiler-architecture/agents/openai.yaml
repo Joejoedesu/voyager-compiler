@@ -1,0 +1,4 @@
+interface:
+  display_name: "Voyager Compiler Architecture"
+  short_description: "Implement Voyager stages, extensions, and pinned regressions"
+  default_prompt: "Use $voyager-compiler-architecture to implement a change in the shared bufferized flow or a documented extension and validate the pinned reference gates."

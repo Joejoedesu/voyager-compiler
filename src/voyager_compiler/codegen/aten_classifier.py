@@ -675,6 +675,7 @@ _QUANTIZED_COMPUTE_OPS = (
     "matmul_mx",
     "max_pool2d",
     "quantize",
+    "quantize_symmetric",
     "quantize_affine",
     "quantize_mx",
     "quantize_mx_outlier",
@@ -685,7 +686,7 @@ _QUANTIZED_COMPUTE_OPS = (
     "vmap",
 )
 
-_QUANTIZED_ELEMENTWISE_OPS = ("dequantize", "quantize", "vmap")
+_QUANTIZED_ELEMENTWISE_OPS = ("dequantize", "quantize", "quantize_symmetric", "vmap")
 
 # Hand-maintained.  ATen compute ops the corpus never exports, because
 # models write them out by hand, but that a compiler rewrite emits.
@@ -722,9 +723,13 @@ def _elementwise_ops() -> frozenset:
 
 def is_compute_op(node: Node) -> bool:
     """Whether ``node`` performs arithmetic -- a kernel, not data movement."""
-    return node.target in _compute_ops()
+    from voyager_compiler.extensions import registry
+    custom = registry.operators.get(node.target)
+    return node.target in _compute_ops() or (custom is not None and custom.compute)
 
 
 def is_elementwise_op(node: Node) -> bool:
     """Whether ``node`` maps one output element per input element."""
-    return node.target in _elementwise_ops()
+    from voyager_compiler.extensions import registry
+    custom = registry.operators.get(node.target)
+    return node.target in _elementwise_ops() or (custom is not None and custom.elementwise)

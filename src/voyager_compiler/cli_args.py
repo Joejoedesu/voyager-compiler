@@ -1,6 +1,6 @@
 import argparse
 
-from voyager_compiler.hardware_config import (
+from voyager_compiler.hardware import (
     DEFAULT_ACCUM_BUFFER_SIZE,
     DEFAULT_DOUBLE_BUFFERED_L2,
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
@@ -13,17 +13,17 @@ from voyager_compiler.hardware_config import (
     DEFAULT_SCRATCHPAD_OFFSET,
     DEFAULT_WEIGHT_BUFFER_SIZE,
 )
-from voyager_compiler.quantization import (
-    DEFAULT_AMAX_HISTORY_LEN,
-    DEFAULT_BACKWARD_OVERRIDE,
-    BACKWARD_OVERRIDES,
-)
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
     GEMM_LAYOUTS,
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
+)
+from voyager_compiler.quantization import (
+    BACKWARD_OVERRIDES,
+    DEFAULT_AMAX_HISTORY_LEN,
+    DEFAULT_BACKWARD_OVERRIDE,
 )
 from voyager_compiler.utils import SLURM_ARGS
 
@@ -86,6 +86,17 @@ def _gemm_kinds(value: str):
 def add_quantization_args(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--numerics_recipe",
+        choices=("native", "voyager_reference_20260927"),
+        default="native",
+        help="Explicit frontend numerical policy; the historical Voyager recipe approximates RMSNorm with LayerNorm.",
+    )
+    parser.add_argument(
+        "--force_scale_power_of_two",
+        action="store_true",
+        help="Compatibility shorthand for power_2_scale=1 on the supplied quantization specs.",
+    )
     parser.add_argument(
         "--activation",
         default=None,
@@ -305,6 +316,13 @@ def add_layout_args(parser):
     Args:
         parser: The ``argparse.ArgumentParser`` to extend.
     """
+    parser.add_argument(
+        "--layout_policy",
+        choices=("torch", "systolic"),
+        default=None,
+        help="Compatibility preset: systolic selects nhwc and xc,ck GEMMs; "
+        "torch selects nchw and xc,kc. Prefer the explicit layout options.",
+    )
     parser.add_argument(
         "--tensor_layout",
         choices=TENSOR_LAYOUTS,

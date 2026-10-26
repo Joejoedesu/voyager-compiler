@@ -45,15 +45,12 @@ import torch.nn.functional as F
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
 )
-from test_codegen import MXU_OPS, FUSION_PATTERNS, _can_fuse  # noqa: E402
-
 from voyager_compiler import (  # noqa: E402
-    OpMatcher,
     compile,
     export_model,
     transform,
 )
-from voyager_compiler.backend.trainium import (  # noqa: E402
+from voyager_compiler.targets.trainium import (  # noqa: E402
     LAYOUT,
     TRN2,
     TRN3,
@@ -63,25 +60,10 @@ from voyager_compiler.backend.trainium import (  # noqa: E402
     record,
     translate,
 )
+from voyager_compiler.targets.trainium.fusion import FUSION_PATTERNS as PATTERNS
 
 TARGETS = {"trn2": TRN2, "trn3": TRN3}
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
-
-# Voyager's fusion patterns, plus an add then an RMS norm: alone, ahead of a
-# GEMM as its prologue, or after one as its tail.
-PATTERNS = FUSION_PATTERNS + [
-    [OpMatcher("add"), OpMatcher("rms_norm")],
-    [
-        OpMatcher("add"),
-        OpMatcher("rms_norm"),
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-    ],
-    [
-        OpMatcher(*MXU_OPS, predicate=_can_fuse),
-        OpMatcher("add"),
-        OpMatcher("rms_norm"),
-    ],
-]
 
 
 class LayerNorm(torch.nn.Module):

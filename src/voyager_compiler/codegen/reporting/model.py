@@ -10,7 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.hardware import AcceleratorConfig
 
 
 @dataclass

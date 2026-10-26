@@ -73,6 +73,14 @@ from quantization_configs import (  # noqa: E402
     set_residual_attention_qconfig,
 )
 
+# Historical reference names retain their numerical recipes.
+QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = QUANTIZATION_CONFIGS[
+    "mxlut4_int6_e5m3_attn_head_int6"
+]
+QUANTIZATION_CONFIGS["mxnf4_outlier"] = QUANTIZATION_CONFIGS[
+    "mxlut4_int6_e5m3_outlier"
+]
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
@@ -412,7 +420,17 @@ def quantize_model(
     example_input = torch.randn(
         1, seq, layernorm.weight.shape[-1], dtype=model.dtype
     )
-    match_and_fuse_rms_norm(gm, layernorm, (example_input,))
+    historical_numerics = args.numerics_recipe == "voyager_reference_20260927"
+    if historical_numerics:
+        from voyager_compiler.targets.voyager.numerics import (
+            remove_softmax_dtype_cast,
+            replace_rmsnorm_with_layer_norm,
+        )
+
+        remove_softmax_dtype_cast(gm)
+        replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
+    else:
+        match_and_fuse_rms_norm(gm, layernorm, (example_input,))
 
     if kivi:
         set_kivi_attention_qconfig(quantizer)
@@ -426,7 +444,12 @@ def quantize_model(
         )
         qconfig = QuantizationConfig(fp8_qspec, None, None, None)
         quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-        quantizer.set_object_type(torch.ops.aten.rms_norm.default, qconfig)
+        norm_op = (
+            torch.ops.aten.layer_norm.default
+            if historical_numerics
+            else torch.ops.aten.rms_norm.default
+        )
+        quantizer.set_object_type(norm_op, qconfig)
 
     # The HF export builds the causal mask in-graph: a ``where`` over the
     # boolean mask that the attention scores' ``add`` reads.  In prefill the
