@@ -339,14 +339,15 @@ def add_layout_args(parser):
         help="Matrix-matrix GEMM layout, the activation's then the weight's, "
         "in C (contraction), K (output features) and X (tokens): xc,kc is "
         "PyTorch's, xc,ck stores the weight [contraction, out], cx,ck also "
-        "stores the activations between GEMMs [features, tokens].",
+        "stores the activations between GEMMs [features, tokens]. "
+        "Explicit output forms such as cx,ck->xk are also accepted.",
     )
     parser.add_argument(
         "--gemv_layout",
         choices=GEMV_LAYOUTS,
         default=DEFAULT_GEMM_LAYOUT,
         help="Matrix-vector GEMM layout (a single activation row): xc,kc or "
-        "xc,ck.",
+        "xc,ck; explicit ->xk output forms are also accepted.",
     )
 
 

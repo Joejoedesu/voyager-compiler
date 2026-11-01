@@ -18,6 +18,11 @@ invariants; this page owns the default target's bindings and regression scope.
 Other hooks retain shared defaults. Workload/frontends own export/calibration;
 shared search, bufferization and allocation own their normal stages.
 
+With `accumulate_fp32`, split reductions produce FP32 partials before adding them
+and round the completed result at its output boundary. GEMV search reserves the
+corresponding FP32 accumulator. MX matrix operations combine the dense product,
+scaling, bias and sparse outlier contribution before the final output rounding.
+
 ## Grouped and depthwise dispatch
 
 `voyager.depthwise` and `voyager.grouped` explicitly select the existing

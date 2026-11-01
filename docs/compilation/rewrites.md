@@ -64,6 +64,12 @@ A physical reservation alone neither fills invalid lanes nor makes their reads s
 
 ## Layout and static preparation
 
+GEMM operations accept explicit output layouts such as `cx,ck->kx` as well as
+the existing `cx,ck,kx` spelling; default-output forms may still omit `->xk`.
+Encoding keeps the established spelling. `quantized_ops.conv2d` accepts `layout`
+and `out_dtype`; new rewrites state `nchw` or `nhwc` explicitly. Its omitted-layout
+default remains NHWC for compatibility with the former generated convolution twin.
+
 Layout policy changes how operations read operands. Static preparation decides
 whether an immutable transform can be evaluated once and stored. One does not
 imply the other: a layout transpose may remain at runtime when its source is

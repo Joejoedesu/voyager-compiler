@@ -6,12 +6,16 @@ built by the shared builders.
   for a transcendental and on VectorE otherwise; a K-major RMS norm squares
   its blocks on ScalarE, sums them across the partitions on TensorE and
   scales them on VectorE, 512 columns at a time (``rms_norm_kmajor_busy``).
-- A vector op on one row lays it out as the translator does: a flat op --
-  an elementwise chain, or an RMS norm alone -- cuts the row across the
-  partitions (``spread_partitions``) and runs on every one, a norm summing
-  its partitions' squares by a ones-matmul (``rms_norm_spread_busy``); any
-  other op runs on one partition, a one-row operand copied onto each
-  partition the op's rows take.
+- A vector op lays its tile out as the translator does: a flat op -- an
+  elementwise chain whose operands are each the result's size or one
+  element, or an RMS norm alone on one row -- cuts the tile in row-major
+  order across the partitions (``spread_partitions``) and runs on every
+  one, a norm summing its partitions' squares by a ones-matmul
+  (``rms_norm_spread_busy``); any other op puts its rows on the
+  partitions, an operand of fewer rows copied onto each partition the op's
+  rows take, row ``p % rows`` onto partition ``p``.  An engine reads an
+  operand on the partition it writes, so a tiling whose operand rows do not
+  lie there (``on_reading_partitions``) does not fit.
 - A 2-D max pool puts one output row on each partition: partition ``p``
   holds the ``kH`` input rows output row ``p`` reads side by side on its
   free axis, loaded as one strip, and VectorE takes ``kH - 1`` vertical
@@ -21,12 +25,14 @@ built by the shared builders.
 import math
 from collections import Counter
 
+import numpy as np
 import torch
 
 from voyager_compiler.codegen.node_info import (
     _pair,
     get_anchor_node,
     get_arg_value,
+    require_allocation,
 )
 from voyager_compiler.compiler.search.lowering import (
     pool_operand_shapes,
@@ -166,6 +172,23 @@ def rms_norm_spread_busy(model, free):
     )
 
 
+def on_reading_partitions(tile, out_tile):
+    """Whether each row of an operand's ``tile`` lies on the partition of
+    every row of a vector op's output tile ``out_tile`` that reads it, as
+    the translator lays it out: a tile of fewer rows than the partitions
+    the output takes copied onto each, row ``p % rows`` onto partition
+    ``p`` (``translate.Layout.replicated``), any other with row ``j`` on
+    partition ``j % 128``.  Only a tile broadcast along the output's rows
+    can miss."""
+    rows, out_rows = rows_cols(tile)[0], rows_cols(out_tile)[0]
+    if rows == 1 or rows >= out_rows:
+        return True
+    index = np.arange(rows).reshape(tile[:-1])
+    reads = np.broadcast_to(index, out_tile[:-1]).ravel()
+    partitions = np.arange(out_rows) % PARTITIONS
+    return np.array_equal(reads % PARTITIONS, partitions % rows)
+
+
 def _op_passes(node):
     """``(engine, share, bits)`` per pass a vector op's arithmetic makes over
     its tile: ``share`` is the fraction of the tile's columns it covers (an
@@ -211,9 +234,12 @@ class TrainiumVector(TrainiumGrid):
         kmajor_dtype: That RMS norm's element type.
         kmajor_post: The chain (``chain_ops``) after that RMS norm.
         group: The group of ops the translator runs (``group_ops``).
-        flat: The translator cuts a one-row tile of the group across the
+        flat: The translator may cut a tile of the group across the
             partitions (``row_parts``): it is an elementwise chain, or an
-            RMS norm alone.
+            RMS norm alone (on one row).
+        inputs: The shapes of the group's stored inputs
+            (``require_allocation``; a lookup table is not one), read only
+            for a ``flat`` group.
     """
 
     def __init__(self, node, model):
@@ -235,18 +261,48 @@ class TrainiumVector(TrainiumGrid):
         self.flat = not any(op.target in NOT_FLAT for op in ops) and (
             row_op is None or (row_op in RMS_NORM_OPS and len(ops) == 1)
         )
+        self.inputs = [
+            tuple(n.value.shape)
+            for n in node.all_input_nodes
+            if self.flat and require_allocation(n)
+        ]
 
     def row_parts(self, out_tile):
         """``(parts, spread)`` for an output tile ``out_tile``: the
-        partitions the translator lays the kernel's one-row tiles on, and
-        whether it cuts each row across them.  A flat op on one row cuts it
-        evenly across the most partitions it can (``spread_partitions``),
-        an operand of one element copied onto each; any other copies a
-        one-row operand onto each partition its rows take."""
+        partitions the translator lays the kernel's tiles on, and whether it
+        cuts them across them.  A flat op -- an RMS norm only on one row --
+        cuts its tiles evenly across the most partitions it can
+        (``spread_partitions``), an operand of one element copied onto each;
+        any other puts its rows on the partitions, an operand of fewer rows
+        copied onto each partition its rows take.  A flat op spreads only
+        when each stored input's tile -- its shape cut to ``out_tile``, a
+        broadcast dim staying 1 -- is the output tile's size or one
+        element."""
         rows, cols = rows_cols(out_tile)
-        if self.flat and rows == 1 and spread_partitions(cols) > 1:
-            return spread_partitions(cols), True
+        size = rows * cols
+        parts = spread_partitions(size)
+        flat = self.flat and all(
+            math.prod(min(d, t) for d, t in zip(s[::-1], out_tile[::-1]))
+            in (1, size)
+            for s in self.inputs
+        )
+        if flat and (rows == 1 or self.group[1] is None) and parts > 1:
+            return parts, True
         return min(rows, PARTITIONS), False
+
+    def fit(self, tiling):
+        """``TrainiumGrid.fit``, ``None`` also when an operand's rows do not
+        lie on the partitions of the output rows reading them
+        (``on_reading_partitions``)."""
+        shapes = self.operand_shapes(tiling)
+        out_tile = output_buffers(shapes[self.node], self.node)[-1][0]
+        if not all(
+            on_reading_partitions(shape, out_tile)
+            for n, shape in shapes.items()
+            if n is not self.node
+        ):
+            return None
+        return super().fit(tiling)
 
     def placement(self, tiling, shapes, moves):
         """The kernel's ``TrainiumPlacement``, its tiles cut into ``shapes``
@@ -264,7 +320,7 @@ class TrainiumVector(TrainiumGrid):
         (``scratch_regions``): a K-major RMS norm's
         (``rms_norm_kmajor_tiles``), an RMS norm's of a row cut across the
         partitions (``rms_norm_spread_tiles``), or the group's over the
-        tile's rows, a row so cut ``row_parts`` times narrower
+        tile's rows, a tile so cut ``row_parts`` elements to a partition
         (``group_tiles``)."""
         if self.kmajor_hidden:
             tiles = rms_norm_kmajor_tiles(
@@ -279,7 +335,7 @@ class TrainiumVector(TrainiumGrid):
                 # A quantize_mx's output: (scales, codes).
                 out_tile = out_tile[-1]
             parts, spread = self.row_parts(out_tile)
-            cols = out_tile[-1] // parts if spread else out_tile[-1]
+            cols = math.prod(out_tile) // parts if spread else out_tile[-1]
             if spread and self.group[1] is not None:
                 tiles = rms_norm_spread_tiles(cols)
             else:
@@ -297,8 +353,8 @@ class TrainiumVector(TrainiumGrid):
         return vector_transfers(self.node, shapes, tiling.grid)
 
     def cost(self, tiling, placement):
-        """The tile sweep in TensorE cycles, and its DRAM bytes, a one-row
-        tile laid out as ``row_parts`` says: an RMS norm of a row cut across
+        """The tile sweep in TensorE cycles, and its DRAM bytes, the tile
+        laid out as ``row_parts`` says: an RMS norm of a row cut across
         the partitions makes its instructions one after another
         (``rms_norm_spread_busy``).  ``placement`` is the contract's."""
         model = self.model
@@ -308,7 +364,7 @@ class TrainiumVector(TrainiumGrid):
         out_tile = output_buffers(shapes[self.node], self.node)[-1][0]
         parts, spread = self.row_parts(out_tile)
         if spread:
-            rows, cols = parts, cols // parts
+            rows, cols = parts, rows * cols // parts
         mx = self._mx_tiles(shapes)
         moves = self.transfers(shapes, tiling)
         steps = math.prod(tiling.grid)

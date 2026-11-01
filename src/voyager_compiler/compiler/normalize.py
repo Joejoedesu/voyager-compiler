@@ -27,6 +27,7 @@ from voyager_compiler.ops.layout import (
     GEMM_LAYOUTS,
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
+    GemmLayout,
 )
 from voyager_compiler.shape_prop import ShapeProp, fake_like
 
@@ -111,8 +112,8 @@ def transform(
 
     assert gemm_layout in GEMM_LAYOUTS, gemm_layout
     assert gemv_layout in GEMV_LAYOUTS, gemv_layout
-    gemm_activation, gemm_weight = gemm_layout.split(",")
-    gemv_weight = gemv_layout.split(",")[1]
+    gemm_activation, gemm_weight, _ = GemmLayout.parse(gemm_layout)
+    gemv_weight = GemmLayout.parse(gemv_layout).weight
     normalize_gemm_weight_layout(model, gemm_weight, gemv_weight)
     if gemm_activation == "cx":
         normalize_activation_layout(model)

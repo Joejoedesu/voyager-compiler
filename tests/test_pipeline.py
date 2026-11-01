@@ -59,6 +59,51 @@ def assert_saved_emission(test, directory):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_voyager_encoding_preserves_implicit_convolution_layout(self):
+        from types import SimpleNamespace
+
+        from voyager_compiler.codegen.voyager_ir_pb2 import PrimOp
+        from voyager_compiler.targets.voyager.codegen import encode
+
+        for layout in ("nhwc", "nchw"):
+            op = PrimOp(target="quantized_ops::conv2d")
+            op.kwargs["layout"].str_value = layout
+            encoded = SimpleNamespace(model=op)
+            encode(encoded, None, None)
+            self.assertEqual("layout" in op.kwargs, layout == "nchw")
+
+    def test_split_reduction_computes_fp32_partials_before_accumulation(self):
+        from voyager_compiler.compiler.bufferize.pipeline import _gemm_plan
+        from voyager_compiler.export_utils import export_model
+        from voyager_compiler.shape_prop import ShapeProp
+
+        class Matrix(torch.nn.Module):
+            def forward(self, a, b):
+                return a @ b
+
+        a = torch.tensor([256, 1, -256, 0], dtype=torch.bfloat16).repeat(
+            1, 2, 1
+        )
+        b = torch.ones(1, 4, 2, dtype=torch.bfloat16)
+        graph = export_model(Matrix(), (a, b))
+        ShapeProp(graph).propagate(a, b)
+        node = next(
+            n
+            for n in graph.graph.nodes
+            if n.target == torch.ops.aten.matmul.default
+        )
+        for fp32, expected in ((False, 0), (True, 1)):
+            with self.subTest(accumulate_fp32=fp32):
+                plan = _gemm_plan(node, k_tiles=2, accumulate_fp32=fp32)
+                first = plan.gemm_kernel((a[..., :2], b[..., :2, :]), True)
+                last = plan.gemm_kernel((a[..., 2:], b[..., 2:, :]), False)
+                self.assertEqual(
+                    first.dtype, torch.float32 if fp32 else torch.bfloat16
+                )
+                self.assertTrue(
+                    torch.all(first.float() + last.float() == expected)
+                )
+
     def test_buffer_program_replay_and_frozen_plan(self):
         class Tiny(torch.nn.Module):
             def forward(self, x):

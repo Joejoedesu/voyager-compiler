@@ -62,6 +62,9 @@ immutable representation replaces all readers; otherwise it charges the
 transposed-block estimate. This does not claim measured speedup.
 
 SBUF/PSUM partition, MX packing and attention constraints remain target-specific.
+Kernel manifests record partially written output ranges for per-kernel checking.
+The completed program still requires full-output comparison; partial MX writes
+remain unsupported. Older manifests without ranges retain whole-output checking.
 Not every generic halo/partial-transfer form translates to NKI. `patterns.py`
 implements instruction fusions, such as paired scalar ALU operations in one
 `tensor_scalar`; translation packs MX codes/scales with required padding. These
@@ -200,9 +203,12 @@ One file per op, holding its op class (fit and cost) and its builder:
   preserving data and storage-alias dependencies; dropping semaphore syntax is
   not itself proof of correctness or modeled overlap. Check the lowered endpoint
   when changes affect buffer reuse, command admission or synchronization.
-- **SBUF tiles** have their rows (all dims but the last, flattened) on the
-  partitions and the last dim free. A one-row tile read as an elementwise
-  operand is replicated across the partitions when loaded. A tile one
+- **SBUF tiles** normally have rows (all dims but the last, flattened) on the
+  partitions and the last dim free. Eligible flat elementwise tiles spread
+  across partitions even with multiple rows. Broadcast operands with fewer rows
+  are replicated onto their reading partitions; incompatible tilings are rejected.
+  The vector model accounts for the same layout, footprint and repeated loads.
+  A tile one
   access pattern walks moves in one `dma_copy`, except a load of 1 MiB or
   more: that moves in pieces of 256 KiB or more of whole 128-row blocks,
   the last piece whatever blocks remain, so a GEMM's first matmuls start

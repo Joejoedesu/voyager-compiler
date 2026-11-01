@@ -25,7 +25,9 @@ def _messages(message):
 
 
 def encode(encoded, program, config):
-    """Project explicit matrix layouts into the established Voyager ABI."""
+    """Project explicit operation layouts into the established Voyager ABI."""
+    from voyager_compiler.ops.layout import GemmLayout
+
     model = encoded.model
     matrix_ops = {
         "aten::linear",
@@ -41,6 +43,13 @@ def encode(encoded, program, config):
         ):
             continue
         layout = message.kwargs["layout"].str_value
+        if message.target == "quantized_ops::conv2d" and layout == "nhwc":
+            # This Voyager opcode already denotes the NHWC convolution.
+            del message.kwargs["layout"]
+            continue
+        if message.target in matrix_ops | mx_ops:
+            layout = str(GemmLayout.parse(layout))
+            message.kwargs["layout"].str_value = layout
         if message.target in mx_ops and layout in ("xc,ck", "xc,kc"):
             message.kwargs["weight_layout"].str_value = layout.split(",")[1]
             del message.kwargs["layout"]

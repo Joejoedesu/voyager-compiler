@@ -11,10 +11,11 @@ Runs in the ``trn`` env (Neuron SDK, torch 2.9), which cannot import
 ``<dir>`` holds ``translate``'s output beside ``tensors.pt``, the value of
 every HBM box -- the inputs, the parameters and each kernel's results, as
 Voyager's own bufferized graph computed them.  A kernel call runs on the
-values of its inputs and is compared with the values of its outputs; the
-program runs on the inputs and parameters alone.  The error is the largest
-absolute difference over the largest reference magnitude; an MX output's
-is taken block by block (``mx_error``).
+values of its inputs and is compared with the values of its outputs, of an
+output it writes part of (its step's ``partial``) only there; the program
+runs on the inputs and parameters alone.  The error is the largest absolute
+difference over the largest reference magnitude; an MX output's is taken
+block by block (``mx_error``).
 """
 
 import argparse
@@ -184,15 +185,26 @@ def check_calls(directory, kernels, manifest, tensors, only, distinct):
         )
         pairs = manifest.get("mx", {})
         codes_of = {e["scales"]: codes for codes, e in pairs.items()}
+        partial = call.get("partial", {})  # Older manifests wrote full outputs.
         errors, bars = [], []
         for b in call["outputs"]:
             # An MX array is checked with the other half of its pair.
             codes = codes_of.get(b, b)
             if codes not in pairs:
-                errors.append(error(got[b], tensors[b]))
+                actual, want = (
+                    got[b].float().flatten(),
+                    tensors[b].float().flatten(),
+                )
+                if b in partial:
+                    runs = partial[b]
+                    actual = torch.cat([actual[a:z] for a, z in runs])
+                    want = torch.cat([want[a:z] for a, z in runs])
+                errors.append(error(actual, want))
                 bars.append(MAX_FP8_ERROR.get(dtypes.get(b), MAX_ERROR))
                 continue
             scales = pairs[codes]["scales"]
+            if {codes, scales} & set(partial):
+                raise NotImplementedError(f"{b}: an MX array written in part")
             if codes not in got or scales not in got:
                 raise NotImplementedError(f"{b}: half an MX pair written")
             errors.append(

@@ -24,6 +24,52 @@ from voyager_compiler.targets.gemmini.target import TARGET
 
 
 class QuantizationTests(unittest.TestCase):
+    def test_mx_outlier_product_rounds_after_addition(self):
+        # 257 rounds to 256 in BF16. Adding the -256 outlier first must
+        # retain 1, instead of rounding the dense and sparse paths apart.
+        a = torch.tensor([[256, 1]], dtype=torch.bfloat16)
+        b = torch.ones(2, 1, dtype=torch.bfloat16)
+        result = torch.ops.quantized_ops.matmul_mx(
+            a,
+            b,
+            A_data=torch.tensor([-256], dtype=torch.bfloat16),
+            A_indices=torch.tensor([0]),
+            A_indptr=torch.tensor([0, 1]),
+        )
+        self.assertEqual(result.item(), 1)
+        self.assertEqual(result.dtype, torch.bfloat16)
+
+    def test_layout_spellings_and_convolution_output_precision(self):
+        from voyager_compiler.ops.layout import GemmLayout
+
+        a = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        b = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        for old, new in (("xc,ck", "xc,ck->xk"), ("cx,ck,kx", "cx,ck->kx")):
+            with self.subTest(layout=new):
+                self.assertEqual(GemmLayout.parse(old), GemmLayout.parse(new))
+                x = a.T if old.startswith("cx") else a
+                result = torch.ops.quantized_ops.matmul(x, b, layout=new)
+                expected = (a @ b).T if new.endswith("kx") else a @ b
+                torch.testing.assert_close(result, expected)
+
+        x = torch.tensor([256, 1], dtype=torch.bfloat16).reshape(1, 2, 1, 1)
+        w = torch.ones(1, 2, 1, 1, dtype=torch.bfloat16)
+        for layout in ("nchw", "nhwc"):
+            with self.subTest(layout=layout):
+                result = torch.ops.quantized_ops.conv2d(
+                    x if layout == "nchw" else x.permute(0, 2, 3, 1),
+                    w if layout == "nchw" else w.permute(2, 3, 1, 0),
+                    layout=layout,
+                    out_dtype=torch.float32,
+                )
+                self.assertEqual(result.dtype, torch.float32)
+                self.assertEqual(result.item(), 257)
+        # The formerly generated conv twin remains NHWC when unspecified.
+        legacy = torch.ops.quantized_ops.conv2d(
+            x.permute(0, 2, 3, 1), w.permute(2, 3, 1, 0)
+        )
+        self.assertEqual(legacy.item(), 256)
+
     def test_shared_stage_order_and_explicit_quantizer_override(self):
         events = []
 
