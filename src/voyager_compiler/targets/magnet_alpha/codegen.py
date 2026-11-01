@@ -140,7 +140,7 @@ def _host_output_only(node):
     return True
 
 
-def emit(program, encoded, config, output):
+def encode(encoded, program, config):
     program.assert_frozen()
     nodes = {
         f"{scope}/{node.name}": node
@@ -247,17 +247,59 @@ def emit(program, encoded, config, output):
                 kwargs=argument(dict(node.kwargs)),
             )
         )
+    layers = []
+    for node, selected, fields, arrays in staged:
+        payloads = []
+        for spec, array in arrays:
+            key = f"payload-{len(encoded.payloads)}"
+            encoded.payloads[key] = array
+            payloads.append(dict(key=key, source=spec))
+        layers.append(
+            dict(
+                name=selected["name"],
+                kind=selected["kind"],
+                node=names[node],
+                reads=to_data(node.meta["target_invoke"].reads),
+                writes=to_data(node.meta["target_invoke"].writes),
+                schedule=fields,
+                payloads=payloads,
+            )
+        )
+    encoded.target_data = dict(
+        schema_version=1,
+        layers=layers,
+        host_output_nodes=host,
+        program=dict(
+            schema_version=1,
+            graph_digest=program.frozen_digest,
+            plan_digest=program.plan_digest,
+            steps=driver,
+            allocation=to_data(program.plan.allocation),
+            scope="Selected native calls plus explicit transfers, views and host output conversion",
+        ),
+    )
+    return encoded
+
+
+def emit(bundle, output):
+    data = bundle.target_data
+    if data["schema_version"] != 1:
+        raise ValueError("unsupported Alpha target IR")
     directory = output / "alpha-cmod"
     directory.mkdir(exist_ok=False)
     results = []
-    for node, selected, fields, arrays in staged:
-        folder = directory / selected["name"]
+    for layer in data["layers"]:
+        folder = directory / layer["name"]
         folder.mkdir()
-        text = "".join(f"{key} = {value}\n" for key, value in fields.items())
+        text = "".join(
+            f"{key} = {value}\n" for key, value in layer["schedule"].items()
+        )
         for index in (0, 1, 10):
             (folder / f"schedule{index}.txt").write_text(text)
         files = []
-        for spec, array in arrays:
+        for payload in layer["payloads"]:
+            spec = payload["source"]
+            array = bundle.read_payload(payload["key"])
             target = folder / spec["file"]
             np.savetxt(target, array.reshape(1, -1), delimiter=",", fmt="%d")
             files.append(
@@ -268,34 +310,15 @@ def emit(program, encoded, config, output):
                     source=spec,
                 )
             )
-        results.append(
-            dict(
-                name=selected["name"],
-                kind=selected["kind"],
-                node=names[node],
-                reads=to_data(node.meta["target_invoke"].reads),
-                writes=to_data(node.meta["target_invoke"].writes),
-                schedule=fields,
-                payloads=files,
-            )
-        )
+        results.append(dict(layer, payloads=files))
     (directory / "layers.txt").write_text(
         "".join(r["name"] + "\n" for r in results)
     )
     (directory / "program.json").write_text(
-        json.dumps(
-            dict(
-                schema_version=1,
-                graph_digest=program.frozen_digest,
-                plan_digest=program.plan_digest,
-                steps=driver,
-                allocation=to_data(program.plan.allocation),
-                scope="Selected native calls plus explicit transfers, views and host output conversion",
-            ),
-            indent=2,
-        )
-        + "\n"
+        json.dumps(data["program"], indent=2) + "\n"
     )
+    driver = data["program"]["steps"]
+    host = data["host_output_nodes"]
     report = dict(
         schema_version=1,
         status="complete",
@@ -316,4 +339,3 @@ def emit(program, encoded, config, output):
     (directory / "conversion_report.json").write_text(
         json.dumps(report, indent=2) + "\n"
     )
-    program.assert_frozen()

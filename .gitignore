@@ -8,6 +8,8 @@ bash_scripts
 build
 data
 logs
+# Generated compiler bundles, tensor payloads and local evaluation collateral.
+/results/
 models
 plots
 slurm_scripts

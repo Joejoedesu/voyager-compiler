@@ -1702,7 +1702,13 @@ class Kernel:
         coords = source.coords
         r = coords.shape[1]
         if view.box.level == IMMEDIATE:
-            return "scalar", repr(self.immediates[view.box.name])
+            value = self.immediates[view.box.name]
+            literal = (
+                f"float({str(value)!r})"
+                if isinstance(value, float) and not math.isfinite(value)
+                else repr(value)
+            )
+            return "scalar", literal
         if view.box.level == DRAM:
             # A scalar read where it lies, as Voyager reads it: loaded onto
             # every partition, one value per row.

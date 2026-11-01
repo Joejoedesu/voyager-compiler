@@ -127,6 +127,15 @@ class CandidateRejected(ValueError):
     """Expected legality/fit/refinement rejection, recorded in search evidence."""
 
 
+class NoLegalMapping(CandidateRejected, RuntimeError):
+    """A supported search space has no fitting mapping for this candidate.
+
+    Retain RuntimeError compatibility for existing search callers, while the
+    implementation planner can reject this algorithm and try another. Model or
+    builder programming errors must not be translated into this exception.
+    """
+
+
 @dataclass(frozen=True)
 class OperatorSemantics:
     """Shared classification for a registered target operator.
@@ -169,14 +178,18 @@ class QuantizationPolicy:
 class TargetSpec:
     """Bindings at shared compiler boundaries; never a replacement pipeline.
 
-    ``operators`` declares semantics; ``quantization`` configures shared PT2E or overrides that stage;
+    ``operators`` declares semantics; ``input_preprocessing`` optionally rewrites
+    the exported graph and its inputs before quantization. ``quantization``
+    configures shared PT2E or overrides that stage;
     ``legalize`` rewrites it before shared ``normalization``; ``lower`` then maps
     normalized tensor operations to custom target operations. ``implementations``
     pair candidate search/model/estimate with a buffer builder. ``refine`` may
     finalize target execution/storage declarations before shared allocation.
-    ``encode`` projects the frozen program into the canonical artifact, while
-    ``emit`` produces target collateral. Optional ``runtime`` and ``characterize``
-    own execution and measurement, not compilation. A missing optional callback
+    ``encode(EncodedIR, program, config)`` projects frozen decisions into common
+    IR, target records and payloads, then the driver seals the bundle.
+    ``emit(SavedBundle, output_directory)`` produces target collateral using only
+    saved inputs, without a live graph or renewed search. Optional ``runtime``
+    and ``characterize`` own execution and measurement, not compilation. A missing optional callback
     means no specialization of that boundary, not an unimplemented target.
 
     See docs/extensions.md for signatures, consumers and decision boundaries.
@@ -196,6 +209,7 @@ class TargetSpec:
     encode: Callable | None = None
     operators: tuple = ()
     normalization: tuple = ()
+    input_preprocessing: Callable | None = None
 
     def __post_init__(self):
         names = [i.name for i in self.implementations]
@@ -319,6 +333,7 @@ def describe_target(target):
             for name in (
                 "hardware",
                 "model",
+                "input_preprocessing",
                 "legalize",
                 "lower",
                 "refine",

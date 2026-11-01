@@ -634,8 +634,13 @@ def get_access(point, layer, resource):
     return [access_list, array_costs]
 
 
+def _has_custom_size(layer, level):
+    levels = getattr(layer, "size_fn_levels", None)
+    return layer.size_fn is not None and (level > 1 if levels is None else level in levels)
+
+
 def _level_bytes(point, layer, level, resource, partitioning_accum):
-    """Byte footprint of ``point``'s tile at a byte-pool level (L2+).
+    """Byte footprint at a level selected by Layer.size_fn_levels.
 
     The layer's ``size_fn`` answers it: sizing a tile in bytes (element
     counts, element widths, scale tensors, fused operands, bank packing) is
@@ -651,8 +656,8 @@ def _level_bytes(point, layer, level, resource, partitioning_accum):
 
 
 def get_bank_size(point, layer, level, resource):
-    if level > 1 and layer.size_fn is not None:
-        # L2/L3 are flat byte pools.  No partitioning: this is one bank's (one
+    if _has_custom_size(layer, level):
+        # Caller-selected byte level. No partitioning: this is one bank's (one
         # PE's) worth, not the spatially replicated block.
         return _level_bytes(point, layer, level, resource, None)
 
@@ -684,8 +689,8 @@ def get_block_size(point, layer, level, resource):
             reduce(mul, point.loop_partitioning(i)[: level + 1], 1)
         )  # FIXME inclusive mode also duplicates data
 
-    if level > 1 and layer.size_fn is not None:
-        # L2/L3 are byte pools; the layer's ``size_fn`` sizes them.
+    if _has_custom_size(layer, level):
+        # Caller-selected byte level; size_fn sizes its physical representation.
         return _level_bytes(
             point, layer, level, resource, partitioning_accum_list
         )

@@ -81,7 +81,7 @@ or overlap.
 Check the required partial order and reuse/admission conditions rather than
 requiring identical ordering for independent commands. Include multi-tile and
 split-reduction cases, buffer-depth contrasts, retained operands and competing
-ISA forms where supported. Endpoint traces/cycles are needed to validate actual
+ISA forms where supported. Endpoint traces or suitable timing observations are needed to validate actual
 admission/overlap; static order checks establish only structural agreement.
 
 Use existing graphs/plans/command artifacts for diagnostic summaries, not a
@@ -111,11 +111,11 @@ loop engine and a stream of explicit instructions may have different submission
 costs even for the same software tile.
 
 For a performance investigation, record candidate mapping/order, buffer plan,
-legality/rejection reason and predicted cycles; add measured cycles/utilization
+legality/rejection reason and predicted latency; add measured latency/utilization
 when those observations are available. Within measured candidates, report
-selection regret when useful: measured cycles of the model-selected candidate
-divided by the minimum measured cycles minus one. This is not proof of a global
-optimum. Ranking and selection quality matter even when absolute cycle error is
+selection regret when useful: measured latency of the model-selected candidate
+divided by the minimum measured latency minus one, using the same unit and scope. This is not proof of a global
+optimum. Ranking and selection quality matter even when absolute timing error is
 small. Explicitly report candidates that cannot be compared under the same
 execution contract.
 
@@ -143,11 +143,15 @@ not copy a historical winning setting into another target's physical model.
 
 ## Keep comparisons and claims reproducible
 
-Use identical problem semantics, precision/rounding, padding, hardware instance,
-queue depths, memory model and timing scope for local comparisons. Distinguish a
+For equivalent-execution comparisons, use identical problem semantics,
+precision/rounding, padding, hardware instance, memory model and timing scope.
+For different quantization assignments, keep model/data/accuracy limits fixed and
+compare their full executable costs with changed arithmetic explicit. Distinguish a
 paper's reported speedup from a locally reproduced baseline. Define utilization:
-useful MACs divided by peak MACs/cycle and measured cycles, for example, differs
-from padded work or array-active occupancy. State whether one MAC counts as one
+useful MACs divided by peak MACs per time unit and measured elapsed time differs
+from padded work or array-active occupancy. Match units: cycles with MACs/cycle,
+or milliseconds with MACs/ms. Retain the endpoint observation and measurement
+method; converting device time to cycles requires a justified clock. State whether one MAC counts as one
 or two operations and keep the numerator/peak convention consistent.
 
 Prior measurements can inform a model when the relevant hardware mechanisms,
@@ -161,7 +165,7 @@ identical stream plus authenticated old simulation is valid reused evidence;
 label it rather than claiming a fresh simulation. Validate each actual output
 feeding the next network segment and final numerical reference.
 
-For segmented replay, the sum of independent accelerator cycles excludes host
+For segmented replay, the sum of independent accelerator execution times excludes host
 staging and other inter-segment costs unless explicitly measured. Do not call it
 end-to-end application latency. Retain failed/unsupported/unmeasured cases in the
 coverage account. Save concise evidence in the selected repository's existing

@@ -15,6 +15,7 @@ what applies. Read only the relevant detail and callable source.
 
 | Stage | Existing optimization | Owner and boundary |
 | --- | --- | --- |
+| Prepare/export (optional) | Input representation rewrite, such as selected conv-to-im2col | `TargetSpec.input_preprocessing`, selected by the binding; before observers/calibration. See [input boundary rewrites](#input-boundary-rewrites). |
 | Quantization | Observer conversion, constant-weight quantization and inference conv/BN folding | `quantization/quantize_pt2e.py`; shared quantization or a target override. `freeze_weights` is optional, after calibration; it is not automatically selected by normalization. |
 | Normalize: cleanup | Constant generators, autocast inlining, removable operations, attention-operand normalization and scalar index arithmetic | `compiler/normalize.py` invokes `fold_constant_generators`, `inline_autocast_modules`, `remove_prunable_ops`, `normalize_attention_operands`, `scalarize_index_arithmetic`. `keep_fp32=False` explicitly opts into removing FP32 casts. |
 | Normalize: quantization folding | Compose compatible scales and move Q/DQ toward producers or supported cache updates | `quant_folding.py:fuse_quantize_dequantize_with_producer` runs before alignment/layout; format, block-axis and boundary guards still apply. |
@@ -31,6 +32,13 @@ what applies. Read only the relevant detail and callable source.
 Canonical stage order: [compiler/normalize.py](../../src/voyager_compiler/compiler/normalize.py).
 Public controls and ownership: [extension catalog](../extensions.md).
 The descriptions below distinguish closely related mechanisms.
+
+Convolution classification distinguishes dense, grouped, and depthwise connectivity
+(including depthwise channel multipliers). NHWC conversion retains OIHW weights
+for grouped operations; channel padding must preserve group membership. These
+facts do not select hardware. Target recipes own native/group-aware execution or
+an explicit whole-operation builder; see [bufferization](../roles/bufferization.md).
+
 
 ## Padding and shape legalization
 
@@ -126,3 +134,33 @@ do not by themselves establish device performance.
 
 [Compilation reference](../compilation.md) · [Extension points](../extensions.md) ·
 [Documentation entry point](../README.md)
+
+## Input boundary rewrites
+
+**Stage:** prepare/export → optional rewrite → calibrate/quantize. The workload ×
+target binding opts in; shared normalization does not enable it automatically.
+
+Use [input preprocessing](../extensions.md#input-preprocessing) to select an
+exported-graph rewrite for improved utilization. `WorkloadSpec.prepare` remains
+for custom frontends; `WorkloadSpec.preprocess` only changes inputs before export.
+
+[`replace_conv2d_with_im2col`](../../src/voyager_compiler/codegen/transform/rewrites.py)
+is a specialized helper for eligible three-channel ATen convolutions with stored
+weights. Use `predicate=lambda node: ...` to select nodes; the default rewrites all
+eligible nodes. Check parameter-use and following-operation assumptions. This is
+not a generic first-layer optimizer or a host-packing extractor.
+When the binding needs an aligned packed reduction, `reduction_multiple=N`
+zero-pads the unfolded input and materializes a matching padded weight. The
+default `1` adds no alignment. This is explicit binding-owned storage expansion;
+it does not relax the non-inflating constant-preparation rule.
+
+| Choice | Contract |
+| --- | --- |
+| Rewrite before quantization | Check activation/weight axes and bias annotations on the rewritten graph. This selects one frontend per compile. |
+| Packed GEMM versus native convolution after quantization | Target recipes preserve fixed scales, zero points, rounding and bias under the same input/output contract; no silent recalibration. |
+
+Host packing is excluded from accelerator timing only by the agreed boundary;
+report it separately. Internal activation packing remains executable, modeled
+work. Declare packed shapes, padded weights and scratch; padded lanes must encode
+numerical zero and expanded constants count toward storage. Dynamic im2col is not
+constant folding. A graph rewrite alone does not move packing to the host.

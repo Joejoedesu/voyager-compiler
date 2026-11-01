@@ -9,7 +9,7 @@ from ._encoding import ACC, command, ex, ld, loop_mm, st, tile
 DRAM_BASE = 0x80000000
 
 
-def emit(program, encoded, config, output):
+def encode(encoded, program, config):
     program.assert_frozen()
     commands, bodies = [], []
 
@@ -111,13 +111,13 @@ def emit(program, encoded, config, output):
         if invocation.opcode in (
             "matmul",
             "conv2d",
+            "depthwise_conv2d",
             "requantize",
             "add",
             "average",
             "maxpool",
         ):
-            from ..semantics import facts
-            from ._commands import expand, explicit_matmul
+            from ..semantics import facts, selected_tile
 
             kind, params, operands = facts(node)
             choice = program.plan.choices[node.meta["scope"][0]]
@@ -125,6 +125,10 @@ def emit(program, encoded, config, output):
             if choice.implementation != invocation.implementation:
                 raise ValueError(
                     "Gemmini invocation differs from frozen selection"
+                )
+            if choice.tile is not None:
+                selected["tile"] = selected_tile(
+                    kind, params, choice.tile.tiling
                 )
             if selected["tile"]:
                 params["tile"] = selected["tile"]
@@ -136,12 +140,15 @@ def emit(program, encoded, config, output):
             addresses = {key: address(value) for key, value in operands.items()}
             addresses["y"] = address(destination)
             start = len(commands)
-            part = (
-                explicit_matmul(params, addresses)
-                if kind == "matmul" and selected["mode"] == "explicit"
-                else expand(kind, params, addresses)
+            commands.append(
+                dict(
+                    type="operation",
+                    kind=kind,
+                    parameters=params,
+                    addresses=addresses,
+                    mode=selected["mode"],
+                )
             )
-            commands.extend(part)
             # TargetInvoke is synchronous at the IR boundary, including output DMA.
             commands.append(dict(type="drain"))
             bodies.append(
@@ -225,6 +232,41 @@ def emit(program, encoded, config, output):
         )
     if not bodies:
         raise NotImplementedError("no supported Gemmini matrix invocation")
+    encoded.target_data = dict(
+        schema_version=1, instructions=commands, bodies=bodies
+    )
+    return encoded
+
+
+def emit(bundle, output):
+    from ._commands import expand, explicit_matmul
+
+    data = bundle.target_data
+    if data["schema_version"] != 1:
+        raise ValueError("unsupported Gemmini target IR")
+    commands, offsets = [], []
+    for instruction in data["instructions"]:
+        offsets.append(len(commands))
+        if instruction.get("type") == "operation":
+            kind, params, addresses = (
+                instruction[key] for key in ("kind", "parameters", "addresses")
+            )
+            commands.extend(
+                explicit_matmul(params, addresses)
+                if kind == "matmul" and instruction["mode"] == "explicit"
+                else expand(kind, params, addresses)
+            )
+        else:
+            commands.append(instruction)
+    offsets.append(len(commands))
+    bodies = [
+        dict(
+            body,
+            command_start=offsets[body["command_start"]],
+            command_end=offsets[body["command_end"]],
+        )
+        for body in data["bodies"]
+    ]
     directory = output / "gemmini"
     directory.mkdir(exist_ok=False)
     (directory / "commands.json").write_text(

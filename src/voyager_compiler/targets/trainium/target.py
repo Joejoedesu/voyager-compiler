@@ -14,11 +14,22 @@ from .implementations import encode, fp8_matrix, implementations
 from .model import TrainiumModel
 
 
-def emit(program, encoded, config, output):
-    from .translate import immediates, translate
+def emit(bundle, output):
+    from types import SimpleNamespace
 
+    from .translate import translate
+
+    data = bundle.target_data
+    if data["schema_version"] != 1:
+        raise ValueError("unsupported Trainium target IR")
     return translate(
-        encoded, str(output / "nki"), config, immediates(program.graph, encoded)
+        bundle.read_model(),
+        str(output / "nki"),
+        SimpleNamespace(moving_free_max=data["moving_free_max"]),
+        {
+            name: bundle.read_payload(key).item()
+            for name, key in data["immediates"].items()
+        },
     )
 
 

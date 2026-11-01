@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from test_pipeline import assert_saved_emission
 
 from voyager_compiler.extensions import WorkloadSpec
 from voyager_compiler.pipeline import compile_workload
@@ -89,6 +90,7 @@ class GemminiTests(unittest.TestCase):
                     dump_tensors=False,
                 )
                 run(result, reference=torch._int_mm(*args), rtol=0, atol=0)
+                assert_saved_emission(self, directory)
                 code = json.loads(
                     (Path(directory) / "gemmini/commands.json").read_text()
                 )

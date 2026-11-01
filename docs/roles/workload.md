@@ -22,6 +22,7 @@ target's bindings. Start with these source owners; follow imports as needed:
 | Problem | Next action |
 | --- | --- |
 | No workload adapter exists | Start with build/example_inputs and an independent reference; export one representative input to inspect actual signatures. Add assets/state hooks only when needed. |
+| Select optional input packing or a pre-quantization graph rewrite | Bind [input preprocessing](input-preprocessing.md); keep sample acquisition here and adapt samples if the input contract changes. |
 | Coverage stalls despite a working GEMM | Inspect connected regions, non-matrix ops, layouts, quantization boundaries and state updates. Hand unsupported signatures to lowering/recipes; do not hide them in preprocessing. |
 | Repeated calls disagree | Check input/state aliasing and mutation before blaming arithmetic. Compare the first differing update and subsequent consumers. |
 
@@ -54,3 +55,6 @@ Return the WorkloadSpec, input/reference identities, relevant signatures and evi
 Exercise the preparation/reference path and affected cases. Check declared assets and state transitions; use the selected target/workload gate for integration.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)
+
+For input-layer utilization problems, follow [input preprocessing](input-preprocessing.md)
+and its shared rewrite helpers.

@@ -104,6 +104,12 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already registered"):
             registry.register(workload)
 
+    def test_builtin_workload_is_discoverable(self):
+        from voyager_compiler.extensions import registry
+        from voyager_compiler.workloads.mobilenet_v2 import WORKLOAD
+
+        self.assertIs(registry.workload("mobilenet-v2"), WORKLOAD)
+
 
 if __name__ == "__main__":
     unittest.main()

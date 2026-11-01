@@ -24,8 +24,9 @@ def _messages(message):
             yield from _messages(value)
 
 
-def encode(model, program, config):
+def encode(encoded, program, config):
     """Project explicit matrix layouts into the established Voyager ABI."""
+    model = encoded.model
     matrix_ops = {
         "aten::linear",
         "aten::matmul",
@@ -45,4 +46,4 @@ def encode(model, program, config):
             del message.kwargs["layout"]
         elif message.target in matrix_ops and layout == "xc,ck":
             del message.kwargs["layout"]
-    return model
+    return encoded

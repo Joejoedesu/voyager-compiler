@@ -972,12 +972,21 @@ def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=
     para_dim = point.para_loop_dim
     non_empty_loops = get_non_empty_loops(point, num_levels)
 
+    def orders(level):
+        priority = getattr(schedule, "order_priority", {}).get(level)
+        if priority is None:
+            yield from level_order_generator_function(point, le.NUM, non_empty_loops, level)
+            return
+        active = [loop for loop in priority if loop in non_empty_loops[level]]
+        order = [le.NUM - 1] * le.NUM
+        for rank, loop in enumerate(active):
+            order[loop] = rank
+        yield order
+
     level_orders = [
         [
             order
-            for order in level_order_generator_function(
-                point, le.NUM, non_empty_loops, level
-            )
+            for order in orders(level)
             if _order_fits_hint(order, blocking, partitioning, schedule, level)
         ]
         for level in range(num_levels)
@@ -1044,6 +1053,10 @@ def opt_mapping_point_generator_function(
                     layer,
                     mapping_point,
                 )
+                # A target adapter may reject a complete ordered mapping.
+                # Do not let an illegal low-energy point enter the frontier.
+                if runtime == float("inf"):
+                    continue
             else:
                 runtime = float("inf")
 

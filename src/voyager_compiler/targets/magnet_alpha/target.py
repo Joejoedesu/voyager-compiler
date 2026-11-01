@@ -15,7 +15,7 @@ from . import (  # noqa: F401 — register Torch operator schemas
     operators,
     quant_ops,
 )
-from .codegen import emit
+from .codegen import emit, encode
 from .hardware import MagnetAlphaHardwareConfig
 
 
@@ -243,6 +243,7 @@ TARGET = registry.register(
         legalize=legalize,
         operators=OPERATORS,
         refine=refine,
+        encode=encode,
         emit=emit,
     )
 )

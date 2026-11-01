@@ -231,6 +231,7 @@ def _get_im2col_gemm_pattern(
     stride: Union[int, Tuple[int]] = 1,
     padding: Union[int, Tuple[int]] = 0,
     dilation: Union[int, Tuple[int]] = 1,
+    reduction_multiple: int = 1,
 ):
 
     def _im2col_gemm_pattern(
@@ -240,25 +241,41 @@ def _get_im2col_gemm_pattern(
     ) -> Tuple[torch.Tensor]:
         inp_unf = F.unfold(input, weight.shape[-2:], dilation, padding, stride)
         wt = weight.view(weight.size(0), -1)
-        out_unf = F.linear(inp_unf.transpose(-1, -2), wt, bias)
+        matrix = inp_unf.transpose(-1, -2)
+        tail = (-wt.shape[-1]) % reduction_multiple
+        if tail:
+            matrix = F.pad(matrix, (0, tail))
+            wt = F.pad(wt, (0, tail))
+        out_unf = F.linear(matrix, wt, bias)
         out = out_unf.transpose(-1, -2).view(*output_shape)
         return out
 
     return WrapperModule(_im2col_gemm_pattern)
 
 
-def replace_conv2d_with_im2col(model: GraphModule):
+def replace_conv2d_with_im2col(
+    model: GraphModule, *, predicate=None, reduction_multiple=1
+):
     """
     Replace Conv2d operations that has input channel dimension equal to 3 with
     In2col operations in the given FX graph module.  Usually this is the first
     Conv2D layer in torchvision models.
 
     Args:
-        model (GraphModule): The FX graph module to transform.
+        model (GraphModule): The FX graph module to transform, before quantization.
+        predicate: Optional ``(conv_node) -> bool`` selecting eligible nodes.
+            The caller owns workload/target policy and the host input boundary;
+            this helper only rewrites the graph. Without a predicate, rewrite
+            all eligible three-channel convolutions as before.
+        reduction_multiple: Optional packed GEMM reduction alignment. Zero-pad
+            both the unfolded input and stored weight explicitly, before
+            quantization. The binding must permit the input storage expansion.
 
     Returns:
         GraphModule: The transformed FX graph module.
     """
+    if not isinstance(reduction_multiple, int) or reduction_multiple < 1:
+        raise ValueError("reduction_multiple must be a positive integer")
     graph = model.graph
 
     def get_shape(n):
@@ -290,6 +307,9 @@ def replace_conv2d_with_im2col(model: GraphModule):
         ):
             continue
 
+        if predicate is not None and not predicate(node):
+            continue
+
         logger.info(f"Replacing Conv2d node {node} with Im2col + GEMM")
 
         _example_inputs = (
@@ -299,7 +319,11 @@ def replace_conv2d_with_im2col(model: GraphModule):
         )
 
         match_pattern = _get_im2col_gemm_pattern(
-            output_shape, _pair(stride), _pair(padding), _pair(dilation)
+            output_shape,
+            _pair(stride),
+            _pair(padding),
+            _pair(dilation),
+            reduction_multiple,
         )
         match_pattern = _get_aten_graph_module_for_pattern(
             match_pattern,
@@ -312,12 +336,16 @@ def replace_conv2d_with_im2col(model: GraphModule):
         )[0]
         graph.erase_node(node)
 
-        # Fold the view operation into the parameter
-        view_node = next(iter(weight_node.users))
-        assert view_node.target == torch.ops.aten.view.default
+        # Materialize the explicitly requested weight representation. This is
+        # binding-owned padding, not the non-inflating constant-preparation pass.
+        linear_node = next((n for n in val_maps.values() if is_gemm_op(n)))
+        view_node = linear_node.args[1]
 
         val = fetch_attr(model, weight_node.target).detach()
         val = val.reshape(val.size(0), -1)
+        tail = (-val.shape[-1]) % reduction_multiple
+        if tail:
+            val = F.pad(val, (0, tail))
 
         with graph.inserting_before(view_node):
             new_weight = create_getattr_from_value(
@@ -328,8 +356,6 @@ def replace_conv2d_with_im2col(model: GraphModule):
         view_node.replace_all_uses_with(new_weight)
 
         # Move elementwise operations after view to after the linear node
-        linear_node = next((n for n in val_maps.values() if is_gemm_op(n)))
-
         order = {n: i for i, n in enumerate(graph.nodes)}
         fusable_ops = []
         next_node = next(iter(output.users))

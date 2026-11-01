@@ -16,12 +16,15 @@ LIBRARY.define(
     "conv2d(Tensor x, Tensor weight, Tensor bias, int stride, int pad, float scale, bool relu=False) -> Tensor"
 )
 LIBRARY.define(
+    "depthwise_conv2d(Tensor x, Tensor weight, Tensor bias, int stride, int pad, float scale, bool relu=False) -> Tensor"
+)
+LIBRARY.define(
     "requantize(Tensor x, float scale=1., bool relu=False) -> Tensor"
 )
 LIBRARY.define(
     "add(Tensor a, Tensor b, float a_scale, float b_scale, bool relu=False) -> Tensor"
 )
-LIBRARY.define("average(Tensor x) -> Tensor")
+LIBRARY.define("average(Tensor x, float scale=1.) -> Tensor")
 LIBRARY.define(
     "maxpool(Tensor x, int kernel, int stride, int pad, bool input_nonnegative=False) -> Tensor"
 )
@@ -62,15 +65,27 @@ def conv2d(x, weight, bias, stride, pad, scale, relu=False):
     return quant(accumulator(out), scale, relu).permute(0, 2, 3, 1).contiguous()
 
 
+def depthwise_conv2d(x, weight, bias, stride, pad, scale, relu=False):
+    out = torch.nn.functional.conv2d(
+        x.permute(0, 3, 1, 2).double(),
+        weight.double(),
+        bias.double(),
+        stride,
+        pad,
+        groups=x.shape[-1],
+    )
+    return quant(accumulator(out), scale, relu).permute(0, 2, 3, 1).contiguous()
+
+
 def add(a, b, a_scale, b_scale, relu=False):
     # MVIN scaling saturates each operand BEFORE accumulation.
     return quant(quant(a, a_scale).int() + quant(b, b_scale).int(), 1, relu)
 
 
-def average(x):
+def average(x, scale=1.0):
     return quant(
         accumulator(x.double().sum((1, 2), keepdim=True)),
-        1 / (x.shape[1] * x.shape[2]),
+        scale / (x.shape[1] * x.shape[2]),
     )
 
 
@@ -92,6 +107,7 @@ def maxpool(x, kernel, stride, pad, input_nonnegative=False):
 for name, fn in dict(
     matmul=matmul,
     conv2d=conv2d,
+    depthwise_conv2d=depthwise_conv2d,
     requantize=quant,
     add=add,
     average=average,
@@ -117,6 +133,18 @@ def fake_conv(x, weight, bias, stride, pad, scale, relu=False):
     )
 
 
+@torch.library.register_fake("gemmini::depthwise_conv2d")
+def fake_depthwise(x, weight, bias, stride, pad, scale, relu=False):
+    return x.new_empty(
+        (
+            x.shape[0],
+            (x.shape[1] + 2 * pad - weight.shape[2]) // stride + 1,
+            (x.shape[2] + 2 * pad - weight.shape[3]) // stride + 1,
+            x.shape[3],
+        )
+    )
+
+
 @torch.library.register_fake("gemmini::requantize")
 def fake_quant(x, scale=1.0, relu=False):
     return x.new_empty(x.shape, dtype=torch.int8)
@@ -128,7 +156,7 @@ def fake_add(a, b, a_scale, b_scale, relu=False):
 
 
 @torch.library.register_fake("gemmini::average")
-def fake_average(x):
+def fake_average(x, scale=1.0):
     return x.new_empty((x.shape[0], 1, 1, x.shape[3]))
 
 
@@ -146,7 +174,15 @@ def fake_pool(x, kernel, stride, pad, input_nonnegative=False):
 
 OPS = tuple(
     getattr(torch.ops.gemmini, name).default
-    for name in ("matmul", "conv2d", "requantize", "add", "average", "maxpool")
+    for name in (
+        "matmul",
+        "conv2d",
+        "depthwise_conv2d",
+        "requantize",
+        "add",
+        "average",
+        "maxpool",
+    )
 )
 
 
@@ -178,7 +214,7 @@ def _validate(kind, p, operands):
         if "bias" in operands:
             shape("bias", (p["n"],), "int32")
             required.add("bias")
-    elif kind == "conv2d":
+    elif kind in ("conv2d", "depthwise_conv2d"):
         allowed = common | {
             "batch",
             "h",
@@ -207,7 +243,14 @@ def _validate(kind, p, operands):
         ):
             raise ValueError("Convolution output geometry does not match input")
         shape("x", (p["batch"], p["h"], p["w"], p["ci"]))
-        shape("weight", (k, k, p["ci"], p["co"]))
+        if kind == "depthwise_conv2d":
+            if p["ci"] != p["co"]:
+                raise ValueError(
+                    "Depthwise hardware loop requires channel multiplier one"
+                )
+            shape("weight", (p["co"], 1, k, k))
+        else:
+            shape("weight", (k, k, p["ci"], p["co"]))
         shape("bias", (p["co"],), "int32")
         shape("y", (p["batch"], p["oh"], p["ow"], p["co"]))
     elif kind == "maxpool":
@@ -243,7 +286,7 @@ def _validate(kind, p, operands):
         shape("x", (p.get("batch", 1), p["h"], p["w"], p["channels"]))
         shape("y", (p.get("batch", 1), p["oh"], p["ow"], p["channels"]))
     elif kind == "average":
-        allowed = {"batch", "pixels", "channels"}
+        allowed = {"batch", "pixels", "channels", "scale"}
         required = {"x", "y"}
         positive("pixels", "channels")
         shape(
@@ -299,6 +342,27 @@ def facts(node):
             ow=node.value.shape[2],
             kernel=w.shape[0],
         )
+    elif name == "depthwise_conv2d":
+        x, w = tensors["x"].value, tensors["weight"].value
+        if (
+            x.ndim != 4
+            or w.ndim != 4
+            or w.shape[:2] != (x.shape[3], 1)
+            or w.shape[2] != w.shape[3]
+        ):
+            raise CandidateRejected(
+                "Depthwise convolution requires NHWC and Cx1xRxR weights"
+            )
+        p.update(
+            batch=x.shape[0],
+            h=x.shape[1],
+            w=x.shape[2],
+            ci=x.shape[3],
+            co=x.shape[3],
+            oh=node.value.shape[1],
+            ow=node.value.shape[2],
+            kernel=w.shape[2],
+        )
     elif name == "average":
         x = tensors["x"].value
         if x.ndim != 4:
@@ -327,7 +391,8 @@ def facts(node):
         p.update(rows=math.prod(x.shape[:-1]), channels=x.shape[-1])
     boxes = {
         k: SimpleNamespace(
-            shape=v.value.shape, dtype=str(v.value.dtype).removeprefix("torch.")
+            shape=v.value.shape,
+            dtype=str(v.value.dtype).removeprefix("torch."),
         )
         for k, v in tensors.items()
     }
@@ -367,3 +432,63 @@ def raw_dimensions(node):
             "this native family requires 16-aligned M and 16-bit bounds"
         )
     return m, n, k
+
+
+def tile_storage(kind, params, tile, mode):
+    """Physical scratchpad/accumulator bytes, shared by search and emission."""
+
+    def blocks(value):
+        return (value + 15) // 16
+
+    if kind == "matmul":
+        m, n, k = tile
+        if mode == "hardware_loop":
+            m, n, k = (blocks(v) * 16 for v in tile)
+        return 16 * (m * blocks(k) + k * blocks(n)), 64 * m * blocks(n)
+    if kind == "depthwise_conv2d":
+        r, c = tile
+        return tile_storage("conv2d", params, (r, c, 1, 1), mode)
+    if kind == "conv2d":
+        r, c, o, i = tile
+        kernel, stride = params["kernel"], params["stride"]
+        return (
+            16
+            * (
+                (r * stride + kernel - 1)
+                * (c * stride + kernel - 1)
+                * blocks(i)
+                + kernel * kernel * i * blocks(o)
+            ),
+            64 * r * c * blocks(o),
+        )
+    raise ValueError(f"No matrix tile storage for {kind}")
+
+
+def selected_tile(kind, p, mapping):
+    """Project the selected on-chip extents; tails remain logical extents."""
+    import interstellar
+
+    le = interstellar.le
+    loops = (
+        (le.OX, le.OC, le.IC)
+        if kind == "matmul"
+        else (le.OY, le.OX, le.OC, le.IC)
+    )
+    full = (
+        (p["m"], p["n"], p["k"])
+        if kind == "matmul"
+        else (p["oh"], p["ow"], p["co"], p["ci"])
+    )
+    return tuple(
+        min(
+            extent,
+            math.prod(
+                b * q
+                for b, q in zip(
+                    mapping.loop_blockings[loop][:2],
+                    mapping.loop_partitionings[loop][:2],
+                )
+            ),
+        )
+        for loop, extent in zip(loops, full)
+    )

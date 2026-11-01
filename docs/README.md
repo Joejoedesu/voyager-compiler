@@ -10,11 +10,14 @@ human-readable tour, use the [compiler walkthrough](../../reports/voyager-compil
 | Locate an extension point | [Extension catalog](extensions.md) | Actual target registration and its guide |
 | Understand the compiler | [Compilation flow](compilation.md#the-compilation-flow) | [IR decisions](compilation.md#ir-ownership-and-why-these-records-differ), relevant source |
 | Distinguish graphs and plans | [Tensor graph, execution graph and decisions](compilation.md#tensor-graph-execution-graph-and-compilation-decisions) | [Async and native completion](compilation.md#asynchronous-buffer-operations-and-native-completion) |
+| Choose preprocessing before quantization | [Input preprocessing](roles/input-preprocessing.md) | [Hook contract](extensions.md#input-preprocessing), input rewrite helpers |
 | Reuse an existing compiler transformation | [Shared transformations](compilation/rewrites.md) | Focused feature reference, current pass and target binding |
+| Compare algorithms for one operation/region | [Algorithm comparison](compilation/algorithm-search.md) | Implementation recipes, component builders and whole-region costs |
 | Adopt a target or workload | [Adoption overview](adoption.md) | [Target registration](adoption/registration.md) or [workload × target binding](adoption/workload-binding.md), plus relevant roles |
 | Implement a specific change | [Role index](roles.md) | Selected role, linked contract section, current callable source |
 | Build a model without an existing target | [Performance role](roles/performance.md) | [Create and register the model](compilation/performance-models.md#create-and-register-the-model), builder and ISA/runtime contract |
 | Diagnose poor selection/performance | [Performance role](roles/performance.md) | [Model/converter guidance](compilation.md#execution-model-and-converter-consistency), target implementation |
+| Resume adoption experiments or organize pending checks | [Adoption work record](adoption/harness.md) | Task-local artifacts, relevant procedure and role |
 | Check a finished change | [Integration role](roles/integration.md) | [Pinned validation](compilation.md#reference-gates-and-reproducible-commands) |
 
 The compilation guide owns shared compiler contracts and links focused references

@@ -4,7 +4,7 @@ Use for: Candidate enumeration, cache behavior or mapping selection that the exi
 
 ## Binding and ownership
 
-`Framework: compiler/search/`. This is framework development, not a registered scheduler-engine plugin. Target alternatives use ImplementationSpec.
+`MatrixSpace` and recipe adapters configure target-owned search; `Framework: compiler/search/` owns enumeration mechanics. Target alternatives use `ImplementationSpec`. No separate engine-plugin registry is required to reuse `search_matrix`.
 For a new target, first follow the [model bootstrap and reuse guide](performance.md#starting-a-model-for-a-new-target). Reusing a search engine does not require inheriting another target's cost formulas.
 
 ## Load for this task
@@ -35,6 +35,9 @@ target's bindings. Start with these source owners; follow imports as needed:
 
 3. Keep deterministic selection and bounded capacity retries. Search proposes mappings; final expanded allocation validates storage.
 
+   Raise `NoLegalMapping` for an exhausted legal mapping space so another
+   algorithm can compete; do not catch arbitrary runtime errors as infeasibility.
+
 4. Use the existing shared search contract. Independent scheduler-engine registration and richer event/result contracts need explicit shared interfaces; a target option is not such an interface.
 
 ## Do not
@@ -49,3 +52,18 @@ Return the candidate-space/selection change, cache/constraint reasoning and evid
 Check the meaningful changed space or constraint and deterministic choice. Validate a known feasible/good candidate remains reachable; avoid tests that merely mirror enumeration code.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)
+
+## Target adapter versus shared builder
+
+`search_matrix(op, layer, ...)` is the reusable Interstellar adapter. Targets own
+`MatrixSpace.architecture`, `schedule`, internal `fit_level` and optional `mapping_filter`; models own
+extent/capacity fit and latency. The shared FX/grid route retains its builder's
+reduction-order restriction. A custom builder can consume the full mapping
+without that restriction. Preserve its `TileResult` on the node so the planner
+and emitter retain the same decision; use explicit order priorities only for
+orders the implementation actually fixes. See [adapter construction](../compilation/performance-models.md#target-owned-matrix-search-adapters).
+
+Default selection is strict modeled latency (`runtime_tolerance=0`); a positive
+near-tie budget must be explicit. For a performance gap, follow the
+[required diagnosis](../compilation/performance-models.md#required-diagnosis-when-utilization-or-selected-performance-is-poor),
+including known-good candidate reachability before changing scoring.

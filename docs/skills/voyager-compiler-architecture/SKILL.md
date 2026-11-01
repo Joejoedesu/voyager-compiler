@@ -32,9 +32,13 @@ switches or a second compilation pipeline. One source file per hook is not requi
 
 ## Follow the shared lifecycle
 
-`pipeline.compile_workload()` owns prepare/export → quantize → target legalize
+`pipeline.compile_workload()` owns prepare/export → optional input preprocessing → quantize → target legalize
 → common normalize → optional target custom-operation lowering → search/bufferize → target refine → allocate/finalize
-invocations → validate/freeze → encode/target emit → save bundle.
+invocations → validate/freeze → encode → save bundle → optional target emit.
+`encode` captures common IR and target records/payloads from frozen decisions;
+`emit` reads the saved bundle without live compiler objects. Test relocation and
+fresh-process emission. Neither hook selects a new implementation or allocation.
+See the [emission role](../../../docs/roles/emission.md) for signatures and commands.
 `runtime.run()` uses host replay unless the caller passes a target with a runtime
 hook. Pass the reference and chosen tolerances explicitly for comparison.
 `compile_bufferized()` accepts an already prepared/normalized FX graph;
@@ -43,6 +47,7 @@ public `transform()`/`compile()` remain compatibility entry points.
 | Responsibility | Canonical owner |
 | --- | --- |
 | Model construction, assets, export/reference | `compiler/prepare.py`, `WorkloadSpec` |
+| Optional input preprocessing | `compiler/preprocess.py`, `TargetSpec.input_preprocessing` |
 | Shared quantization and normalization | `compiler/quantize.py`, `compiler/normalize.py` |
 | Alias/effect analysis | `compiler/analysis.py` |
 | Recipe and mapping/tile search | `compiler/search/`, `ImplementationSpec` |
@@ -94,12 +99,21 @@ and finite comparable costs. First-match dispatch is not search. Preserve candid
 isolation, rejection reasons and selected parameters. Capacity failures can trigger
 bounded replanning, not silent fallback to a donor compiler.
 
+For [fixed-region algorithms](../../../docs/compilation/algorithm-search.md), reuse
+`build_sequential_region` when component kernels execute sequentially; its parent
+cost already includes `ImplementationChoice.components`. Pair streaming/recomputation
+with its actual execution model. `NoLegalMapping` rejects only the infeasible
+candidate; do not classify arbitrary implementation errors as search failures.
+
 Reuse shared bufferized templates for layout, tile, placement or primitive changes.
 `MatrixSpace`, `GridSpace` and `AttentionSpace` select different search engines but
 produce `TileResult` for the same lifecycle. A new algorithmic control structure may
 need a builder; new effects, aliasing or completion semantics need a scoped shared
 contract change. An independent engine registry or richer result schema is not
 created by adding a target option; inspect the current scheduler contract first.
+
+For input-representation utilization problems, see
+[input preprocessing](../../../docs/roles/input-preprocessing.md), before quantization.
 
 `TargetSpec.quantization` configures shared PT2E defaults and observer hooks, or
 provides `QuantizationPolicy.run(prepared, config, options)` for a target-owned
@@ -141,7 +155,7 @@ execution checker or fresh characterization campaign is required. Fit models onl
 after checking structural agreement. Reuse applicable measurements with provenance;
 assess held-out ranking as well as error when fitting.
 
-Use affected `tests/` contracts and agreed target gates; consult the target guide
+Use affected [test contracts](../../../tests/README.md) and agreed target gates; consult the target guide
 when present, or establish the requested checks for a new target.
 Preserve pinned comparators, approved replacements and numerical warnings. Do not
 edit source during a gate. Separate host replay, emitted artifacts, endpoint
@@ -153,3 +167,11 @@ and skills stay target agnostic; target guides describe actual bindings and loca
 constraints; dated reports hold run status. Old TODOs, reports and retired R/W/X
 labels are not instructions to reimplement existing code. Inspect source before
 acting on a stated gap. Follow the user's commit/push scope.
+
+For requested performance work, investigate material utilization gaps: permitted
+initial-input rewrites, candidate/adapter/builder expressiveness, ranking, and
+model–conversion–runtime agreement. Follow the checkout's
+[model construction and required diagnosis](../../../docs/compilation/performance-models.md).
+Default selection is strict modeled latency. Reuse Interstellar through
+`search_matrix` with target-owned constraints; do not inherit the default target's
+schedule or call a narrow candidate list a hardware limit.

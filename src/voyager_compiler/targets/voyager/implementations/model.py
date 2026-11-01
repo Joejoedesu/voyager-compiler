@@ -18,6 +18,7 @@ from voyager_compiler.codegen.node_info import (
     is_conv2d,
     is_fully_connected,
     is_gemm_op,
+    is_grouped_conv,
     is_pooling,
 )
 from voyager_compiler.compiler.search.lowering import matrix_layer
@@ -168,9 +169,13 @@ class VoyagerModel(RuntimeModel):
         (``VoyagerGemv``), any other GEMM / conv is mapped onto the PE array
         (``VoyagerGemm``), and a pool or any other op tiles the vector
         unit's lanes (``VoyagerPool``, ``VoyagerVector``).  A conv over three
-        input channels, an image network's first layer, stays untiled
-        (``None``)."""
+        input channels, an image network's first layer, and grouped/depthwise
+        convolutions use their whole-operation recipes (``None``)."""
         anchor = get_anchor_node(node)
+        # The Voyager recipe retains whole-operation grouped convolution.
+        # Other targets may provide a searched grouped/depthwise implementation.
+        if is_grouped_conv(anchor):
+            return None
         if is_gemm_op(anchor):
             if is_fully_connected(anchor):
                 return VoyagerGemv(node, self.grid_space, self)

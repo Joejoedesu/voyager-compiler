@@ -20,12 +20,18 @@ need to be registered again. Load only the [roles](../roles.md) needed for it.
    emission. Check existing alternatives before adding duplicates; first-match
    dispatch does not explore them.
    For a fresh target, use the [model creation instructions](../compilation/performance-models.md#create-and-register-the-model)
-   to choose shared search machinery and target-owned fit/cost components.
+   to choose shared enumeration, a target-owned operation adapter/constraints,
+   fit/cost and a compatible builder. Do not inherit the default target's loop
+   hints or confuse a narrow candidate list with hardware legality.
 4. **Bind the missing extension.** Use the relevant `TargetSpec` hooks and shared
    pipeline. For new operations, define executable behavior and schema effects;
    register `OperatorSemantics` classification as needed.
    Reuse existing allocation and compilation decisions. A new endpoint does not
-   justify a private compilation pipeline.
+   justify a private compilation pipeline. For each substantial helper, identify
+   the shared implementation reused or the concrete contract it cannot satisfy;
+   an extension hook alone is not evidence of implementation reuse. Start with
+   shared quantization/normalization, search, allocation and optional replay
+   images before writing replacements.
 5. **Check affected behavior.** Use representative cases for changed legality,
    arithmetic, execution or resource ownership; force alternative recipes when
    needed to verify them. Reuse unaffected evidence. Compile/emit through Voyager
@@ -35,6 +41,11 @@ need to be registered again. Load only the [roles](../roles.md) needed for it.
 6. **Return the scoped result.** Link bindings, changes, restrictions and evidence.
    Distinguish compiler checks from endpoint execution and report unavailable
    evidence honestly. Compiler-only work may finish without device access.
+
+Use the [adoption work record](harness.md) when registration spans experiments: keep
+missing capabilities and competing execution forms as opportunities, and record
+arithmetic, resource and endpoint checks against specific artifacts. A working
+first recipe establishes a baseline; it does not exclude another useful ISA form.
 
 Analytical models suffice for registration/search. Reuse applicable measurements
 with provenance; characterize only when the requested tuning or performance claim

@@ -182,7 +182,7 @@ def _define_layout_variant(aten_op, arg_transforms, out_transform):
 def register_nhwc_operators() -> Dict:
     """Generate the NHWC twin of every ``NHWC_LAYOUT_OPS`` entry: the
     first (activation) argument arrives NHWC, a ``weight`` argument
-    arrives HWIO (kept as-is for a depthwise conv, whose weight layout
+    arrives HWIO (kept as-is for a grouped conv, whose weight layout
     is not transformed), and the result is returned NHWC.  Returns
     ``{aten OpOverload: generated OpOverload}``.
     """

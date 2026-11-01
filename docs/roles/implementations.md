@@ -25,6 +25,10 @@ target's bindings. Start with these source owners; follow imports as needed:
 | A shape or dtype changes the fastest form | Expose the meaningful parameters, include boundary/resource-limited cases, and keep the alternative reachable. Check pruning/budgets before blaming the cost model. |
 | Another algorithm saves memory by changing computation | Keep the same observable region; pair a new builder with its full cost, including recomputation. Reuse inner tile engines; arbitrary overlapping-region search needs framework work. |
 
+For a fixed operation/region, follow [algorithm comparison](../compilation/algorithm-search.md).
+Sequential component recipes can use `build_sequential_region`; streaming or
+recomputation needs a builder/model matching its own execution structure.
+
 ## Do
 
 1. Decide whether an existing bufferized template plus target primitives expresses the form. Add a new builder for changed algorithmic control; shared IR changes need a missing semantic capability.
@@ -50,3 +54,8 @@ Return the recipe, restrictions, alternative/rejection evidence, paired model/bu
 Force each relevant alternative, compare semantics and emitted mode, then check normal selection. Use the affected target regression; candidate enumeration alone does not prove realization.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)
+
+Do not equate a narrow candidate list with hardware limits. In performance work,
+compare known feasible spatial/channel tiles and retention policies, and record
+material omissions or budget pruning. See [target-owned search](../compilation/performance-models.md#target-owned-matrix-search-adapters)
+and [input-boundary alternatives](../compilation/rewrites.md#input-boundary-rewrites).

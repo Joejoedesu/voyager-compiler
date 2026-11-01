@@ -3,9 +3,83 @@
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from pathlib import Path
+
+
+@dataclass
+class EncodedIR:
+    """Common operation IR plus target-owned, versioned records and array payloads.
+
+    Encode hooks fill these projections from frozen decisions. They contain no
+    live FX nodes, callbacks or hardware objects; emitters receive saved files.
+    """
+
+    model: object
+    target_data: dict = field(default_factory=dict)
+    payloads: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SavedBundle:
+    """Verified, relocatable input to an emitter; never reconstructs live FX."""
+
+    directory: Path
+    manifest: dict
+
+    @classmethod
+    def load(cls, directory):
+        directory = Path(directory).resolve()
+        manifest = json.loads((directory / "bundle.json").read_text())
+        if manifest.get("schema_version") != 2:
+            raise ValueError("independent emission requires bundle schema 2")
+        bundle = cls(directory, manifest)
+        bundle.verify()
+        return bundle
+
+    def path(self, name):
+        path = (self.directory / name).resolve()
+        if (
+            not path.is_relative_to(self.directory)
+            or name not in self.manifest["files"]
+        ):
+            raise ValueError(f"not a bundle member: {name}")
+        return path
+
+    def verify(self):
+        for name, expected in self.manifest["files"].items():
+            with self.path(name).open("rb") as stream:
+                actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            if actual != expected:
+                raise ValueError(f"bundle checksum mismatch: {name}")
+
+    def read_json(self, name):
+        return json.loads(self.path(name).read_text())
+
+    @property
+    def target_data(self):
+        record = self.read_json("target_ir.json")
+        if (
+            record["target"] != self.manifest["target"]
+            or record["schema_version"] != 1
+        ):
+            raise ValueError("target IR identity or schema mismatch")
+        return record["data"]
+
+    def read_model(self):
+        from google.protobuf import text_format
+
+        from voyager_compiler.codegen.voyager_ir_pb2 import Model
+
+        return text_format.Parse(self.path("model.txt").read_text(), Model())
+
+    def read_payload(self, name):
+        import numpy as np
+
+        return np.load(
+            self.path(f"target_payloads/{name}.npy"), allow_pickle=False
+        )
 
 
 def to_data(value):
@@ -98,7 +172,7 @@ def save_bundle(program, config, output_dir, provenance=None):
                     stream, "sha256"
                 ).hexdigest()
     bundle = dict(
-        schema_version=1,
+        schema_version=2,
         target=program.plan.target,
         graph_digest=program.frozen_digest,
         plan_digest=program.plan_digest,

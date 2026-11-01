@@ -29,6 +29,11 @@ nonnegative affine correction per family; each fitted family needs at least two
 distinct modeled training timings and held-out coverage. Apply the returned
 profile through the compile API's `performance_profile` argument.
 
+For time-only endpoints, keep measured microseconds/milliseconds and the device
+completion boundary; do not invent a clock for this cycle-based fitter. Use a
+target-owned timing model/adapter and document its search cost convention. See
+[timing units](../compilation/performance-models.md#timing-units-and-observation-scope).
+
 This is not automatic candidate exploration. Arrange forced alternatives through
 the target's candidate controls or a scoped test registration, and retain the
 selected recipe/parameters, artifact identity and timing boundary in provenance.

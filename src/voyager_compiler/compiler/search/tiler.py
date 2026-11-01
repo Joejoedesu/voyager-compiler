@@ -13,7 +13,7 @@ from voyager_compiler.extensions import RuntimeModel
 # chosen; the least-traffic one among those wins.  0.0 = only the fastest.
 # The matrix search hands it to interstellar, which picks the least-energy
 # mapping among those.
-DEFAULT_RUNTIME_TOLERANCE = 0.02
+DEFAULT_RUNTIME_TOLERANCE = 0.0
 
 
 @dataclass(frozen=True)

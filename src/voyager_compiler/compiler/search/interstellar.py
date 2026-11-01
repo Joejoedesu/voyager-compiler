@@ -21,13 +21,13 @@ import multiprocessing
 import operator
 import os
 import time
+from copy import copy
 from dataclasses import dataclass, replace
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
     get_anchor_node,
     is_conv2d,
-    is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
 )
@@ -37,7 +37,11 @@ from voyager_compiler.compiler.search.lowering import (
     row_block,
 )
 from voyager_compiler.compiler.search.tile_shapes import gemv_op_tiling
-from voyager_compiler.compiler.search.tiler import TileConstraint
+from voyager_compiler.compiler.search.tiler import (
+    DEFAULT_RUNTIME_TOLERANCE,
+    TileConstraint,
+)
+from voyager_compiler.extensions import NoLegalMapping
 from voyager_compiler.ir.plan import GridSpace, MatrixSpace, TileResult
 from voyager_compiler.shape_prop import ShapeProp
 
@@ -87,7 +91,133 @@ class _Search:
     def key(self):
         """What the result depends on, which keys the tiler's cache: the
         op's key and the constraint."""
-        return self.op.key, self.constraint
+        return self.op.key, self.constraint, self.tolerance
+
+
+def memory_level(config, operands, *, bytes_per_element=(1, 1, 1), slots=1):
+    """Resource capacities/partitions from named input/output/weight memories.
+
+    Widths convert byte capacities into Interstellar element slots. Use widths
+    of one for levels whose byte footprint is checked by OpModel.fit. Private
+    buffering can divide capacity with slots; shared fit must also count it.
+    This helper does not infer loop order, reuse, energy or bank-port legality.
+    """
+    from voyager_compiler.hardware import CapacityUnit
+
+    if (
+        len(operands) != 3
+        or len(bytes_per_element) != 3
+        or not isinstance(slots, int)
+        or slots < 1
+    ):
+        raise ValueError(
+            "memory_level needs three operands/widths and positive slots"
+        )
+    memories, capacities, partitions = {}, [], []
+    for name, width in zip(operands, bytes_per_element):
+        if not isinstance(width, int) or width < 1:
+            raise ValueError("operand widths must be positive integer bytes")
+        memory = config.memory_instance(name)
+        if memory.size.unit != CapacityUnit.BYTES or memory.size.value is None:
+            raise ValueError(
+                f"{name}: matrix resource requires a known byte capacity"
+            )
+        if name in memories:
+            index, previous_width = memories[name]
+            if previous_width != width:
+                raise ValueError(
+                    "Mixed-width operands sharing memory need a byte-based fit callback"
+                )
+        else:
+            index = len(capacities)
+            memories[name] = index, width
+            capacities.append(int(memory.size.value) // (width * slots))
+        partitions.append(index)
+    return capacities, partitions
+
+
+def validate_mapping(mapping, layer, levels):
+    """Reject malformed selected results before builders project them."""
+    fields = (
+        mapping.loop_blockings,
+        mapping.loop_partitionings,
+        mapping.loop_orders,
+    )
+    if any(
+        len(rows) != le.NUM or any(len(row) != levels for row in rows)
+        for rows in fields
+    ):
+        raise ValueError("matrix mapping dimensions disagree with the resource")
+    for loop, extent in enumerate(layer.sizes):
+        factors = (
+            *mapping.loop_blockings[loop],
+            *mapping.loop_partitionings[loop],
+        )
+        if (
+            any(not isinstance(v, int) or v < 1 for v in factors)
+            or math.prod(factors) != extent
+        ):
+            raise ValueError(
+                "matrix mapping factors do not cover the declared layer"
+            )
+    for level in range(levels):
+        active = [
+            loop
+            for loop in range(le.NUM)
+            if mapping.loop_blockings[loop][level]
+            * mapping.loop_partitionings[loop][level]
+            > 1
+        ]
+        ranks = [mapping.loop_orders[loop][level] for loop in active]
+        if sorted(ranks) != list(range(len(active))):
+            raise ValueError("matrix mapping has an invalid active loop order")
+
+
+def search_matrix(
+    op,
+    layer,
+    *,
+    constraint=None,
+    runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE,
+    name="matrix",
+):
+    """Reuse Interstellar with a target-owned operation adapter.
+
+    The caller supplies a Layer and an OpModel whose MatrixSpace owns the
+    Resource, Schedule and optional full-mapping legality predicate. Returns
+    TileResult without assuming the shared bufferized builder's loop order or
+    converting the mapping to its grid. A custom builder must consume the
+    returned mapping and placement without retiling. Fit sees blocking totals
+    before ordering; mapping_filter sees the complete ordered mapping.
+
+    MatrixSpace.fit_level identifies the internal level checked by OpModel.fit.
+    The shared FX/grid builder remains a four-level, L2-fit consumer; native
+    recipes may supply another hierarchy with their own resource units/order.
+    """
+    if not isinstance(op.space, MatrixSpace):
+        raise TypeError("search_matrix requires an OpModel with MatrixSpace")
+    if not math.isfinite(runtime_tolerance) or runtime_tolerance < 0:
+        raise ValueError("runtime_tolerance must be finite and nonnegative")
+    levels = op.space.architecture.buffer_levels()
+    if not 0 < op.space.fit_level < levels - 1:
+        raise ValueError("fit_level must identify an internal memory level")
+    search = _Search(name, op, layer, constraint, runtime_tolerance)
+    return _finish_search(search, _run_search(search))
+
+
+def _require_shared_matrix_schedule(space, name):
+    """The shared pipelined builder keeps one reduction live at a time."""
+    if space.architecture.buffer_levels() != 4 or space.fit_level != 2:
+        raise ValueError(
+            "shared matrix builder requires four levels and fit_level=2"
+        )
+    ic_hint = space.schedule.schedule_hint[le.IC][3]
+    if ic_hint is None or ic_hint[0] != 0:
+        raise ValueError(
+            f"{name}: the shared matrix builder requires the L3 reduction "
+            "innermost; use search_matrix with a compatible custom builder "
+            "for another loop structure"
+        )
 
 
 def _prepare_search(node, tiler, constraint):
@@ -109,7 +239,7 @@ def _prepare_search(node, tiler, constraint):
         ``(op, search)``: the anchor's ``OpModel``, and its ``_Search`` when
         its space is a ``MatrixSpace``, else ``None``.  ``None`` instead when
         no search applies: not a GEMM / conv, an anchor that carries an
-        ``l2_tiling``, a depthwise conv, or one the model leaves untiled.
+        ``l2_tiling``, or one the target model leaves untiled.
     """
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor) or anchor.meta.get("l2_tiling") is not None:
@@ -130,13 +260,12 @@ def _prepare_search(node, tiler, constraint):
         for i, ph in enumerate(phs):
             ph.meta["dtype"] = dtypes[i]
 
-    if is_depthwise_conv(anchor):
-        return None
     op = tiler.model.prepare(node)
     if op is None:
         return None
     if not isinstance(op.space, MatrixSpace):
         return op, None
+    _require_shared_matrix_schedule(op.space, anchor.name)
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
     # else _detect_mha_relayout can't store the tile: that joins whatever
@@ -193,12 +322,12 @@ def _run_search(search):
     """The ``MappingPoint`` interstellar picks for ``search``.
 
     Interstellar is driven through its own contract.  It sizes the scratchpad
-    level (L2) of every blocking before it partitions the blocking and orders
+    level (MatrixSpace.fit_level) of every blocking before it partitions the blocking and orders
     the loops, through ``layer.size_fn``, which answers ``_FITS`` or ``_VETO``
     from the op's ``fit`` of interstellar's own point -- its capacity check then
     holds exactly when the model's does -- and it prices each full mapping
     through its runtime callback, the op's ``cost``.  The constraint vetoes a
-    tile off its L2 extents before ``fit`` is asked.  The fit reads only a
+    tile off its selected-level extents before ``fit`` is asked.  The fit reads only a
     blocking's per-level totals (``_level_totals``) -- above L0, which no matrix
     space partitions, they are its blockings -- so every partitioning and loop
     order of the blocking takes its answer.  Interstellar prices those right
@@ -208,36 +337,26 @@ def _run_search(search):
     Dispatches no torch op, so it is safe in a forked worker (:class:`_Search`).
 
     Raises:
-        ValueError: The schedule does not pin the reduction innermost at L3.
         RuntimeError: No tiling fits on chip.
     """
     op, constraint = search.op, search.constraint
     space = op.space
-    # The builders accumulate a split reduction across consecutive grid
-    # steps, so the schedule has to pin IC innermost at L3.
-    ic_hint = space.schedule.schedule_hint[le.IC][3]
-    if ic_hint is None or ic_hint[0] != 0:
-        raise ValueError(
-            f"{search.name}: the schedule does not pin the L3 reduction "
-            "innermost, so the builders could not emit its nest"
-        )
-
     last = None, None  # the blocking fit last: its totals, its Placement
 
     def fit(mapping):
-        """``op.fit`` of ``mapping``, vetoed off the constraint by its L2
+        """``op.fit`` of ``mapping``, vetoed off the constraint by its selected-level
         extents, kept as ``last``."""
         nonlocal last
         totals = _level_totals(mapping)
         allowed = constraint is None or constraint.allows(
-            lambda loop: math.prod(totals[loop][:3])
+            lambda loop: math.prod(totals[loop][: space.fit_level + 1])
         )
         last = totals, (op.fit(mapping) if allowed else None)
         return last[1]
 
     def size_fn(point, *_):
         """``Layer.size_fn``: whether ``point``'s blocking fits.  Interstellar
-        asks it only at L2, before it partitions the blocking
+        asks it at the configured fit level, before it partitions the blocking
         (``opt_valid_blocking``), so ``point`` has no loop orders and
         partitionings of 1.  The other arguments are interstellar's
         contract."""
@@ -250,13 +369,26 @@ def _run_search(search):
         totals, placement = last
         if _level_totals(mapping) != totals:
             placement = fit(mapping)
-        return op.cost(mapping, placement).latency
+        if placement is None or (
+            space.mapping_filter is not None
+            and not space.mapping_filter(mapping)
+        ):
+            return math.inf
+        latency = op.cost(mapping, placement).latency
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError(
+                f"{search.name}: model cost must be finite and nonnegative"
+            )
+        return latency
 
-    search.layer.size_fn = size_fn
+    # Fit policy belongs to this search, not the caller-owned Layer.
+    layer = copy(search.layer)
+    layer.size_fn = size_fn
+    layer.size_fn_levels = (space.fit_level,)
     try:
         result = interstellar.optimizer.opt_optimizer(
             space.architecture,
-            search.layer,
+            layer,
             space.schedule,
             runtime,
             verbose=False,
@@ -268,7 +400,7 @@ def _run_search(search):
         # invariant break.
         if "No valid mapping point found" not in str(e):
             raise
-        raise RuntimeError(f"{search.name}: no tiling fits on chip") from e
+        raise NoLegalMapping(f"{search.name}: no tiling fits on chip") from e
     _, _, mapping, _ = result
     return mapping
 
@@ -279,11 +411,20 @@ def _finish_search(search, mapping):
     interstellar's per-level ``(input, output, weight)`` access counts, which
     the ``Tiling`` proto reports."""
     op = search.op
+    validate_mapping(
+        mapping, search.layer, op.space.architecture.buffer_levels()
+    )
     placement = op.fit(mapping)
+    if placement is None:
+        raise NoLegalMapping(f"{search.name}: selected mapping does not fit")
     cost = op.cost(mapping, placement)
+    if not math.isfinite(cost.latency) or cost.latency < 0:
+        raise ValueError(
+            f"{search.name}: model cost must be finite and nonnegative"
+        )
 
     blockings = mapping.loop_blockings
-    for level in (1, 2, 3):
+    for level in range(1, op.space.architecture.buffer_levels()):
         logger.info(
             f"[interstellar] {search.name} L{level} tiles: "
             f"IC={blockings[le.IC][level]} OC={blockings[le.OC][level]} "
@@ -476,8 +617,13 @@ def search_tilings(pairs, tiler):
         op, search = prepared
         if search is None:
             try:
-                gemv_op_tiling(node, op, constraint)
-            except RuntimeError:  # no tiling fits
+                gemv_op_tiling(
+                    node,
+                    op,
+                    constraint,
+                    runtime_tolerance=tiler.runtime_tolerance,
+                )
+            except NoLegalMapping:  # no tiling fits
                 results[node, constraint] = None
             else:
                 results[node, constraint] = node.meta["tile_result"]
@@ -490,7 +636,7 @@ def search_tilings(pairs, tiler):
         any other error propagates with its traceback."""
         try:
             return _run_search(search)
-        except RuntimeError:
+        except NoLegalMapping:
             return None
 
     keys = list(pending)
@@ -594,7 +740,13 @@ def get_tiling(node, tiler=None):
         return None, None
     op, search = prepared
     if isinstance(op.space, GridSpace):
-        return batch_dims + gemv_op_tiling(node, op, constraint), None
+        return (
+            batch_dims
+            + gemv_op_tiling(
+                node, op, constraint, runtime_tolerance=tiler.runtime_tolerance
+            ),
+            None,
+        )
 
     if search.key in tiler.cache:
         cached = tiler.cache[search.key]

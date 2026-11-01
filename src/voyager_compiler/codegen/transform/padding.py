@@ -15,6 +15,7 @@ from voyager_compiler.codegen.node_info import (
     is_conv2d,
     is_depthwise_conv,
     is_gemm_op,
+    is_grouped_conv,
     is_matmul,
 )
 from voyager_compiler.export_utils import (
@@ -517,6 +518,10 @@ def pad_matrix_op_dimensions(
             continue
 
         is_dw = is_depthwise_conv(node)
+        if is_grouped_conv(node) and not is_dw:
+            # Dense lane padding would change group membership. Leave this
+            # signature intact for target legalization or implementation.
+            continue
         is_conv = is_conv2d(node)
         is_mm = is_matmul(node)
 
@@ -533,6 +538,12 @@ def pad_matrix_op_dimensions(
         # outputs pad to whole PE columns.
         bs = node.kwargs.get("block_size", 1)
         multiple = math.lcm(pe_array_size[0], bs)
+        multiplier = oc // ic if is_dw else 1
+        if is_dw:
+            multiple = math.lcm(
+                multiple,
+                pe_array_size[1] // math.gcd(pe_array_size[1], multiplier),
+            )
         padding_ic = (multiple - (ic % multiple)) % multiple
         padding_ic_scale = (ic + padding_ic) // bs - math.ceil(ic / bs)
         padding_oc = (-oc) % pe_array_size[1]
@@ -553,7 +564,7 @@ def pad_matrix_op_dimensions(
         # grows only along its output channels.
         if is_dw:
             node.args = node.args[:-1] + (node.args[-1] + padding_ic,)
-            padding_oc = padding_ic
+            padding_oc = padding_ic * multiplier
             padding_ic = padding_ic_scale = 0
 
         if is_conv:

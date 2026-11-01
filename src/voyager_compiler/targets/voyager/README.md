@@ -10,13 +10,48 @@ invariants; this page owns the default target's bindings and regression scope.
 | Extension | Binding and responsibility |
 | --- | --- |
 | `hardware` | Shared `AcceleratorConfig` describes the default device |
-| `implementations` | Shared recipes, with `build_pointwise` and `build_gemm` overrides; GEMM retains its shape-only tail for artifact compatibility |
+| `implementations` | Shared dense/vector recipes, pointwise and GEMM overrides, and explicit whole-operation grouped/depthwise recipes; GEMM retains its shape-only tail for artifact compatibility |
 | `model` | `implementations:VoyagerModel` and paired operation models for fit/cost evaluation |
 | `operators` | `implementations/kernels.py:OPERATORS` declares primitive semantics |
 | `encode` | `codegen.py:encode` produces the established model projection |
 
 Other hooks retain shared defaults. Workload/frontends own export/calibration;
 shared search, bufferization and allocation own their normal stages.
+
+## Grouped and depthwise dispatch
+
+`voyager.depthwise` and `voyager.grouped` explicitly select the existing
+whole-operation convolution path. `VoyagerModel.prepare` leaves these operations
+untiled; shared search has no target-independent depthwise exclusion. The recipe
+reuses the convolution template with `whole_tensor=True` for fused MX epilogues
+and the existing untiled template otherwise. Dense recipes are disjoint. This
+preserves the established control and instruction format; it does not add a new
+grouped-convolution tiling search or establish hardware support for new signatures.
+
+## Opt-in attention algorithm comparison
+
+```python
+from voyager_compiler.targets.voyager.target import with_attention_algorithms
+
+target = with_attention_algorithms()
+# Pass target to compile_workload(..., target, ..., config=config).
+```
+
+This target value compares `voyager.attention.materialized` with
+`voyager.attention.streaming` for supported FP32 SDPA regions. The first reuses
+Voyager GEMM/vector recipes; the second uses its FA3 builder/attention model.
+The registered default target and quantized attention recipe remain unchanged.
+Supply the complete hardware configuration, including local buffer capacities,
+as for normal matrix search. `runtime_tolerance=0` selects strict modeled latency;
+this is now the default. A positive tolerance explicitly enables near-fastest
+traffic/energy selection.
+
+Current comparison excludes masks, dropout, causal mode, GQA and differing value
+head widths. Materialization can handle per-GEMM padding; streaming rejects shapes
+whose products have no legal mapping. Inspect `plan.alternatives`, `plan.rejected`
+and the winner's `components`. Costs are analytical estimates, not measurements.
+See [algorithm comparison](../../../../docs/compilation/algorithm-search.md) and
+`tests/test_region_algorithms.py` for the shared contract and forced-recipe checks.
 
 ## Padding
 
@@ -29,34 +64,37 @@ before reusing it. See the shared [padding decisions](../../../../docs/compilati
 
 ## Pinned development gate
 
-The Voyager gate selects the user's 11 cases from the 26-case historical
-snapshot. The historical KIVI failure is outside that selection. Some selected
-cases have pinned numerical warnings: preserving those warnings passes artifact
-compatibility, not numerical accuracy. The approved decode replacement at
-`../reference-point/voyager-decode-corrected-2026-10-23` retains both concatenation
-copies and supersedes only that one artifact. All other comparators remain fixed.
+The active reference is `reference-point/voyager-latency0-2026-10-31`, selected
+by `validation/reference-baselines.json`. Its 11 development cases explicitly
+pin `--runtime_tolerance 0.0`: minimize modeled latency, with secondary criteria
+only breaking equal-latency ties. The user approved this replacement after the
+compiler default changed from 2% to 0%. The historical 26-case snapshot and the
+October 23 decode correction remain archived; the active snapshot includes both
+required concatenation copies.
 
-Run from the repository root using the existing environment and a fresh output:
+Eight cases match their numerical references; three Llama cases retain pinned
+numerical warnings. Passing this gate establishes artifact/status/warning-summary
+compatibility, not model accuracy. Changing a reduction tile can change BF16
+rounding; a new search policy needs its own numerical acceptance check.
+
+Run from the repository root into a fresh output directory:
 
 ```bash
 /home/zhouhua/Research/ML/ml-env/bin/python validation/run_references.py \
-  ../reports/voyager-suite-RUN --jobs 2 --dependency-path ../.validation-packages
+  results/voyager-suite-RUN --offline --jobs 2 --dependency-path ../.validation-packages
 ```
 
-Use a new `RUN` directory each time. The two ImageNet-dependent Voyager cases
-use an ImageNet input (three calibration steps for ResNet INT8, one example
-image for ViT). The original frontend uses streaming, but the current static-
-preparation validation runs entirely locally: `--offline`, the existing GLUE/
-WikiText Arrow caches with workspace-local lock files, and an explicit local
-ImageNet adapter preserving TFDS validation order. The report evidence records
-the adapter, image checksums and exact invocations under
-`../reports/voyager-static-preparation-2026-10-24/`. Both ImageNet cases must
-still match the original pinned model hashes and numerical summaries. Disable
-optional dataset download-count requests with `HF_UPDATE_DOWNLOAD_COUNTS=0`;
-those S3 HEAD requests are not required for input loading or compilation. The environment is Python 3.13/Torch
-2.12.1+cu130/TorchAO 0.17, running on CPU. The dependency path contains only small
-existing compatibility dependencies, not another Torch/CUDA environment.
-
+The runner reads the baseline and commands named by the pins, checks their
+checksums, and records the explicit search policy. `validation/run_case.py`
+supplies the two ImageNet-dependent cases with local images in pinned order,
+verifying their checksums and retaining the original frontend transforms.
+The image paths are recorded in the snapshot's `imagenet-inputs.json`.
+GLUE/WikiText reuse existing Arrow caches; offline runs stage file links under
+the output directory so cache locks and new writes stay local. Set
+`HF_DATASETS_CACHE` to select another existing cache source. No dataset download,
+sitecustomize adapter or report-directory environment setup is required.
+Optional dataset download-count telemetry is disabled. The existing CPU-capable
+environment and small compatibility dependency directory remain sufficient.
 
 Source base: compiler-2 `cef1e7e42b31e1cfcc01a1e4e02cedab11e3e9ef`.
 

@@ -13,8 +13,8 @@ from voyager_compiler.codegen.node_info import (
     gemm_layout,
     get_arg_value,
     is_conv2d,
-    is_depthwise_conv,
     is_fully_connected,
+    is_grouped_conv,
     is_linear,
     is_matmul,
     is_nop,
@@ -166,7 +166,7 @@ def _permute_inputs(
     # Case A: Input is a weight (Parameter) or weight scale.
     conv = next((n for n in node.users if is_conv2d(n)), None)
     if node.op == "get_attr" and conv is not None:
-        if is_depthwise_conv(conv):
+        if is_grouped_conv(conv):
             return None
 
         w = get_arg_value(conv, 1, "weight")

@@ -16,6 +16,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
+from typing import Callable
 
 
 class Role(Enum):
@@ -98,11 +99,20 @@ class MatrixSpace:
         architecture: The interstellar ``Resource``: the memory levels, their
             capacities and the PE array.
         schedule: The interstellar ``Schedule``: the loops and orders the
-            search is pinned to.
+            target/recipe permits, not the default target's schedule.
+        mapping_filter: Optional target predicate on a complete MappingPoint,
+            including loop orders. Capacity/extent-only checks belong in fit;
+            this predicate runs after ordering and before cost. Keep it pure
+            and usable in forked workers. Changes must change the model key.
+        fit_level: Internal memory level checked by fit and TileConstraint.
+            Default 2 retains the shared four-level builder contract; native
+            recipes may describe another hierarchy (for example three levels).
     """
 
     architecture: object
     schedule: object
+    mapping_filter: Callable | None = None
+    fit_level: int = 2
 
 
 @dataclass(frozen=True)
@@ -183,7 +193,8 @@ class TileResult:
         cost: Its :class:`Cost`; ``None`` from an unranked grid search.
         access_list: Interstellar's per-level ``(input, output, weight)``
             access counts, which emit reports; ``None`` off the matrix
-            search.
+            search. These are logical Interstellar accesses, not a native DMA
+            trace or measured traffic; physical estimates belong in Cost.
     """
 
     tiling: object
@@ -218,6 +229,10 @@ class ImplementationChoice:
     tile: TileResult | None = None
     cost: Cost | None = None
     requirements: tuple[BufferRequirement, ...] = ()
+    # Ordered component choices for a region lowered as sequential kernels.
+    # The parent's cost covers the region; components are attribution, not
+    # additional work to charge again.
+    components: tuple[tuple[str, "ImplementationChoice"], ...] = ()
 
 
 @dataclass(frozen=True)

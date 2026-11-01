@@ -27,6 +27,18 @@ target's bindings. Start with these source owners; follow imports as needed:
 | Target has multiple engines or distinct local memories | Declare where operands, partial sums and temporaries live, when transfers happen and which engines/dependencies permit overlap. Pair every extra buffer or transpose with the model. |
 | Native macro hides internal control, or algorithm has a new loop structure | Use explicit invocation ownership for native work. Add a builder when shared control cannot express the algorithm; unsupported effects/completion require a scoped IR change. |
 
+For a fixed region assembled from sequential kernels, reuse
+[`build_sequential_region`](../compilation/algorithm-search.md#reuse-sequential-component-kernels).
+It returns bufferized FX with ordered component choices and a complete sequential
+cost. A streaming or recomputation schedule needs its own builder/model; summing
+component latencies does not describe overlapping execution.
+
+Grouped/depthwise convolution describes connectivity, not an execution unit.
+Select a group-aware or native recipe. The shared dense convolution template
+cannot split independent groups as a dense C reduction; `whole_tensor=True`
+explicitly reuses its whole-operation form, including fused epilogues. Target
+models decide search support; the shared search does not skip depthwise ops.
+
 ## Do
 
 1. Reuse templates when differences are layout, placement or primitive realization. Add a builder for a different algorithmic control structure, not for every PyTorch spelling.
@@ -53,3 +65,8 @@ Return executable buffers/control, scratch/native reservations, changed movement
 Replay affected kernels/regions, check state and view-observable results, and verify allocation constraints. Include emitted/submitted checks when changing target execution assumptions.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)
+
+When reusing a search engine, separately check that this builder can realize its
+full mapping: spatial tiling, reduction order, buffering and retained operands.
+The shared matrix builder's reduction-inner restriction is not a universal target
+constraint. Custom builders can use [the matrix search adapter](../compilation/performance-models.md#target-owned-matrix-search-adapters).

@@ -4,6 +4,8 @@ Operation expansions are adapted from the voyager-gemmini donor scheduler.
 Residual phase drains preserve its validated conservative load/add/store order.
 """
 
+from ..semantics import tile_storage
+
 SPAD_ROWS = 16384
 ACC_ROWS = 1024
 from ._encoding import ACC, command, ex, ld, loop_conv, loop_mm, st, tile
@@ -16,8 +18,8 @@ def ceildiv(a, b):
 def matmul(p, addr):
     m, k, n = p["m"], p["k"], p["n"]
     tm, tn, tk = p["tile"]
-    i, j, z = (ceildiv(v, 16) for v in (tm, tn, tk))
-    if 16 * i * j > ACC_ROWS // 2 or 16 * (i + j) * z > SPAD_ROWS // 2:
+    sp, acc = tile_storage("matmul", p, p["tile"], "hardware_loop")
+    if sp > SPAD_ROWS * 16 // 2 or acc > ACC_ROWS * 64 // 2:
         raise ValueError("Matmul tile exceeds double-buffered Lean capacity")
     a, b, c = addr["a"], addr["b"], addr["y"]
     d = addr.get("bias", 0)
@@ -47,15 +49,19 @@ def matmul(p, addr):
     return out
 
 
-def conv(p, addr):
+def conv(p, addr, *, depthwise=False):
     batch, h, w, ci, co, oh, ow, k = (
         p[x] for x in ("batch", "h", "w", "ci", "co", "oh", "ow", "kernel")
     )
     stride, pad = p.get("stride", 1), p.get("pad", 0)
-    tr, tc, to, ti = p["tile"]
-    ar = (tr * stride + k - 1) * (tc * stride + k - 1) * ceildiv(ti, 16)
-    br = k * k * ti * ceildiv(to, 16)
-    if ar + br > SPAD_ROWS // 2 or tr * tc * ceildiv(to, 16) > ACC_ROWS // 2:
+    tr, tc, to, ti = (*p["tile"], 1, 1) if depthwise else p["tile"]
+    sp, acc = tile_storage(
+        "depthwise_conv2d" if depthwise else "conv2d",
+        p,
+        p["tile"],
+        "hardware_loop",
+    )
+    if sp > SPAD_ROWS * 16 // 2 or acc > ACC_ROWS * 64 // 2:
         raise ValueError(
             "Convolution tile exceeds double-buffered Lean capacity"
         )
@@ -68,7 +74,7 @@ def conv(p, addr):
         for r in range(0, oh, tr):
             for c in range(0, ow, tc):
                 for oc in range(0, co, to):
-                    for ic in range(0, ci, ti):
+                    for ic in ((oc,) if depthwise else range(0, ci, ti)):
                         rows, cols = min(tr, oh - r), min(tc, ow - c)
                         ir, ix = r * stride - pad, c * stride - pad
                         up, lp = max(0, -ir), max(0, -ix)
@@ -96,14 +102,16 @@ def conv(p, addr):
                             x=addr["x"]
                             + ((b * h + ir + up) * w + ix + lp) * ci
                             + ic,
-                            weight=addr["weight"] + ic * co + oc,
-                            bias=bias + oc * 4 if ic == 0 else 0,
+                            weight=addr["weight"]
+                            + (oc * k * k if depthwise else ic * co + oc),
+                            bias=bias + oc * 4 if depthwise or ic == 0 else 0,
                             y=(
                                 addr["y"] + ((b * oh + r) * ow + c) * co + oc
-                                if ic + ti >= ci
+                                if depthwise or ic + ti >= ci
                                 else 0
                             ),
                             no_bias=False,
+                            depthwise=depthwise,
                             relu=p.get("relu", False),
                         )
     return out
@@ -116,7 +124,10 @@ def pointwise(kind, p, addr):
         st(channels, p.get("scale", 1), kind == "relu" or p.get("relu", False)),
     ]
     if kind == "average":
-        out += [ld(channels, shrunk=True), st(channels, 1 / p["pixels"])]
+        out += [
+            ld(channels, shrunk=True),
+            st(channels, p.get("scale", 1) / p["pixels"]),
+        ]
         for b in range(p.get("batch", 1)):
             for c in range(0, channels, 16):
                 nc = min(16, channels - c)
@@ -234,8 +245,8 @@ def maxpool(p, addr):
 def expand(kind, params, addresses):
     if kind == "matmul":
         return matmul(params, addresses)
-    if kind == "conv2d":
-        return conv(params, addresses)
+    if kind in ("conv2d", "depthwise_conv2d"):
+        return conv(params, addresses, depthwise=kind == "depthwise_conv2d")
     if kind in ("add", "relu", "requantize", "average"):
         return pointwise(kind, params, addresses)
     if kind == "maxpool":
@@ -248,10 +259,8 @@ def explicit_matmul(p, addr):
     m, n, k = (p[key] for key in ("m", "n", "k"))
     tm, tn, tk = p["tile"]
     a_rows = tm * ceildiv(tk, 16)
-    if (
-        a_rows + tk * ceildiv(tn, 16) > SPAD_ROWS
-        or tm * ceildiv(tn, 16) > ACC_ROWS
-    ):
+    sp, acc = tile_storage("matmul", p, p["tile"], "explicit")
+    if sp > SPAD_ROWS * 16 or acc > ACC_ROWS * 64:
         raise ValueError("Explicit matmul tile exceeds physical memory")
     commands = [
         ex(),

@@ -10,8 +10,8 @@ from voyager_compiler.compiler.bufferize.invocation import build_native
 from voyager_compiler.compiler.bufferize.residency import build_whole
 from voyager_compiler.ir.buffer import TargetInvoke
 
-from .scheduling import cost, footprint, raw_requirements
-from .semantics import facts, raw_dimensions
+from .scheduling import cost, footprint, raw_requirements, search_native
+from .semantics import facts, raw_dimensions, selected_tile
 
 
 def build_raw_explicit(node, context, parameters):
@@ -50,7 +50,15 @@ def build_raw_loop(node, context, parameters):
 
 def build_native_kernel(node, context, parameters):
     kind, p, _ = facts(node)
-    tile, mode = parameters["tile"], parameters["mode"]
+    mode = parameters["mode"]
+    if kind in ("matmul", "conv2d") and "tile" not in parameters:
+        result = search_native(kind, p, mode, context)
+        node.meta["tile_result"] = result
+        tile = selected_tile(kind, p, result.tiling)
+        requirements = result.placement.requirements
+    else:
+        tile = parameters["tile"]
+        requirements = footprint(kind, p, tile, mode, context.tiler.config)
     invocation = TargetInvoke(
         f"gemmini.{kind}.{mode}",
         kind,
@@ -59,15 +67,13 @@ def build_native_kernel(node, context, parameters):
         (),
         resources=(
             ("matrix", "scratchpad", "accumulator")
-            if kind in ("matmul", "conv2d")
+            if kind in ("matmul", "conv2d", "depthwise_conv2d")
             else ("dma", "accumulator")
         ),
         allocation_owner="native",
         scheduling_owner="hardware" if mode == "hardware_loop" else "compiler",
         implicit_traffic_bytes=cost(kind, p, tile, mode).dram_bytes,
-        native_requirements=footprint(
-            kind, p, tile, mode, context.tiler.config
-        ),
+        native_requirements=requirements,
     )
     return build_native(node, invocation)
 
@@ -113,7 +119,11 @@ def lower_operations(prepared, config, options):
     if any(n.target in (aten._int_mm.default, *OPS) for n in gm.graph.nodes):
         return
     for node in gm.graph.nodes:
-        if node.target not in (aten.relu_.default, aten.add_.Tensor):
+        if node.target not in (
+            aten.relu_.default,
+            aten.hardtanh_.default,
+            aten.add_.Tensor,
+        ):
             continue
         source = node.args[0]
         while True:
@@ -139,10 +149,20 @@ def lower_operations(prepared, config, options):
             user = next(iter(cursor.users))
             if user.target == qops.quantize_symmetric.default:
                 break
+            if user.target in (
+                aten.im2col.default,
+                aten.pad.default,
+            ) and not options.get("allow_input_packing", False):
+                raise NotImplementedError(
+                    "Gemmini host input packing requires the workload binding's allow_input_packing=True"
+                )
             if user.target not in (
                 aten.permute.default,
                 aten.reshape.default,
                 aten.view.default,
+                aten.transpose.int,
+                aten.im2col.default,
+                aten.pad.default,
             ):
                 raise NotImplementedError(
                     "Gemmini input requires an explicit INT8 quantization boundary"
@@ -290,33 +310,79 @@ def lower_operations(prepared, config, options):
                 b = constant(node.args[2], torch.int32)
             else:
                 name = node.name + "_zero_bias"
-                width = fetch_attr(gm, node.args[1].target).shape[-1]
+                weight_shape = fetch_attr(gm, node.args[1].target).shape
+                width = (
+                    weight_shape[0]
+                    if p.get("groups", 1) != 1
+                    else weight_shape[-1]
+                )
                 root.register_buffer(
                     name, torch.zeros(width, dtype=torch.int32)
                 )
                 b = graph.get_attr(name)
             if node.target == qops.linear.default:
-                if p["layout"] != "xc,ck" or len(node.args[0].value.shape) != 2:
+                if p["layout"] != "xc,ck" or len(node.args[0].value.shape) < 2:
                     raise NotImplementedError(
-                        "Gemmini linear requires shared xc,ck layout and rank-2 activation"
+                        "Gemmini linear requires shared xc,ck layout"
+                    )
+                shape = tuple(node.args[0].value.shape)
+                if len(shape) > 2:
+                    x = graph.call_function(
+                        aten.reshape.default, (x, (-1, shape[-1]))
                     )
                 result = graph.call_function(
                     native.matmul.default, (x, w, b, 1 / scale)
                 )
+                if len(shape) > 2:
+                    width = fetch_attr(gm, node.args[1].target).shape[-1]
+                    result = graph.call_function(
+                        aten.reshape.default, (result, (*shape[:-1], width))
+                    )
             else:
                 weight = fetch_attr(gm, node.args[1].target)
+                from voyager_compiler.codegen.node_info import is_depthwise_conv
+
+                depthwise = is_depthwise_conv(node)
+                kernel = weight.shape[2:] if depthwise else weight.shape[:2]
                 if (
-                    p["groups"] != 1
-                    or pair(p["dilation"]) != 1
-                    or weight.shape[0] != weight.shape[1]
+                    pair(p["dilation"]) != 1
+                    or kernel[0] != kernel[1]
+                    or (p["groups"] != 1 and not depthwise)
+                    or (depthwise and weight.shape[0] != p["groups"])
                 ):
                     raise NotImplementedError(
-                        "Gemmini requires square dense undilated convolution"
+                        "Gemmini supports square undilated dense or multiplier-one depthwise convolution"
                     )
                 result = graph.call_function(
-                    native.conv2d.default,
-                    (x, w, b, pair(p["stride"]), pair(p["padding"]), 1 / scale),
+                    (
+                        native.depthwise_conv2d.default
+                        if depthwise
+                        else native.conv2d.default
+                    ),
+                    (
+                        x,
+                        w,
+                        b,
+                        pair(p["stride"]),
+                        pair(p["padding"]),
+                        1 / scale,
+                    ),
                 )
+        elif node.target in (aten.hardtanh.default, aten.hardtanh_.default):
+            import math
+
+            # Scaling the INT32 accumulator into this output domain implements
+            # both bounds in the store, without an intermediate INT8 result.
+            if tuple(node.args[1:]) != (0.0, 6.0) or not math.isclose(
+                scale * 127, 6.0, rel_tol=1e-7
+            ):
+                raise NotImplementedError(
+                    "Gemmini ReLU6 saturation requires output scale 6/127; select the target ReLU6 quantization policy"
+                )
+            result = graph.call_function(
+                native.requantize.default,
+                (emit(node.args[0], scale), 1.0, True),
+            )
         elif node.target in (aten.relu.default, aten.relu_.default):
             result = graph.call_function(
                 native.requantize.default,
@@ -345,12 +411,14 @@ def lower_operations(prepared, config, options):
                 ),
             )
         elif node.target == qops.adaptive_avg_pool2d.default:
-            if pair(node.args[1]) != 1 or domain(node.args[0]) != scale:
+            if pair(node.args[1]) != 1:
                 raise NotImplementedError(
-                    "Gemmini global average requires a preserved quantization domain"
+                    "Gemmini supports global spatial average only"
                 )
+            input_scale = domain(node.args[0])
             result = graph.call_function(
-                native.average.default, (emit(node.args[0], scale),)
+                native.average.default,
+                (emit(node.args[0], input_scale), input_scale / scale),
             )
         elif node.target == qops.max_pool2d.default:
             p = parameters(node)
@@ -394,6 +462,42 @@ def lower_operations(prepared, config, options):
     scales = [domain(n) for n in leaves]
     lowered = [emit(n, s) for n, s in zip(leaves, scales)]
     graph.output(tree_unflatten(lowered, spec))
+    # These stores already support ReLU after the same integer rounding and
+    # saturation. Fuse only an exclusive, scale-preserving consumer.
+    for node in list(graph.nodes):
+        if node.target != native.requantize.default or node.args[1:] != (
+            1.0,
+            True,
+        ):
+            continue
+        value = source = node.args[0]
+        while source.target in transparent and len(source.users) == 1:
+            source = source.args[0]
+        if len(source.users) != 1 or source.target not in (
+            native.matmul.default,
+            native.conv2d.default,
+            native.depthwise_conv2d.default,
+            native.add.default,
+        ):
+            continue
+        source.update_kwarg("relu", True)
+        node.replace_all_uses_with(value)
+        graph.erase_node(node)
+    # MVIN performs exactly this INT8 round/saturate before addition. Retain the
+    # boundary but realize it during the load instead of a separate DRAM pass.
+    for node in graph.nodes:
+        if node.target != native.add.default:
+            continue
+        for index in (0, 1):
+            source = node.args[index]
+            if source.target != native.requantize.default:
+                continue
+            p = parameters(source)
+            if p["relu"] or node.args[index + 2] != 1.0:
+                continue
+            node.update_arg(index, source.args[0])
+            node.update_arg(index + 2, p["scale"])
+    graph.eliminate_dead_code()
     result = GraphModule(root, graph)
     expected = tree_unflatten(
         [(v / s).round().to(torch.int8) for v, s in zip(reference, scales)],

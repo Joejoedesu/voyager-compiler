@@ -32,6 +32,7 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_conv2d,
     is_full_reduction,
+    is_grouped_conv,
     is_nop,
     is_reshape_op,
     quant_param_arg_nodes,
@@ -2250,9 +2251,13 @@ def _stamp_anchor_meta(gm, anchor) -> None:
 
 
 def build_conv2d(
-    node: torch.fx.Node, ctx: BuildContext, *, accumulate_fp32: bool = False
+    node: torch.fx.Node,
+    ctx: BuildContext,
+    *,
+    accumulate_fp32: bool = False,
+    whole_tensor: bool = False,
 ) -> Optional[torch.fx.GraphModule]:
-    """Pipeline builder for a conv2d (groups=1) node — incl. the microscaling /
+    """Pipeline builder for dense conv2d — incl. the microscaling /
     codebook (``conv2d_mx``) variant, a fused bias, and the systolic NHWC layout
     — over the input-channel (C) cross-tile reduction.  A map over the (N, K,
     oH, oW) output grid plus a C reduction dim: the input is a strided
@@ -2260,8 +2265,14 @@ def build_conv2d(
     kernel convolves each C-block and accumulates.  Grid ``(N, K, oH, oW, C)``;
     for ``num_k == 1`` the C dim is extent 1.  Specs are logical NCHW/OIHW and
     projected onto each operand's physical order (``meta["transposed"]`` selects
-    NHWC + HWIO).  Returns the gm or ``None``.
+    NHWC + HWIO). A target may request ``whole_tensor=True`` for grouped
+    convolution, retaining OIHW weights and fused epilogues without dense
+    channel tiling. Returns the gm or ``None``.
     """
+    if is_grouped_conv(get_anchor_node(node)) and not whole_tensor:
+        # No dense channel reduction exists across independent groups. A target
+        # can explicitly request the whole-operation template (including fusion).
+        return None
     info = parse_fused_submodule(node, ctx.tiler)
     if info is not None:
         tiling, l3_order = info.tiling, info.l3_order
@@ -2280,8 +2291,6 @@ def build_conv2d(
 
     nhwc = anchor.meta.get("transposed", False)
     in_dims = NCHW_TO_NHWC if nhwc else None
-    # The layout pass never permutes a grouped conv's weight, so it stays
-    # OIHW even on a transposed node.
     w_dims = OIHW_TO_HWIO if nhwc and groups == 1 else None
     out_dims = NCHW_TO_NHWC if nhwc else None
 
@@ -2289,9 +2298,7 @@ def build_conv2d(
     K, wC, kH, kW = unproject(w.shape, w_dims)
     oH, oW = unproject(out.shape, out_dims)[2:]
 
-    # A grouped conv's C is not a dense reduction, so it cannot be diced --
-    # build it whole-tensor (a trip-1 nest).
-    if groups != 1 or tiling is None:
+    if whole_tensor or tiling is None:
         tiling = (1, 1, 1, 1)
     ny, nx, nk, nc = tiling
     tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
@@ -2384,14 +2391,11 @@ def build_conv2d(
             pad=project((0, 0, ph, pw), in_dims),
             pad_value=1.0,
         )
-        # A grouped weight has a single (or partial) in-channel, so its
-        # scale's own shape names the channel / kernel extents the dense
-        # arithmetic would misderive from the input's.
         ws_tile = (tk, tc // bs, kH, kW)
         ws = anchor.kwargs.get("weight_scale")
         if groups != 1 and isinstance(ws, torch.fx.Node):
-            s0, s1, s2, s3 = unproject(ws.value.shape, w_dims)
-            ws_tile = (s0 // nk, s1, s2, s3)
+            # Grouped scales follow OIHW's within-group channel extent.
+            ws_tile = tuple(ws.value.shape)
         wt_scale_qspec = _InputSpec(
             project(ws_tile, w_dims),
             project((gK, gC, None, None), w_dims),  # kH/kW whole -> None

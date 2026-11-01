@@ -39,6 +39,7 @@ from voyager_compiler.compiler.search.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     pick,
 )
+from voyager_compiler.extensions import NoLegalMapping
 from voyager_compiler.ir.plan import GridTiling, TileResult
 from voyager_compiler.ops.layout import NHWC_OP_VARIANTS
 
@@ -192,8 +193,13 @@ def _search_grid(op, full_shape, tolerance=0.0, **limits):
     )
 
 
-def gemv_op_tiling(node, op, constraint):
+def gemv_op_tiling(
+    node, op, constraint, *, runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE
+):
     """Per-dim tile counts for a matrix-vector GEMM, bare or fused.
+
+    Use the compilation tolerance for ranked candidates, including explicit
+    opt-in policies; the default is strict modeled latency.
 
     Called from ``get_tiling`` during bufferization, so it sees the layout the
     transform settled on and the operands fusion left on the kernel.  The
@@ -240,12 +246,12 @@ def gemv_op_tiling(node, op, constraint):
     result = _search_grid(
         op,
         (X, C, K),
-        DEFAULT_RUNTIME_TOLERANCE,
+        runtime_tolerance,
         multiple_of=tuple(multiple),
         pinned=pinned,
     )
     if result is None:
-        raise RuntimeError(
+        raise NoLegalMapping(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
@@ -368,7 +374,7 @@ def vector_op_tiling(node, tiler):
     if result is None and splits:
         result = search(last_dim=None)
     if result is None:
-        raise RuntimeError(
+        raise NoLegalMapping(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
@@ -428,7 +434,7 @@ def pool_op_tiling(node, tiler):
     multiple_of = (1,) * (len(full_shape) - 1) + (op.space.lanes,)
     result = _search_grid(op, full_shape, multiple_of=multiple_of, order=order)
     if result is None:
-        raise RuntimeError(
+        raise NoLegalMapping(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )

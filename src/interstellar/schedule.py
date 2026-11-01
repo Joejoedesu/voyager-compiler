@@ -17,9 +17,16 @@ class Schedule(object):
     hint_para_index: {mem level: [spatially unrolled loop indexes]}
     """
 
-    def __init__(self, schedule_hint, partition_loops=None):
+    def __init__(self, schedule_hint, partition_loops=None, *, order_priority=None):
 
         self.schedule_hint = schedule_hint
+        # Optional inner-to-outer precedence, independent of unit-size loops.
+        # Use only where the paired implementation fixes that order.
+        self.order_priority = dict(order_priority or {})
+        for level, order in self.order_priority.items():
+            if level < 0 or sorted(order) != list(range(le.NUM)):
+                raise ValueError("order_priority must give every loop exactly once")
+            self.order_priority[level] = tuple(order)
         if partition_loops != None:
             self.partition_loops = []
             for l in partition_loops:
@@ -28,6 +35,8 @@ class Schedule(object):
             self.partition_loops = partition_loops
 
         num_levels = len(list(schedule_hint.values())[0])
+        if any(level >= num_levels for level in self.order_priority):
+            raise ValueError("order_priority level exceeds the schedule hierarchy")
         hint_para_index = {}
         for loop in schedule_hint:
             for level in range(num_levels):

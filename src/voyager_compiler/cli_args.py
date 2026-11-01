@@ -494,11 +494,12 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--runtime_tolerance",
         type=float,
-        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()
+        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.0) in compile()
         help="How much longer than the best modeled runtime an interstellar "
         "tiling may take and still be chosen, as a fraction; among those, the "
-        "one with the least DRAM traffic wins.  0 = only the fastest "
-        "(default: 0.01).",
+        "one with the least energy (matrix) or traffic (grid/recipe) wins. "
+        "Default 0 selects the fastest modeled result; secondary criteria "
+        "only break equal-latency ties.",
     )
 
     # -- reporting (timing / DRAM-traffic estimator) ------------------------

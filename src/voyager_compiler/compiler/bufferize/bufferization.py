@@ -1078,16 +1078,37 @@ def bufferize_graph(
             if old is not None and new is not None and old != new
         }
         digest = _key_digest(key)
+        component_groups = {}
         for src, new in value_remap.items():
             if src.op != "placeholder" and isinstance(new, Node):
-                new.meta["scope"] = (scope, anchor.target)
-                new.meta["build_group"] = group
-                new.meta["implementation"] = choice
+                component_scope = (
+                    src.meta.get("scope", (src.name, src.target))
+                    if sub_gm.meta.get("region_choices")
+                    else None
+                )
+                if component_scope is not None:
+                    # Sequential kernels have independent searched bank groups
+                    # and measurement identities. Collapsing them into the outer
+                    # region falsely joins their bank reservations/lifetimes.
+                    if component_scope not in component_groups:
+                        component_groups[component_scope] = next(group_ids)
+                    new.meta["scope"] = (
+                        f"{scope}/{component_scope[0]}",
+                        component_scope[1],
+                    )
+                    new.meta["build_group"] = component_groups[component_scope]
+                    new.meta["implementation"] = src.meta.get("implementation")
+                else:
+                    new.meta["scope"] = (scope, anchor.target)
+                    new.meta["build_group"] = group
+                    new.meta["implementation"] = choice
                 # The group says which layers of THIS compile were built
                 # alike; the key says the same across compiles, which is what
                 # carries an RTL measurement from a two-layer compile to the
                 # full model.
-                new.meta["build_key"] = digest
+                new.meta["build_key"] = (
+                    src.meta.get("build_key") if component_scope else digest
+                )
                 tag = new.meta.get(BASE_TABLE_TAG)
                 if tag in retag:
                     new.meta[BASE_TABLE_TAG] = retag[tag]
@@ -1246,6 +1267,12 @@ def _dedup_regions(gm: GraphModule) -> None:
             sub = _subgraph(gm, node.target)
             if sub is not None:
                 _dedup_regions(sub)
+
+
+def build_untiled(node, context, parameters):
+    """Recipe entry point for the existing whole-tensor pipeline template."""
+    result = _build_for_untiled(node, context.tiler)
+    return result[0] if result is not None else None
 
 
 def _build_for_untiled(node: Node, tiler):

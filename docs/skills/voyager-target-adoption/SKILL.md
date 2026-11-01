@@ -52,10 +52,13 @@ independent properties, not universal prerequisites for coverage or model fittin
 
 `WorkloadSpec` supplies model/inputs and optional assets, calibration, state or
 reference behavior. `TargetSpec` supplies hardware and recipes plus applicable
-quantization policy, legalization, normalization, custom-operation lowering,
+input preprocessing, quantization policy, legalization, normalization, custom-operation lowering,
 refinement, encoding/emission and runtime
 hooks. Use the smallest existing hook; do not add target-name switches or invoke
 a donor pipeline inside a hook.
+
+For input-representation utilization problems, see
+[input preprocessing](../../../docs/roles/input-preprocessing.md), before quantization.
 
 Pair each equivalent ISA/algorithm form with semantic matching, legal candidates,
 resource requirements, a model/estimate and a builder. Competing recipes need
@@ -99,10 +102,19 @@ facts, policy choices and empirical corrections remain distinct.
 
 ## Validation and handoff
 
+Across experiments or resumptions, use the checkout's
+[adoption harness](../../../docs/adoption/harness.md) to retain the best validated
+artifact, opportunities and pending checks. Follow registration for missing target
+capabilities and workload binding for accuracy-constrained execution choices.
+Compare equivalent lowerings under the integer contract; compare changed numerical
+policies under fixed model/data/accuracy limits. Use the endpoint's timing unit and
+scope, keeping estimates separate from measurements.
+
 Run affected shared contracts and agreed gates, using a target guide when present
 or the declared workload/endpoint contract for a fresh target. Preserve
 pinned comparators, approved replacements and retained warnings. Use existing
-environments and fresh outputs; do not edit source during gates. Host reference,
+environments and fresh outputs; freeze the tested source/artifact snapshot while
+a gate runs. A separate candidate can develop independently. Host reference,
 artifact compatibility, endpoint correctness and performance are separate claims.
 Static/calibration inputs are not substitute hardware outputs.
 
@@ -110,3 +122,11 @@ Report changed/reused behavior, bound extension points, supported/rejected forms
 model/emission findings, measured versus estimated results and reproducible
 artifacts. Keep general docs target agnostic; target guides own local constraints
 and dated reports own run status. Follow the user's commit/push scope.
+
+For requested performance work, investigate material utilization gaps: permitted
+initial-input rewrites, candidate/adapter/builder expressiveness, ranking, and
+model–conversion–runtime agreement. Follow the checkout's
+[model construction and required diagnosis](../../../docs/compilation/performance-models.md).
+Default selection is strict modeled latency. Reuse Interstellar through
+`search_matrix` with target-owned constraints; do not inherit the default target's
+schedule or call a narrow candidate list a hardware limit.

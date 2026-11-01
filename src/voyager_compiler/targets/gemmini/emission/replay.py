@@ -9,7 +9,8 @@ import json
 from pathlib import Path
 
 import torch
-from torch.fx import Interpreter
+
+from voyager_compiler.replay import collect_replay_images
 
 from ._encoding import STATUS
 
@@ -18,48 +19,20 @@ APERTURE = 16 << 20
 
 
 def write_replay(result, directory, commands_path):
-    result.program.assert_frozen()
-    directory = Path(directory)
-    program = result.program.graph
-    size = (result.program.plan.allocation.dram_bytes + 15) // 16 * 16
-    if size > APERTURE:
-        raise ValueError(
-            "Whole-program replay exceeds the pinned 16 MiB endpoint aperture"
-        )
-    directory.mkdir(parents=True, exist_ok=False)
-    initial = bytearray([0xA5] * size)
-    expected = bytearray(initial)
-
-    def store(image, node, value):
-        segment = node.meta.get("memory")
-        if segment is None:
-            raise ValueError(
-                f"{node.name}: replay requires a finalized DRAM allocation"
-            )
+    def encode(value):
         if value.dtype not in (torch.int8, torch.int32):
             raise ValueError(
                 "Gemmini replay accepts signed integer payloads only"
             )
-        payload = value.detach().cpu().contiguous().numpy().tobytes()
-        if len(payload) > segment.end - segment.start:
-            raise ValueError("Replay payload exceeds allocation")
-        image[segment.start : segment.start + len(payload)] = payload
+        return value.detach().cpu().contiguous().numpy().tobytes()
 
-    class Replay(Interpreter):
-        def run_node(self, node):
-            value = super().run_node(node)
-            if node.op in ("placeholder", "get_attr") and isinstance(
-                value, torch.Tensor
-            ):
-                store(initial, node, value)
-                store(expected, node, value)
-            if node.target == torch.ops.voyager.insert.default:
-                source, destination = node.args
-                store(expected, destination, self.env[source])
-            return value
-
-    with torch.no_grad():
-        Replay(program).run(*result.args)
+    images = collect_replay_images(
+        result, encode, alignment=16, capacity=APERTURE
+    )
+    initial, expected = images.initial, images.expected
+    size = len(initial)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
     command_stream = json.loads(Path(commands_path).read_text())["commands"]
     records = [
         dict(type="defaults", status=STATUS),

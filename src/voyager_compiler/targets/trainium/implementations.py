@@ -1,5 +1,6 @@
 """Searchable FP8 single-row and paired-row TensorE realizations."""
 
+import numpy as np
 import torch
 
 from voyager_compiler.extensions import CandidateRejected, ImplementationSpec
@@ -105,5 +106,17 @@ def encode(encoded, program, config):
                 for child in children:
                     walk(child)
 
-    walk(encoded)
+    walk(encoded.model)
+    from .translate import immediates
+
+    constants = {}
+    for name, value in immediates(program.graph, encoded.model).items():
+        key = f"immediate-{len(constants)}"
+        encoded.payloads[key] = np.asarray(value)
+        constants[name] = key
+    encoded.target_data = dict(
+        schema_version=1,
+        immediates=constants,
+        moving_free_max=config.moving_free_max,
+    )
     return encoded

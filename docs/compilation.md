@@ -4,8 +4,8 @@ This is the implementation tree for `Joejoedesu/voyager-compiler`, branch
 `AGEN-compiler`, based on compiler-2 commit
 `cef1e7e42b31e1cfcc01a1e4e02cedab11e3e9ef` (2026-10-20). The [detailed walkthrough](../../reports/voyager-compiler-walkthrough.html)
 combines the flow, extension ownership, adoption guidance and dated evidence.
-The original acceptance snapshot is in `../reports/voyager-implementation-2026-10-23/`;
-cleanup/review evidence is in `../reports/voyager-documentation-2026-10-24/`.
+The original acceptance snapshot is in `../reports/archive/voyager-implementation-2026-10-23/`;
+cleanup/review evidence is in `../reports/archive/voyager-documentation-2026-10-24/`.
 Start with [documentation navigation](README.md), then read the relevant
 sections of this reference. [Target and workload adoption](adoption.md) gives the development
 workflow; [roles and handoffs](roles.md) route a task to its focused reader and
@@ -94,12 +94,13 @@ operations, correctness and performance evidence separately.
 ```text
 WorkloadSpec + options                        TargetSpec + hardware
           │                                          │
-prepare/export → quantization (default or target override) → target legalize → common normalize
+prepare/export → optional input preprocessing [TargetSpec.input_preprocessing]
+          → calibrate/quantize (default or target override) → target legalize → common normalize
           → target custom-operation lowering (optional)
           │                     FX + numerical/value contracts
           ▼
 shared search: registered implementations × their candidate parameters
-          ├─ Interstellar: hierarchical GEMM/conv mappings
+          ├─ Interstellar: target-owned geometry/constraints/model + compatible builder
           ├─ tile shapes: vector, reduction, GEMV, pooling
           └─ attention tiles: coupled query/key blocks
           │                     provisional CompilationPlan
@@ -110,21 +111,33 @@ bufferize selected recipe → refine layouts/residency/native calls
 allocate actual buffers → finalize invocation effects → validate → freeze
           │                     final AllocationPlan + choices + identities
           ▼
-encode common IR → target emit → save checksummed bundle → runtime/replay
+encode common + target IR → save checksummed bundle → optional target emit → runtime/replay
 
 capacity rejection ── bounded replan (default at most two retries) ──► search
 accelerator measurement ── fit + held-out validation ──► performance profile
 ```
+
+The optional [input preprocessing hook](extensions.md#input-preprocessing) runs
+after workload preparation and before quantization, with a binding-selected
+override or the target default. Automatic constant preparation stays separate.
+Choosing a different frontend/input contract requires a separate compilation.
+Later recipes compare implementations of the prepared graph under that contract.
 
 `pipeline.compile_workload()` owns this order. `compile_bufferized()` starts
 from an already prepared/normalized graph. The public `transform()` and
 `compile()` compatibility interfaces still work; `compile()` returns the encoded
 protobuf model, while the new pipeline returns a `CompilationResult` containing
 the executable graph, frozen plan, bundle, inputs and reference.
+Set `emit_target=False` to stop after saving the bundle. Later,
+`compiler.emit.emit_bundle(bundle_dir, output_dir)` generates target files using
+only saved inputs, even in a new process. Encoding captures target-specific
+fields and payloads alongside `model.txt`; the protobuf alone need not contain
+all target information. See the [emission role](roles/emission.md).
 
 | Responsibility | Source owner | Output or hook |
 | --- | --- | --- |
-| Construct model, check assets, inputs and export | `compiler/prepare.py` | `PreparedWorkload`; optional workload frontend/preprocessing/reference |
+| Construct model, check assets and export | `compiler/prepare.py` | `PreparedWorkload`; `WorkloadSpec.prepare` owns a custom frontend and matching input/reference contract |
+| Optional input preprocessing | `compiler/preprocess.py` | `TargetSpec.input_preprocessing`; graph/examples/calibration before quantization |
 | Quantization and calibration | `compiler/quantize.py`, `quantization/` | Shared PT2E or `QuantizationPolicy.run` target override with resolved configuration; [hook order and controls](extensions.md#quantization) |
 | Target legality and common rewrites | `TargetSpec.legalize`, `compiler/normalize.py`, `TargetSpec.lower` | Legalize → shared layouts/rewrites → custom operations; [stage boundaries](extensions.md#graph-legalization) |
 | Alias/effect analysis | `compiler/analysis.py` | Derived `ValueRelations`, graph identity |
@@ -132,7 +145,7 @@ the executable graph, frozen plan, bundle, inputs and reference.
 | Loops, buffers, movement, kernel bodies | `compiler/bufferize/` | Executable FX using shared allocation/copy/view/insert/control ops |
 | Layout/residency refinement | `TargetSpec.refine` | Same buffer graph; no private allocator |
 | Placement and invocation effects | `compiler/allocate.py`, `compiler/banked_allocation.py`, `compiler/bufferize/invocation.py` | Concrete arenas, banks, slots, native reservations and read/write effects |
-| Frozen encoding and target projection | `compiler/emit.py`, `TargetSpec.encode`, `TargetSpec.emit` | Generic model plus selected target instruction/runtime |
+| Frozen encoding and target projection | `compiler/emit.py`, `TargetSpec.encode`, `TargetSpec.emit` | Saved operation IR plus target records/payloads; independent target-file emission |
 | Bundle and replay | `artifacts.py`, `runtime.py` | Checksums/provenance; host or registered target execution |
 | Offline performance calibration | `performance/` | Measurements, fitted profile and held-out errors |
 
@@ -301,6 +314,14 @@ and latency. The current candidate budget is 64 per site. Capacity failure may
 exclude the selected recipe/parameter pair and retry from the prepared graph.
 This is bounded local replanning, not a global optimality guarantee.
 
+[Fixed-region algorithm comparison](compilation/algorithm-search.md) uses the
+same planner. Sequential regions can compose existing kernels with
+`build_sequential_region` and retain their choices in
+`ImplementationChoice.components`. The region cost includes its components once.
+Streaming/recomputation needs its own paired execution model; no general graph-cover
+search is implied. The default target provides opt-in materialized versus streaming
+FP32 attention recipes while retaining its pinned default registration.
+
 Use the existing bufferized template when only layout, tile shape, placement or
 instruction realization changes. GEMM/conv, pointwise/reduction/pool, attention,
 CSR/outlier and whole-tensor templates share movement/control primitives.
@@ -375,9 +396,10 @@ while constructing a recipe candidate. The planner then compares its returned
 `ImplementationChoice`. Allocation is later and authoritative. This is not a
 single global scheduling optimizer: graph fusion/normalization, local recipe
 search and target-local factor selection have separate scopes. The default
-local runtime tolerance is 2%; traffic/energy tie behavior is retained from the
-base. The coverage-first objective above is the adoption objective; the current
-planner has no source-op coverage score or global coverage optimizer.
+local runtime tolerance is 0: fastest modeled latency wins, with traffic/energy
+used only among equal-latency candidates. A positive tolerance explicitly opts
+into a slower near-fastest choice. See the [target adapter contract](compilation/performance-models.md#target-owned-matrix-search-adapters)
+for independent reuse of Interstellar and the paired builder restrictions.
 
 A new scheduling engine and a new hardware cost model are separate extensions.
 An existing engine can enumerate candidates for a new target model. An ISA
@@ -392,7 +414,7 @@ The following section describes the current shared interface and its limits.
 | Recipe dispatch | `compiler/search/planner.py:select_implementation` | Compares `ImplementationSpec` candidates during bufferization |
 | Candidate enumeration | Recipe `candidates`, paired `model` / `build` / `estimate` | Recipe registration is public; no separate scheduler-engine plugin registry |
 | Operation facts | `RuntimeModel.prepare(node)` → target `OpModel` | FX facts; no general immutable FX-free workload snapshot protocol |
-| Shared engines | `compiler/search/{interstellar,tile_shapes,attention_tiles}.py` | Three existing engines; another engine needs an explicit adapter/contract |
+| Shared engines/adapters | `compiler/search/{interstellar,tile_shapes,attention_tiles}.py` | `search_matrix` accepts target-owned geometry/constraints; the shared FX/grid builder is one consumer. Another engine needs an explicit contract |
 | Selected result | `ir/plan.py:TileResult` wrapped in `ImplementationChoice` | Tiling, placement, cost and aggregate access counts; no complete generic typed access-event/energy/named-factor schema |
 
 Public extension contracts live in `extensions.py`; search state lives in
@@ -577,7 +599,10 @@ PYTHONPATH=src:test /home/zhouhua/Research/ML/ml-env/bin/python \
 Use the selected [target guide](../src/voyager_compiler/targets/README.md) for
 pinned workload cases, environment inputs and endpoint-specific commands.
 `validation/reference-baselines.json` identifies pinned comparators where
-applicable. Preserve required gates and approved comparator replacements; do not
+applicable. Pin the effective search policy and numerical recipe explicitly:
+a command that inherits a changing compiler default cannot reproduce an old
+artifact. Keep compatibility checks separate from numerical acceptance of a new
+policy, and record checksum-verified local inputs in the validation recipe. Preserve required gates and approved comparator replacements; do not
 silently replace a failed baseline or reinterpret a retained warning as accuracy.
 
 Use fresh result directories. Record relevant source/configuration identities and

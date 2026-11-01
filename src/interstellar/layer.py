@@ -36,6 +36,8 @@ class Layer(object):
         level has no banking.
 
         None => the level is sized in element counts, unconverted.
+    size_fn_levels: explicit levels using size_fn; None preserves L2+ behavior.
+        Other levels retain element-based sizing.
     """
 
     def __init__(
@@ -50,6 +52,7 @@ class Layer(object):
         wstd=1,
         hstd=1,
         size_fn=None,
+        size_fn_levels=None,
     ):
         self.nifm = nifm
         self.nofm = nofm
@@ -63,6 +66,8 @@ class Layer(object):
         self.wstd = wstd
         self.hstd = hstd
         self.size_fn = size_fn
+        # None retains the historical byte-pool behavior at L2 and above.
+        self.size_fn_levels = size_fn_levels
         assert self.wofm > 0
         assert self.hofm > 0
         assert self.nimg > 0

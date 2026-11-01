@@ -223,8 +223,27 @@ def is_conv2d(node: Node) -> bool:
     ]
 
 
-def is_depthwise_conv(node: Node) -> bool:
+def is_grouped_conv(node: Node) -> bool:
+    """Grouped connectivity, independent of a target's execution strategy."""
     return is_conv2d(node) and get_arg_value(node, 6, "groups", 1) != 1
+
+
+def is_depthwise_conv(node: Node) -> bool:
+    """One input channel per group, allowing an integral channel multiplier.
+
+    Grouped weights retain OIHW even when activations use NHWC. No hardware
+    capability or scheduling decision follows from this classification.
+    """
+    if not is_grouped_conv(node):
+        return False
+    groups = get_arg_value(node, 6, "groups", 1)
+    source, weight = node.args[:2]
+    channel_axis = -1 if node.meta.get("transposed", False) else 1
+    return (
+        source.shape[channel_axis] == groups
+        and weight.shape[1] == 1
+        and weight.shape[0] % groups == 0
+    )
 
 
 def is_linear(node: Node) -> bool:

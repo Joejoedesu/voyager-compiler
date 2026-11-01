@@ -41,10 +41,10 @@ overlap assumptions being priced by the model.
 | `hardware` | `config.py:TrainiumConfig`, TRN2/TRN3: engines, partitions and capacities |
 | `normalization` | `config.py:LAYOUT` and `fusion.py:FUSION_PATTERNS`: operand layouts and explicit target-owned broad fusion patterns |
 | `implementations` / `model` | `implementations.py`, `model.py`, GEMM/attention/vector models and builders: competing FP8 row modes plus shared recipes |
-| `encode` | `implementations.py:encode`: selected buffer program projection |
-| `emit` | `target.py:emit`, `translate.py`: selected NKI instruction forms and program |
+| `encode` | `implementations.py:encode`: selected row mode in common IR; immediate constants in binary payloads (including non-finite values) and translation limits in saved target records |
+| `emit` | `target.py:emit`, `translate.py`: read saved IR and translation records to generate NKI, without live FX or configuration objects |
 
-No separate `quantization`, `legalize`, `lower`, `refine`, `runtime` or `characterize` hook is
+No separate `input_preprocessing`, `quantization`, `legalize`, `lower`, `refine`, `runtime` or `characterize` hook is
 registered. Shared defaults apply; inherited runtime tools are invoked separately.
 Broad graph patterns live in `fusion.py`; registered compilation and both benchmark
 frontends consume that table, with no imports from tests or hardware-derived

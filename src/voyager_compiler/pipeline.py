@@ -1,10 +1,11 @@
-"""The shared prepare → normalize → search/bufferize → allocate → emit flow."""
+"""The shared prepare → normalize → search/bufferize → allocate → encode/save → emit flow."""
 
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from torch.utils._pytree import tree_flatten
+import torch
+from torch.utils._pytree import tree_flatten, tree_map
 
 from voyager_compiler.artifacts import hardware_digest, save_bundle
 from voyager_compiler.compiler.allocate import (
@@ -19,9 +20,10 @@ from voyager_compiler.compiler.bufferize import (
 )
 from voyager_compiler.compiler.bufferize.emit import gen_compute_graph
 from voyager_compiler.compiler.bufferize.ops import oracle_disabled
-from voyager_compiler.compiler.emit import emit
+from voyager_compiler.compiler.emit import emit_bundle, encode
 from voyager_compiler.compiler.normalize import transform
 from voyager_compiler.compiler.prepare import prepare
+from voyager_compiler.compiler.preprocess import preprocess_inputs
 from voyager_compiler.compiler.quantize import quantize
 from voyager_compiler.compiler.search.planner import candidate_key
 from voyager_compiler.compiler.search.tiler import (
@@ -42,6 +44,7 @@ class CompilationResult:
     reference: object = None
     args: tuple = ()
     kwargs: dict = field(default_factory=dict)
+    original_reference: object = None
 
 
 def compile_bufferized(
@@ -62,6 +65,7 @@ def compile_bufferized(
     performance_profile=None,
     max_replans=2,
     reference_outputs=None,
+    emit_target=True,
 ):
     if config is None:
         config = target.hardware() if target else AcceleratorConfig()
@@ -126,10 +130,25 @@ def compile_bufferized(
 
             allocation = finalize_invocations(program, config, allocation)
         except MemoryCapacityError as error:
+            # A composed region retains child kernel scopes for bank placement
+            # and reporting. Replan its nearest selected owner, not an unrelated
+            # earlier region merely because the child has no top-level choice.
+            affected_sites = [
+                max(
+                    (
+                        key
+                        for key in plan.choices
+                        if site == key or site.startswith(key + "/")
+                    ),
+                    key=len,
+                    default=site,
+                )
+                for site in error.sites
+            ]
             site = next(
                 (
                     site
-                    for site in (*error.sites, *plan.choices)
+                    for site in (*affected_sites, *plan.choices)
                     if site in plan.choices
                     and any(
                         choice != plan.choices[site]
@@ -184,18 +203,18 @@ def compile_bufferized(
     model.meta["compilation_plan"] = plan
     model.meta["value_relations_source"] = relations.graph_digest
     print_bufferized_graph(model)
-    encoded = emit(
+    encoded = encode(
         program,
         flat_inputs,
         output,
         dump_tensors,
-        encode=target.encode,
+        target=target,
         config=config,
     )
-    if target.emit is not None:
-        target.emit(program, encoded, config, output)
-        program.assert_frozen()
     bundle = save_bundle(program, config, output, provenance)
+    if emit_target:
+        emit_bundle(output, output, target=target)
+    program.assert_frozen()
     return CompilationResult(
         program,
         encoded,
@@ -220,8 +239,19 @@ def compile_workload(
     options.setdefault("target", target.name)
     config = target.hardware() if config is None else config
     prepared = prepare(workload, options)
+    # Preserve the original frontend's outputs independently of preprocessing
+    # and quantization, which may replace or mutate their working reference.
+    original_reference = tree_map(
+        lambda value: (
+            value.detach().clone()
+            if isinstance(value, torch.Tensor)
+            else copy.deepcopy(value)
+        ),
+        prepared.reference,
+    )
     if workload.calibration is not None and "calibration" not in options:
         options["calibration"] = workload.calibration(prepared, options)
+    prepared = preprocess_inputs(prepared, target, config, options)
     prepared = quantize(prepared, target, options, config=config)
     if target.legalize is not None:
         target.legalize(prepared, config, options)
@@ -245,4 +275,5 @@ def compile_workload(
         **compile_options,
     )
     result.reference = prepared.reference
+    result.original_reference = original_reference
     return result

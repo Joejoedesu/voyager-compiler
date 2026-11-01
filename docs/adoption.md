@@ -47,8 +47,9 @@ and attributable checks reduce stale-document risk; they do not eliminate it.
 
 ## Evidence follows the claim
 
-Describe the actual result instead of assigning a stage-completion label. No new
-report schema, ledger or compiler IR is required.
+Describe the actual result instead of assigning a stage-completion label. The optional
+[adoption work record](adoption/harness.md) keeps current opportunities and checks
+for a continuing task; it is not a support ledger or evidence of completion.
 
 | Claim | Appropriate evidence and limits |
 | --- | --- |
@@ -95,6 +96,11 @@ required. Stable native-owned behavior may be modeled, with its identity and
 limits stated. Fitting must not conceal a known implementation mismatch.
 
 ## Task input and handoff
+
+For work spanning experiments or resumptions, use the compiler-owned
+[adoption harness](adoption/harness.md). Keep the best validated candidate,
+open opportunities and pending checks together in task artifacts. Reconcile
+that record against current source and receipts on resume.
 
 Load the relevant role and linked contract sections, not every reader. A focused
 single-agent task and a delegated task need the same concrete context:

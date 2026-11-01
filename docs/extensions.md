@@ -22,18 +22,27 @@ Target guides map their actual files to these bindings.
 | `calibration` (optional) | `(prepared, options) → calibration iterable` | Supplies samples when the caller has not supplied them; consumed by `compile_workload` |
 | `cases` | Workload-owned case metadata | Not an automatically executed compiler callback |
 
+Use `prepare` for a custom frontend. For an optional input representation or
+operation rewrite on the exported graph, use the separate
+[input preprocessing boundary](#input-preprocessing). Existing custom frontends
+remain valid; do not apply the same rewrite in both places.
+
 Pair-specific policy can stay with the workload when inseparable from its
 reference and inputs. Do not move target-independent model preparation into a
 target emitter.
 
 ## Target boundaries
 
-`TargetSpec` is assembly. Its callbacks execute at the following boundaries:
+`TargetSpec` is assembly. Its callbacks execute at the following boundaries.
+Encoding is mandatory; its target callback is optional. Emission is independently
+runnable after the bundle is saved; see [encoding and emission](roles/emission.md)
+for the saved-file contract and command.
 
 | Binding | Signature/result | Shared consumer and boundary |
 | --- | --- | --- |
 | `name`, `hardware` | `hardware() → AcceleratorConfig` | Registry/pipeline resolve identity and physical capabilities; configuration is not a cost correction |
 | `operators` | `(operator, OperatorSemantics)` entries | Registry/classifier consume compute traits; Torch schemas own aliases/writes. This is not a full layout/padding/operand-role trait inventory |
+| `input_preprocessing` | `(prepared, config, options) → PreparedWorkload` | Optional exported-graph/input rewrite before quantization; caller option overrides the target default |
 | `quantization` | Optional `QuantizationPolicy` | `compiler/quantize.py` dispatches shared PT2E or a target override, described below |
 | `legalize` | `(prepared, config, options)`, in-place | Pipeline before common normalization; explicit graph rewrites and supported-form legalization |
 | `normalization` | Normalization option pairs | Shared normalization consumes policy/patterns; this is data, not another pass manager |
@@ -41,8 +50,8 @@ target emitter.
 | `model` | `(config, accumulate_fp32) → RuntimeModel` | Shared `Tiler` uses operation fit/cost models; whole-operation recipes may instead provide `estimate` |
 | `implementations` | `ImplementationSpec` entries | Shared planner compares legal realizations and bufferizes the winner; details below |
 | `refine` | `(program, config)`, in-place | After bufferization, before final allocation. Own target execution/storage declarations and permitted refinement; do not allocate final addresses |
-| `encode` | `(encoded_model, program, config) → encoded_model` | `compiler/emit.py` projects the frozen program into the canonical artifact |
-| `emit` | `(program, encoded_model, config, output_directory)` | Pipeline writes target collateral from frozen decisions; no tiling, ISA selection or new global allocation |
+| `encode` | `(ir: EncodedIR, program, config) → EncodedIR` | Project frozen decisions into common `model`, target-owned `target_data` and optional array `payloads`; shared code saves and checksums the bundle |
+| `emit` | `(bundle: SavedBundle, output_directory)` | Read saved IR/records/payloads to generate target files; no live graph, tiling, ISA selection or new allocation |
 | `runtime` | `(result, args, kwargs) → outputs` | `runtime.run`; optional endpoint execution. Absence means host replay, not an unimplemented compiler |
 | `characterize` | `(result, case, config) → Measurement` | `performance.characterize`; optional attributable timing, not a mandatory compilation stage |
 
@@ -60,6 +69,29 @@ The [operation-semantics role](roles/semantics.md) owns these definitions;
 quantization and lowering consume them.
 
 <a id="quantization-and-custom-operation-lowering"></a>
+
+## Input preprocessing
+
+`TargetSpec.input_preprocessing(prepared, config, options) -> PreparedWorkload`
+selects an optional input/graph rewrite to improve mapping and hardware utilization
+before quantization. The caller's `options["input_preprocessing"]` overrides the
+target default; `None` disables it. Compare alternatives through separate compilations.
+
+Calibration samples are acquired before this hook and executed afterward. Return
+an executable graph, matching examples and serializable
+`provenance["input_preprocessing"]`. If inputs change, replace
+`options["calibration"]` consistently without mutating caller samples; preserve
+replayability for multi-pass calibration. The driver retains asset provenance and
+refreshes the working reference. `result.original_reference` preserves the original
+frontend outputs; a custom frontend must supply that reference.
+
+Constant preparation remains separate. Runtime expansion is constrained by live
+memory and execution cost. Host preparation requires the agreed input/timing
+boundary: this hook does not install a runtime wrapper, and `result.args` contains
+only the prepared example. Keep other dynamic preparation executable in the graph.
+
+See [implementation guidance](roles/input-preprocessing.md) and
+[utilization diagnosis](compilation/performance-models.md#required-diagnosis-when-utilization-or-selected-performance-is-poor).
 
 ## Quantization
 
@@ -185,6 +217,14 @@ finite comparable costs. The current shared engines are hierarchical matrix,
 dimension-wise grid and attention search; recipe registration does not provide
 an independent engine-plugin registry or a complete typed access-event/energy API.
 
+For a fixed region, `build_sequential_region` composes component recipes and
+`estimate_sequential_region` prices their sequential execution. The planner retains
+its `region_choices` metadata in `ImplementationChoice.components`; the parent
+cost already includes those choices. `NoLegalMapping` is an expected
+`CandidateRejected`, while unexpected implementation errors propagate. See
+[algorithm comparison](compilation/algorithm-search.md) for the boundary, cost
+rules and opt-in attention example. This does not search overlapping graph covers.
+
 ## Execution and comparison are explicit
 
 Pass the target to `runtime.run` to use its registered runtime hook. The helper
@@ -266,3 +306,15 @@ optional hooks. It is navigation, not proof of operation support or endpoint
 execution. Follow the selected [target guide](../src/voyager_compiler/targets/README.md)
 for supported forms and evidence. Historical extension comparisons belong in dated
 reports; they must not become hidden requirements for every target.
+
+### Fine-grained reuse of matrix search
+
+`MatrixSpace` owns target/recipe architecture and schedule constraints, with an
+optional complete-mapping `mapping_filter`. `search_matrix(op, layer, ...)` reuses
+Interstellar and returns `TileResult` for a custom builder. The standard FX/grid
+adapter is a separate consumer with its own reduction-order limitation. See
+[construction and limits](compilation/performance-models.md#target-owned-matrix-search-adapters).
+Neither a new target-name switch nor a scheduler registry is needed for this route.
+
+Optional exported-graph/input transformations use `TargetSpec.input_preprocessing`;
+custom frontend construction remains with `WorkloadSpec.prepare`/`preprocess`; see [input rewrites](compilation/rewrites.md#input-boundary-rewrites).

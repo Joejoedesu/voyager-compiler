@@ -15,11 +15,18 @@ a historical completion tracker.
 | `implementations` / `model` | `magnet-alpha.whole`, `build_alpha`, `AlphaModel`: shared whole-tensor construction with instruction constants; no characterized candidate timing model |
 | `refine` | `target.py:refine`: memory-instance binding, shuffles, shared residency refinement and `schedule.py:select_schedules` before freeze |
 | Storage declarations | `bank_layouts`, `layout.py`: packed scale components, physical shapes, clustered banks and port conflicts; shared allocator assigns final addresses |
-| `emit` | `codegen.py`: CMOD collateral plus explicit buffered driver, consuming finalized schedules and addresses |
+| `encode` | `codegen.py`: resolved schedules, allocated addresses, explicit driver and binary payload arrays in the saved target IR |
+| `emit` | `codegen.py`: read the saved target IR/payloads and write CMOD files and driver; no live graph required |
 
-There is no separate `encode`, `runtime` or `characterize` hook bound
+There is no `runtime` or `characterize` hook bound
 here; numerical legalization is in `legalize`, and host replay is not a C-model
 endpoint. Default shared stages still own allocation, freezing and bundling.
+
+Depthwise dispatch is target-owned: legalization forms an accumulator plus NMP
+requantization region, while dense convolution uses PE/PPU. Region formation in
+[implementations.py](implementations.py) selects those instruction families;
+[schedule.py](schedule.py) validates depthwise groups and selects NMP fields.
+Alpha does not rely on the shared dense-convolution tiler or Voyager's fallback.
 
 ## Target quantization
 
@@ -97,5 +104,5 @@ and zero-calibration recipe. The checked scope includes three exact outputs,
 and six host output conversions. Lowered counts are not source-op coverage.
 The synthetic recipe retains a 19-layer depthwise scalar-bias projection; matching
 it does not establish model accuracy. See the
-[dated acceptance](../../../../../reports/voyager-nhwc-preparation-2026-10-24/acceptance.json).
+[dated acceptance](../../../../../reports/archive/voyager-nhwc-preparation-2026-10-24/acceptance.json).
 Donor: `497bfbd40d08690345c769ec8983e4f9ad878c0e`; preserve its source notices.

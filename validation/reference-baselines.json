@@ -2,7 +2,7 @@
   "implementation": {
     "repository": "https://github.com/Joejoedesu/voyager-compiler",
     "checkout": "/home/zhouhua/Research/ML/AGEN-voyager/voyager",
-    "branch": "integration/agent-framework",
+    "branch": "AGEN-compiler",
     "base_commit": "cef1e7e42b31e1cfcc01a1e4e02cedab11e3e9ef"
   },
   "design": {
@@ -11,23 +11,23 @@
   },
   "voyager": {
     "baseline": {
-      "path": "reference-point/baseline.json",
-      "sha256": "2df010a5628c7ef5f5112c9dd3bd3683d838cc9d11aa42ca7639299f52da522c"
+      "path": "reference-point/voyager-latency0-2026-10-31/baseline.json",
+      "sha256": "112d1b1efa2dd911ef3a9beea992d42b0f85c319188b7c8827b7068f1be7bfcd"
     },
     "commands": {
-      "path": "reference-point/metadata/baseline-2026-09-27_01-41-40/commands.txt",
-      "sha256": "4e0741fc13b36392bbe05dfc79816fc5fcb6f69bce144615757e476ac9fc0dea"
+      "path": "reference-point/voyager-latency0-2026-10-31/commands.txt",
+      "sha256": "a5cfc9530b10ff1e889c44992be0a0c55ce867a802a7269771124dd51599301e"
     },
-    "run": "2026-09-27_01-41-40",
+    "run": "voyager-latency0-2026-10-31",
     "acceptance": [
       "identical selected model hashes",
       "unchanged selected case statuses",
       "unchanged selected numerical summaries",
       "no selected case compilation failures"
     ],
-    "snapshot_cases": 26,
-    "snapshot_generated_models": 25,
-    "snapshot_runner_exit_code": 1,
+    "snapshot_cases": 11,
+    "snapshot_generated_models": 11,
+    "snapshot_runner_exit_code": 0,
     "selected_cases": [
       "resnet18/E4M3/16x16",
       "resnet18/E4M3/32x64",
@@ -46,11 +46,21 @@
       "sha256": "9e85469f4c5db5587f60347707ed4515cbc1f65af55f26458ffc8b1ed8e651e4"
     },
     "expected_selected_compile_failures": 0,
-    "artifact_replacements": {
-      "llama_decode/MXNF4/64x64": {
-        "path": "reference-point/voyager-decode-corrected-2026-10-23/reference.json",
-        "sha256": "fbdea581d775635a83446a57dd521845ad6a88bfbbb15d4dc0f84959ef7eef38"
-      }
+    "artifact_replacements": {},
+    "search_policy": {
+      "runtime_tolerance": 0.0
+    },
+    "imagenet_inputs": {
+      "path": "reference-point/voyager-latency0-2026-10-31/imagenet-inputs.json",
+      "sha256": "a74ad152d56b94f2f47b09f8333a816504c498b3f9849640f347ce332d9afd8b"
+    },
+    "artifact_checksums": {
+      "path": "reference-point/voyager-latency0-2026-10-31/checksums.sha256",
+      "sha256": "5252a4d79c7c347ddda359112e502b3a96570ad0faa9a39b5f3b14f937f7c9ab"
+    },
+    "provenance": {
+      "path": "reference-point/voyager-latency0-2026-10-31/provenance.json",
+      "sha256": "6835e78977587f2c04c6bb7e6a6efa0b3ae1ec61b062094d871abffb787bea86"
     }
   },
   "alpha_yolo": {

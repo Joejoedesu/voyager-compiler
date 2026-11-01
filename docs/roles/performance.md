@@ -28,6 +28,9 @@ Start implementing at [Create and register the model](../compilation/performance
 only when implementing that part. A default target model is an optional example,
 not a prerequisite or a universal formula.
 
+For utilization lost to input representation, consider
+[input preprocessing](input-preprocessing.md) and include its packing/movement cost.
+
 ## Implementation decisions
 
 | Problem | Next action |
@@ -62,3 +65,9 @@ Return changed assumptions/formulas, recipe/policy identities, estimated versus 
 Choose code review, targeted commands, traces or timings for the actual claim. Do not equate static instruction-site totals, host runtime or synthetic samples with device performance.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)
+
+For poor utilization or schedule selection in a performance task, follow the
+[required diagnostic procedure](../compilation/performance-models.md#required-diagnosis-when-utilization-or-selected-performance-is-poor).
+Investigate input representation/boundary, candidate reachability and pruning,
+model ranking, and conversion/runtime realization; report unresolved causes rather
+than treating one passing implementation as adequate performance evidence.

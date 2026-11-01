@@ -93,9 +93,20 @@ def main():
     pins = json.loads(
         (REPO / "validation/reference-baselines.json").read_text()
     )["voyager"]
-    for field in ("baseline", "commands"):
-        verify_pin(reference.parent, pins[field])
+    baseline_path = verify_pin(reference.parent, pins["baseline"])
+    commands_path = verify_pin(reference.parent, pins["commands"])
+    image_manifest = (
+        verify_pin(reference.parent, pins["imagenet_inputs"])
+        if "imagenet_inputs" in pins
+        else None
+    )
     verify_pin(REPO, pins["suite"])
+    if "artifact_checksums" in pins:
+        checksums = verify_pin(reference.parent, pins["artifact_checksums"])
+        for line in checksums.read_text().splitlines():
+            expected_digest, name = line.split("  ", 1)
+            if digest(checksums.parent / name) != expected_digest:
+                raise ValueError(f"sealed reference artifact changed: {name}")
     replacements = {}
     for label, pin in pins.get("artifact_replacements", {}).items():
         manifest_path = verify_pin(reference.parent, pin)
@@ -107,7 +118,7 @@ def main():
         ):
             raise ValueError(f"invalid approved replacement: {label}")
         replacements[label] = manifest
-    baseline = json.loads((reference / "baseline.json").read_text())
+    baseline = json.loads(baseline_path.read_text())
     suite = [
         s.strip()
         for s in (REPO / "validation/voyager-suite.txt")
@@ -120,20 +131,34 @@ def main():
     selected = [s for s in suite if not args.only or s in args.only]
     expected = {c["label"]: c for c in baseline["cases"]}
     commands = {}
-    for line in (
-        (reference / baseline["metadata"] / "commands.txt")
-        .read_text()
-        .splitlines()
-    ):
+    for line in commands_path.read_text().splitlines():
         command = shlex.split(line)
         index = command.index("--model_output_dir") + 1
         label = command[index].removeprefix("<run_dir>/")
-        command[:2] = [sys.executable, str(REPO / "test/test_codegen.py")]
+        command[:2] = [sys.executable, str(REPO / "validation/run_case.py")]
         command[index] = str(output / label)
         # The pinned frontend used this explicit approximation before PTQ.
         # Native RMSNorm is the new compiler's default and must stay so.
-        if label.startswith(("llama_", "vit/")):
+        if (
+            label.startswith(("llama_", "vit/"))
+            and "--numerics_recipe" not in command
+        ):
             command += ["--numerics_recipe", "voyager_reference_20260927"]
+        policy = pins.get("search_policy")
+        if policy is not None:
+            if (
+                "--runtime_tolerance" not in command
+                or float(command[command.index("--runtime_tolerance") + 1])
+                != policy["runtime_tolerance"]
+            ):
+                raise ValueError(
+                    f"{label}: command does not specify the pinned search policy"
+                )
+        if image_manifest and label in (
+            "resnet18/INT8/16x16",
+            "vit/MXNF4/64x64",
+        ):
+            command += ["--imagenet-manifest", str(image_manifest)]
         commands[label] = command
     output.mkdir(parents=True, exist_ok=False)
     dependency_paths = [str(p.resolve()) for p in args.dependency_path]
@@ -145,8 +170,30 @@ def main():
         PYTHONDONTWRITEBYTECODE="1",
         MPLCONFIGDIR=str(output / "matplotlib"),
     )
+    env.update(HF_UPDATE_DOWNLOAD_COUNTS="0", HF_HUB_DISABLE_TELEMETRY="1")
+    cache_source = None
     if args.offline:
-        env.update(HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1")
+        # Reuse existing Arrow/metadata files, with all new locks/cache writes
+        # inside this run. Do not require write access to the user's HF cache.
+        cache_source = Path(
+            os.environ.get(
+                "HF_DATASETS_CACHE", Path.home() / ".cache/huggingface/datasets"
+            )
+        ).resolve()
+        cache = output / "dataset-cache"
+        cache.mkdir()
+        for dataset in ("glue", "wikitext"):
+            for source in sorted((cache_source / dataset).rglob("*")):
+                if source.is_file() and source.suffix in (".arrow", ".json"):
+                    destination = cache / source.relative_to(cache_source)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.symlink_to(source.resolve())
+        env.update(
+            HF_HUB_OFFLINE="1",
+            HF_DATASETS_OFFLINE="1",
+            TRANSFORMERS_OFFLINE="1",
+            HF_DATASETS_CACHE=str(cache),
+        )
     probe = subprocess.check_output(
         [
             sys.executable,
@@ -173,7 +220,10 @@ def main():
             dependency_paths=dependency_paths,
             offline=args.offline,
             full_gate=selected == suite,
-            baseline_sha256=digest(reference / "baseline.json"),
+            baseline_sha256=digest(baseline_path),
+            search_policy=pins.get("search_policy"),
+            imagenet_inputs=pins.get("imagenet_inputs"),
+            dataset_cache_source=str(cache_source) if cache_source else None,
             suite_sha256=digest(REPO / "validation/voyager-suite.txt"),
             commands={s: commands[s] for s in selected},
             artifact_replacements=replacements,

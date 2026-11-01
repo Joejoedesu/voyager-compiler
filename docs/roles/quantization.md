@@ -26,13 +26,23 @@ Sources: [stage dispatch](../../src/voyager_compiler/compiler/quantize.py),
 | New target accepts a conventional integer/float format | Try shared quantizer settings and observer/domain hooks first. Preserve caller overrides and calibrate on workload-provided data. |
 | Target representation or calibration order differs | Use the stage override for an actual conversion-flow difference. Define its arithmetic via operation semantics; distinguish a saved profile, recalibration and value-preserving packing. |
 | Quantized output drifts | Compare scale domains, axes and the first changed rounding boundary. Check current conversion/folding guards before adding a second quantizer or weakening tolerance. |
+| Several hardware-supported schemes are plausible | Treat formats, granularity and boundary sharing as binding candidates. Keep calibration/reference constraints fixed, reject inaccurate candidates, then compare execution cost. See [binding search](../adoption/workload-binding.md#quantization-is-part-of-the-binding-search). |
 
 ## Do
 
 - Reuse the shared quantizer and preserve explicit per-module/operator controls.
+  For a new integer target, first configure formats/observers/domain rules, then
+  lower the converted Q/DQ graph into target operations. Shared PT2E owns
+  calibration and eval Conv–BN folding; shared normalization owns layouts and
+  constant preparation. A target lowering should consume their scales and
+  layouts, not reconstruct those passes.
   Use the target override when its format/conversion or calibration flow needs it.
 - Preserve required Q/DQ rounding boundaries, scale domains and compound-format
   metadata. Distinguish conversion, later Q/DQ folding and physical packing.
+- Inspect observer sharing across branches. An equal dtype does not require
+  distant regions to share one scale; implicit sharing can spread a large range
+  backwards and discard useful precision. Conversely, local domains may need
+  extra requantization. Preserve caller overrides and validate the tradeoff.
 - Pass the resolved compile configuration. Repeated calibration needs replayable
   samples; restore saved state without silently fitting a different profile.
 - When exact target arithmetic changes observed values, reference its defined

@@ -105,8 +105,9 @@ def loop_conv(
     pad=0,
     no_bias=False,
     relu=False,
+    depthwise=False,
 ):
-    """Dense NHWC LOOP_CONV_WS; no pooling, dilation or transpose."""
+    """NHWC LOOP_CONV_WS, dense HWIO or multiplier-one depthwise OIHW."""
     fields = (
         batch,
         h,
@@ -146,9 +147,15 @@ def loop_conv(
             (rp << 48) | (up << 32) | (down << 24) | w,
         ),
         command(
-            19, (rows << 48) | 1, (ci << 48) | (co << 32) | (co << 16) | cols
+            19,
+            (rows << 48) | 1,
+            (ci << 48) | ((1 if depthwise else co) << 32) | (co << 16) | cols,
         ),
         command(20, weight, y),
         command(21, bias, x),
-        command(15, (1 << 8) | int(no_bias), 1 | (int(relu) << 3)),
+        command(
+            15,
+            (1 << 8) | (int(depthwise) << 6) | int(no_bias),
+            1 | (int(relu) << 3),
+        ),
     ]

@@ -33,6 +33,7 @@ within `ImplementationSpec`. These are documentation groupings, not new APIs.
 | `WorkloadSpec` | [Workload integration](roles/workload.md) | Model/assets, inputs/state, export/reference and calibration sample acquisition |
 | `TargetSpec.name`, `TargetSpec.hardware` | [Target registration and hardware](roles/target.md) | Registry assembly, physical capabilities and configuration |
 | `TargetSpec.operators` + schemas/implementations | [Operation semantics](roles/semantics.md) | Computation, signatures and effects; registered classification alone is not a complete definition |
+| `TargetSpec.input_preprocessing` | [Input preprocessing](roles/input-preprocessing.md) | Optional graph/input representation before quantization; matching calibration and explicit input boundary |
 | `TargetSpec.quantization` | [Quantization](roles/quantization.md) | Formats, scales/domains, calibration and conversion |
 | `TargetSpec.legalize` | [Graph legalization](roles/legalization.md) | Supported-form rewrites before shared normalization |
 | `TargetSpec.normalization` | [Normalization policy](roles/normalization.md) | Shared layout, alignment, constant preparation and fusion controls |
@@ -41,7 +42,7 @@ within `ImplementationSpec`. These are documentation groupings, not new APIs.
 | `TargetSpec.model`, `ImplementationSpec.model`, `ImplementationSpec.estimate` | [Performance models](roles/performance.md) | Fit/cost estimates used to compare implementations and mappings |
 | `ImplementationSpec.build` | [Bufferized kernel construction](roles/bufferization.md) | Explicit buffers, copies, loops, compute and dependencies for a candidate |
 | `TargetSpec.refine` | [Buffer and storage refinement](roles/refinement.md) | Post-build target declarations and permitted refinements before allocation |
-| `TargetSpec.encode`, `TargetSpec.emit` | [Encoding and emission](roles/emission.md) | Frozen artifact projection and target collateral |
+| `TargetSpec.encode`, `TargetSpec.emit` | [Encoding and emission](roles/emission.md) | Save common/target IR, then generate target files from that bundle |
 | `TargetSpec.runtime` | [Target runtime](roles/runtime.md) | Endpoint submission, outputs and state |
 | `TargetSpec.characterize` | [Performance characterization](roles/characterization.md) | Attributable measurements for offline fitting/validation |
 
@@ -81,8 +82,10 @@ case boundary when fitting a model; ordinary registration can use analytical cos
 
 | Requested change | Start here | Shared changes only when needed |
 | --- | --- | --- |
+| Choose an input representation before quantization | [Input preprocessing](roles/input-preprocessing.md) | Missing graph transformation or runtime preparation contract |
 | Add a workload | Workload integration | New frontend/state semantics unsupported by `WorkloadSpec` |
 | Support another ISA form for an existing op | Implementation alternatives, paired model, builder and emitter | New effects, native completion or candidate-result capability |
+| Compare algorithms for one fixed region | [Algorithm comparison](compilation/algorithm-search.md), implementation alternatives and paired builders/models | New observable semantics or overlapping-region selection; sequential component composition is already shared |
 | Improve poor schedule selection | Model/realization evidence, then search | Missing representable candidates or search-engine protocol |
 | Reuse existing bufferized kernels on a target | Target model and existing builder hooks | A genuinely different algorithmic control structure |
 | Fix lifetime, packed scale or bank conflicts | Analysis/allocation and target layout declarations | Extend canonical buffer/allocation records only if necessary |
@@ -96,3 +99,16 @@ selection and three mapping/tile engines; it does not expose every historical
 scheduler-provider/result API. See the [scheduler contract](compilation.md#scheduler-interface-and-limits).
 The [adoption procedures](adoption.md) cover target registration/extension and
 workload × target binding/refinement. They do not require status trackers.
+
+Search reuse is split between target/recipe constraints (`MatrixSpace`, model and
+candidate callbacks), shared enumeration (`search_matrix` and other engines), and
+execution construction (bufferization). See [adapter ownership](compilation/performance-models.md#target-owned-matrix-search-adapters).
+Workload input rewrites retain their [explicit boundary](compilation/rewrites.md#input-boundary-rewrites).
+For a performance task, [diagnose material utilization gaps](compilation/performance-models.md#required-diagnosis-when-utilization-or-selected-performance-is-poor)
+before declaring the implementation adequate; findings go to the responsible role.
+
+Reuse means calling shared implementations, not merely placing a private compiler
+behind a hook. During a target change, check that selected mappings survive into
+emission, geometry/footprints have one owner, and numerical preparation and replay
+mechanics reuse applicable shared code. See [search reuse](compilation/performance-models.md#connect-search-to-executable-code),
+[quantization](roles/quantization.md) and [emission](roles/emission.md).

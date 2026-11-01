@@ -1,4 +1,4 @@
-"""Deployment coverage, numerical rules and selected command realization."""
+"""Deployment coverage and selected command realization."""
 
 import json
 import tempfile
@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from test_pipeline import assert_saved_emission
 
 from voyager_compiler.extensions import WorkloadSpec
 from voyager_compiler.pipeline import compile_workload
@@ -17,6 +18,75 @@ from voyager_compiler.targets.gemmini.target import TARGET
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_interstellar_multirow_mapping_reaches_native_commands(self):
+        from voyager_compiler.compiler.search.interstellar import search_matrix
+        from voyager_compiler.targets.gemmini.emission._commands import conv
+        from voyager_compiler.targets.gemmini.scheduling import (
+            NativeMatrixModel,
+            cost,
+            selected_tile,
+        )
+
+        p = dict(
+            batch=1,
+            h=7,
+            w=7,
+            oh=7,
+            ow=7,
+            ci=512,
+            co=512,
+            kernel=3,
+            stride=1,
+            pad=1,
+        )
+        model = NativeMatrixModel(
+            "conv2d", p, "hardware_loop", TARGET.hardware()
+        )
+        result = search_matrix(model, model.layer)
+        tile = selected_tile("conv2d", p, result.tiling)
+        self.assertEqual(tile, (7, 7, 128, 64))
+        commands = conv(
+            dict(p, tile=tile),
+            dict(
+                x=0x80000000, weight=0x80100000, bias=0x80400000, y=0x80500000
+            ),
+        )
+        launch = [c for c in commands if int(c["instruction"], 16) >> 25 == 15]
+        geometry = [
+            int(c["rs2"], 16)
+            for c in commands
+            if int(c["instruction"], 16) >> 25 == 17
+        ]
+        self.assertEqual(len(launch), 32)
+        self.assertTrue(
+            all(
+                ((g >> 32) & 65535, (g >> 16) & 65535, g & 65535) == (7, 7, 128)
+                for g in geometry
+            )
+        )
+        self.assertLess(
+            result.cost.latency,
+            cost("conv2d", p, (1, 7, 32, 256), "hardware_loop").latency,
+        )
+
+    def test_prime_matrix_extent_can_use_aligned_interior_tiles(self):
+        from voyager_compiler.compiler.search.interstellar import search_matrix
+        from voyager_compiler.targets.gemmini.scheduling import (
+            NativeMatrixModel,
+        )
+        from voyager_compiler.targets.gemmini.semantics import selected_tile
+
+        p = dict(m=1021, n=64, k=64)
+        model = NativeMatrixModel(
+            "matmul", p, "hardware_loop", TARGET.hardware()
+        )
+        result = search_matrix(model, model.layer)
+        tile = selected_tile("matmul", p, result.tiling)
+        self.assertGreater(tile[0], 1)
+        self.assertEqual(tile[0] % 16, 0)
+        self.assertLess(tile[0], p["m"])
+        self.assertIsNotNone(model.fit(result.tiling))
+
     def test_residual_rounds_and_saturates_before_addition(self):
         a = torch.tensor([[100, -100, 3, 5]], dtype=torch.int8)
         b = torch.tensor([[-100, 100, -3, -5]], dtype=torch.int8)
@@ -61,13 +131,14 @@ class DeploymentTests(unittest.TestCase):
                     WorkloadSpec(
                         "split-tail",
                         lambda _: Matrix(),
-                        lambda m, o: (args, {}),
+                        lambda m, o: (args[:2], {"d": args[2]}),
                     ),
                     replace(TARGET, implementations=(recipe,)),
                     out,
                     dump_tensors=False,
                 )
                 run(result, reference=expected, rtol=0, atol=0)
+                assert_saved_emission(self, out)
                 code = json.loads(
                     (Path(out) / "gemmini/commands.json").read_text()
                 )
@@ -128,9 +199,21 @@ class DeploymentTests(unittest.TestCase):
             }
             self.assertEqual(
                 names,
-                {"conv2d", "requantize", "add", "maxpool", "average", "matmul"},
+                {
+                    "conv2d",
+                    "add",
+                    "maxpool",
+                    "average",
+                    "matmul",
+                },
             )
             code = json.loads((Path(out) / "gemmini/commands.json").read_text())
+            self.assertTrue(
+                any(
+                    n.kwargs.get("relu")
+                    for n in result.program.graph.graph.nodes
+                )
+            )
             self.assertEqual(
                 len(code["bodies"]), len(result.program.plan.choices)
             )
@@ -192,6 +275,95 @@ class DeploymentTests(unittest.TestCase):
                 {"gemmini.matmul.explicit", "gemmini.matmul.hardware_loop"},
             )
             self.assertTrue(all(c.cost.latency > 0 for c in choices))
+            self.assertTrue(all(c.tile is not None for c in choices))
+            for choice in choices:
+                self.assertEqual(len(choice.tile.tiling.loop_blockings[0]), 3)
+            result.program.assert_frozen()
+
+
+class Depthwise(torch.nn.Module):
+    def __init__(self, stride):
+        super().__init__()
+        self.stride = stride
+
+    def forward(self, x, w, b):
+        return torch.ops.gemmini.depthwise_conv2d.default(
+            x, w, b, self.stride, 1, 0.125
+        )
+
+
+class GemminiDepthwiseTests(unittest.TestCase):
+    def test_native_split_spatial_tiles_preserve_groups_and_halos(self):
+        torch.manual_seed(9)
+        args = (
+            torch.randint(-8, 8, (2, 9, 11, 3), dtype=torch.int8),
+            torch.randint(-4, 4, (3, 1, 3, 3), dtype=torch.int8),
+            torch.tensor([-11, 0, 9], dtype=torch.int32),
+        )
+        recipe = next(
+            r
+            for r in TARGET.implementations
+            if r.name == "gemmini.depthwise_conv2d.hardware_loop"
+        )
+        target = replace(
+            TARGET,
+            implementations=(
+                replace(
+                    recipe,
+                    candidates=lambda n, c: (
+                        {"tile": (2, 3), "mode": "hardware_loop"},
+                    ),
+                ),
+            ),
+        )
+        for stride in (1, 2):
+            with (
+                self.subTest(stride=stride),
+                tempfile.TemporaryDirectory() as out,
+            ):
+                expected = torch.nn.functional.conv2d(
+                    args[0].permute(0, 3, 1, 2).double(),
+                    args[1].double(),
+                    args[2].double(),
+                    stride,
+                    1,
+                    groups=3,
+                )
+                expected = (
+                    (expected.float() * 0.125)
+                    .round()
+                    .clamp(-128, 127)
+                    .to(torch.int8)
+                    .permute(0, 2, 3, 1)
+                )
+                result = compile_workload(
+                    WorkloadSpec(
+                        "dw",
+                        lambda _: Depthwise(stride),
+                        lambda m, o: (args, {}),
+                    ),
+                    target,
+                    out,
+                    dump_tensors=False,
+                )
+                run(result, reference=expected, rtol=0, atol=0)
+                stream = json.loads(
+                    (Path(out) / "gemmini/commands.json").read_text()
+                )
+                launches = [
+                    c
+                    for c in stream["commands"]
+                    if c["type"] == "command"
+                    and int(c["instruction"], 16) >> 25 == 15
+                ]
+                self.assertEqual(
+                    len(launches),
+                    2
+                    * 3
+                    * ((expected.shape[1] + 1) // 2)
+                    * ((expected.shape[2] + 2) // 3),
+                )
+                self.assertTrue(all(int(c["rs1"], 16) & 64 for c in launches))
 
 
 if __name__ == "__main__":

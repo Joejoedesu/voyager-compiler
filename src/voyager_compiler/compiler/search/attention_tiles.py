@@ -24,6 +24,7 @@ from voyager_compiler.compiler.search.interstellar import (
     prefetch_tilings,
 )
 from voyager_compiler.compiler.search.tiler import TileConstraint, pick
+from voyager_compiler.extensions import NoLegalMapping
 from voyager_compiler.ir.plan import AttentionTiling, TileResult, pad_head
 from voyager_compiler.shape_prop import set_node_value
 
@@ -231,7 +232,7 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
                 continue
             candidates.append((tiling, placement))
     if not candidates:
-        raise RuntimeError(
+        raise NoLegalMapping(
             f"{node}: no tiling of its operands fits the scratchpad"
         )
 
@@ -262,7 +263,7 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
                 name: _product_result(product, tiler)
                 for name, product in products[tiling.tile_sizes].items()
             }
-        except RuntimeError:  # a product no mapping fits on chip
+        except NoLegalMapping:  # this product has no legal mapping
             continue
         if any(result is None for result in results.values()):
             continue
@@ -277,7 +278,7 @@ def attention_op_tiling(node, op, tiler, *, sq_eff, kv_batch):
             cost.dram_bytes / 1e6,
         )
     if not scored:
-        raise RuntimeError(f"{node}: no tiling of its products maps on chip")
+        raise NoLegalMapping(f"{node}: no tiling of its products maps on chip")
 
     best = pick(scored, tiler.runtime_tolerance, op.space.relative_ties)
     node.meta["tile_result"] = best

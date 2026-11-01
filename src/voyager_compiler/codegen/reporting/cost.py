@@ -19,9 +19,9 @@ from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_conv2d,
-    is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
+    is_grouped_conv,
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
@@ -176,7 +176,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             anchor.target is torch.ops.quantized_ops.conv2d.default
             or anchor.kwargs.get("layout") == "nhwc"
         )
-        if nhwc and not is_depthwise_conv(anchor):  # HWIO = [kh, kw, C, K]
+        if nhwc and not is_grouped_conv(anchor):  # HWIO = [kh, kw, C, K]
             kh, kw, c = w[0], w[1], w[2]
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]

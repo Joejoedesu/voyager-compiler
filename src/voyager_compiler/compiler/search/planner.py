@@ -125,7 +125,11 @@ def select_implementation(
                     implementation.validate(
                         node, graph, trial_context, parameters
                     )
-                tile = node.meta.get("tile_result")
+                # Matrix search stamps the anchor inside a fused region;
+                # vector/attention search stamps the call site itself.
+                tile = node.meta.get("tile_result") or anchor.meta.get(
+                    "tile_result"
+                )
                 cost = (
                     implementation.estimate(
                         node, graph, trial_context, parameters
@@ -151,6 +155,11 @@ def select_implementation(
                     tuple(sorted(parameters.items())),
                     tile,
                     cost,
+                    components=tuple(
+                        graph.meta.get("region_choices", ())
+                        if hasattr(graph, "meta")
+                        else ()
+                    ),
                 )
                 candidates.append(
                     (

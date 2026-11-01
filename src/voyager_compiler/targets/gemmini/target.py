@@ -10,7 +10,7 @@ from voyager_compiler.extensions import (
 )
 
 from . import lowering, scheduling, semantics
-from .emission import emit
+from .emission import emit, encode
 from .hardware import hardware
 from .quantization import POLICY
 
@@ -23,7 +23,11 @@ def _deployment_recipes():
         modes = (
             ("explicit", "hardware_loop")
             if kind == "matmul"
-            else ("hardware_loop",) if kind == "conv2d" else ("dma",)
+            else (
+                ("hardware_loop",)
+                if kind in ("conv2d", "depthwise_conv2d")
+                else ("dma",)
+            )
         )
         for mode in modes:
             yield ImplementationSpec(
@@ -74,6 +78,7 @@ TARGET = registry.register(
             *_deployment_recipes(),
         ),
         refine=lowering.refine,
+        encode=encode,
         emit=emit,
     )
 )

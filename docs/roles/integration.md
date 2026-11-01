@@ -33,7 +33,7 @@ target's bindings. Start with these source owners; follow imports as needed:
 
 3. Integrate handoffs by checking changed interfaces, artifacts and validation evidence. Summaries retain uncertainties and provenance; a confident worker claim is not an acceptance result.
 
-4. Preserve the pinned comparators and requested scope. Keep source fixed during acceptance runs, use existing local assets/environments, and label later documentation-only edits separately.
+4. Preserve the pinned comparators and requested scope. Freeze the source/artifact snapshot submitted to acceptance runs; develop a separate candidate independently if needed. Use existing local assets/environments and label later documentation-only edits separately.
 
 ## Do not
 
@@ -44,6 +44,10 @@ target's bindings. Start with these source owners; follow imports as needed:
 
 Return supported work and gaps, actual host/emission/endpoint evidence, estimates versus measurements, changed source and reproducible artifacts. State each claim at its validated scope; no stage-completion label is required.
 
-Run the affected contracts and required gates once changes settle. Preserve pinned numerical warnings as warnings; emitted collateral is not endpoint execution. Do not replace a failed pin without authorization.
+Use the task-local [adoption work record](../adoption/harness.md) across resumptions.
+A pending check names its tested artifact; a passing check does not close an
+unrelated optimization opportunity or validate a changed candidate.
+
+Run the affected contracts and required gates once changes settle. Preserve pinned numerical warnings as warnings; emitted collateral is not endpoint execution. Do not replace a failed pin without authorization. When a replacement is authorized, preserve the previous snapshot and record the resolved search policy, input identities and retained numerical warnings.
 
 [Role index](../roles.md) · [Adoption and task handoffs](../adoption.md)

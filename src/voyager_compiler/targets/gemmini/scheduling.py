@@ -4,10 +4,22 @@ This module proposes and prices alternatives; it never constructs FX or emits
 instructions. The shared planner chooses. Estimates retain the current heuristic.
 """
 
-from voyager_compiler.extensions import CandidateRejected, RuntimeModel
-from voyager_compiler.ir.plan import BufferRequirement, Cost
+from dataclasses import dataclass
 
-from .semantics import facts, raw_dimensions
+import interstellar
+from voyager_compiler.compiler.search.interstellar import (
+    memory_level,
+    search_matrix,
+)
+from voyager_compiler.extensions import CandidateRejected, RuntimeModel
+from voyager_compiler.ir.plan import (
+    BufferRequirement,
+    Cost,
+    MatrixSpace,
+    Placement,
+)
+
+from .semantics import facts, raw_dimensions, selected_tile, tile_storage
 
 
 class GemminiModel(RuntimeModel):
@@ -22,25 +34,8 @@ def ceildiv(a, b):
 
 
 def demands(kind, p, tile, mode):
-    if kind == "matmul":
-        m, n, k = tile
-        return (
-            16 * (m * ceildiv(k, 16) + k * ceildiv(n, 16)),
-            64 * m * ceildiv(n, 16),
-        )
-    if kind == "conv2d":
-        r, c, o, i = tile
-        kernel, stride = p["kernel"], p["stride"]
-        return (
-            16
-            * (
-                (r * stride + kernel - 1)
-                * (c * stride + kernel - 1)
-                * ceildiv(i, 16)
-                + kernel * kernel * i * ceildiv(o, 16)
-            ),
-            64 * r * c * ceildiv(o, 16),
-        )
+    if kind in ("matmul", "conv2d", "depthwise_conv2d"):
+        return tile_storage(kind, p, tile, mode)
     if kind == "add":
         return (0, 64 * tile[0] * ceildiv(tile[1], 16))
     if kind == "maxpool":
@@ -51,7 +46,12 @@ def demands(kind, p, tile, mode):
 def footprint(kind, p, tile, mode, config):
     sp, acc = demands(kind, p, tile, mode)
     # Hardware macros have two private contexts. Explicit code uses one arena.
-    slots = 2 if mode == "hardware_loop" and kind in ("matmul", "conv2d") else 1
+    slots = (
+        2
+        if mode == "hardware_loop"
+        and kind in ("matmul", "conv2d", "depthwise_conv2d")
+        else 1
+    )
     if (
         sp * slots > config.memory_instance("scratchpad").size.value
         or acc * slots > config.memory_instance("accumulator").size.value
@@ -110,6 +110,21 @@ def cost(kind, p, tile, mode):
             * 16
             + 60
         )
+    elif kind == "depthwise_conv2d":
+        r, c = tile
+        launches = (
+            p["batch"] * p["ci"] * ceildiv(p["oh"], r) * ceildiv(p["ow"], c)
+        )
+        traffic = launches * (
+            (r * p["stride"] + p["kernel"] - 1)
+            * (c * p["stride"] + p["kernel"] - 1)
+            + p["kernel"] ** 2
+            + 4
+        )
+        traffic += p["batch"] * p["oh"] * p["ow"] * p["ci"]
+        latency = traffic / 16 + launches * (
+            r * ceildiv(c, 16) * p["kernel"] ** 2 * 16 + 60
+        )
     elif kind == "average":
         traffic = p["batch"] * (p["pixels"] + 1) * p["channels"]
         latency = traffic / 16 + p["batch"] * p["pixels"] * ceildiv(
@@ -145,27 +160,18 @@ def candidates(node, context, mode):
     kind, p, _ = facts(node)
     config = context.tiler.config
     tiles = []
-    if kind == "matmul":
-        m, n, k = p["m"], p["n"], p["k"]
-        # All output block counts fitting the pinned accumulator; compare both
-        # full and shorter reduction tiles. The ranked shortlist is bounded.
-        for j in range(1, min(ceildiv(n, 16), 64) + 1):
-            for i in range(1, min(ceildiv(m, 16), 64 // j) + 1):
-                cap = config.memory_instance("scratchpad").size.value // (
-                    2 if mode == "hardware_loop" else 1
-                )
-                z = min(ceildiv(k, 16), cap // (256 * (i + j)))
-                for depth in sorted({1, z, max(1, z // 2)}):
-                    if z:
-                        tiles.append((i * 16, j * 16, depth * 16))
-    elif kind == "conv2d":
-        for i in sorted({min(p["ci"], v) for v in (16, 32, 64, 128, p["ci"])}):
-            for o in sorted({min(p["co"], v) for v in (16, 32, 64, 128)}):
-                for c in sorted({min(p["ow"], v) for v in (4, 8, 16, p["ow"])}):
-                    for r in range(
-                        1, min(p["oh"], 512 // (c * ceildiv(o, 16))) + 1
-                    ):
-                        tiles.append((r, c, o, i))
+    if kind in ("matmul", "conv2d"):
+        # One recipe trial runs an independent, exhaustive factor search. The
+        # planner's recipe budget does not truncate the matrix search space.
+        yield dict(mode=mode)
+        return
+    if kind == "depthwise_conv2d":
+        from interstellar.mapping_point_generator import factors
+
+        def extents(n):
+            return sorted({1, n, *factors(n), *range(16, n, 16)})
+
+        tiles = [(r, c) for r in extents(p["oh"]) for c in extents(p["ow"])]
     elif kind == "add":
         for n in sorted(
             {min(ceildiv(p["channels"], 16) * 16, v) for v in (16, 64, 128)}
@@ -227,4 +233,124 @@ def estimate_raw(node, graph, context, parameters):
 
 def estimate_deployment(node, graph, context, parameters):
     kind, p, _ = facts(node)
-    return cost(kind, p, parameters["tile"], parameters["mode"])
+    result = node.meta.get("tile_result")
+    return (
+        result.cost
+        if result is not None
+        else cost(kind, p, parameters["tile"], parameters["mode"])
+    )
+
+
+@dataclass(frozen=True)
+class NativePlacement(Placement):
+    requirements: tuple = ()
+
+
+class NativeMatrixModel:
+    """Interstellar factors native tiles; this adapter owns legality and price.
+
+    Levels are array, private on-chip arenas, DRAM. Outer order is fixed to
+    the command expansion, so the model cannot claim unimplemented retention.
+    Estimates are analytical, not calibrated hardware measurements.
+    """
+
+    def __init__(self, kind, params, mode, config):
+        self.kind, self.params, self.mode, self.config = (
+            kind,
+            dict(params),
+            mode,
+            config,
+        )
+        le = interstellar.le
+        from voyager_compiler.artifacts import hardware_digest
+
+        self.key = (
+            kind,
+            tuple(sorted(params.items())),
+            mode,
+            hardware_digest(config),
+            "native-v1",
+        )
+        self.layer = interstellar.Layer(
+            nifm=ceildiv(params["k" if kind == "matmul" else "ci"], 16) * 16,
+            nofm=ceildiv(params["n" if kind == "matmul" else "co"], 16) * 16,
+            wofm=(
+                ceildiv(params["m"], 16) * 16
+                if kind == "matmul"
+                else params["ow"]
+            ),
+            hofm=1 if kind == "matmul" else params["oh"],
+            wfil=1 if kind == "matmul" else params["kernel"],
+            hfil=1 if kind == "matmul" else params["kernel"],
+            nimg=1 if kind == "matmul" else params["batch"],
+            wstd=1 if kind == "matmul" else params["stride"],
+            hstd=1 if kind == "matmul" else params["stride"],
+        )
+        onchip, onchip_partitions = memory_level(
+            config, ("scratchpad", "accumulator", "scratchpad")
+        )
+        dram, dram_partitions = memory_level(config, ("dram",) * 3)
+        resource = interstellar.Resource(
+            buf_capacity_list=[[1] * 3, onchip, dram],
+            buf_access_cost_list=[[0] * 3, [0] * 2, [1]],
+            buf_unit_static_cost_list=[[0] * 3, [0] * 2, [0]],
+            para_count_list=[256, 1, 1],
+            memory_partitions=[[0, 1, 2], onchip_partitions, dram_partitions],
+            invalid_underutilized=False,
+        )
+        # fit() checks actual byte capacities including padded rows and private
+        # ping/pong contexts. Generic element capacities would double-count or
+        # mis-size INT32 accumulation. DRAM allocation is checked by the planner.
+        hints = {}
+        for loop in range(le.NUM):
+            spatial = 16 if loop in (le.IC, le.OC) else 1
+            middle = (
+                self.layer.sizes[loop]
+                if loop in (le.FX, le.FY)
+                else 1 if loop == le.ON else None
+            )
+            hints[loop] = [
+                [None, None if spatial > 1 else 1, spatial],
+                [None, middle, 1],
+                [None, None, 1],
+            ]
+        outer = (le.IC, le.OC, le.OX, le.OY, le.ON, le.FX, le.FY)
+        schedule = interstellar.Schedule(
+            hints, order_priority={level: outer for level in range(3)}
+        )
+        self.space = MatrixSpace(resource, schedule, fit_level=1)
+
+    def fit(self, mapping):
+        tile = selected_tile(self.kind, self.params, mapping)
+        # Interior matrix tiles fill array blocks. The last tile may be short;
+        # padding search extents keeps useful tiles available for prime M/N/K.
+        if self.kind == "matmul" and any(
+            size % 16 and size != self.params[dimension]
+            for size, dimension in zip(tile, ("m", "n", "k"))
+        ):
+            return None
+        try:
+            requirements = footprint(
+                self.kind, self.params, tile, self.mode, self.config
+            )
+        except CandidateRejected:
+            return None
+        return NativePlacement(requirements=requirements)
+
+    def cost(self, mapping, placement):
+        return cost(
+            self.kind,
+            self.params,
+            selected_tile(self.kind, self.params, mapping),
+            self.mode,
+        )
+
+
+def search_native(kind, params, mode, context):
+    model = NativeMatrixModel(kind, params, mode, context.tiler.config)
+    return search_matrix(
+        model,
+        model.layer,
+        runtime_tolerance=context.tiler.runtime_tolerance,
+        name=f"gemmini.{kind}.{mode}",
+    )
