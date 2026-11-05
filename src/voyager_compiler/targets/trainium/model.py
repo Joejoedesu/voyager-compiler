@@ -72,6 +72,7 @@ from .utils import (
     output_buffers,
     rows_cols,
     sbuf_bytes,
+    spread_row_segments,
 )
 from .vector import TrainiumPool, TrainiumVector
 
@@ -234,7 +235,33 @@ class TrainiumModel(RuntimeModel):
             ghz, fixed = config.vector_ghz, config.vector_overhead_ns
         return math.ceil(elements / rate) / ghz + fixed
 
-    def dma_ns(self, rows, cols, bits, count=1, load=False):
+    def balance_copy_busy(self, busy, copies):
+        """Attribute eligible automatic copies after all fixed engine work.
+
+        ``copies`` contains the service time if every copy ran on VectorE
+        or ScalarE. Walrus's time-aware scheduler considers both engines
+        for unpinned FP32 PSUM-to-SBUF copies. Approximate its opportunity
+        with steady-state load balancing, retaining each engine's existing
+        throughput and instruction overhead. This is not schedule replay:
+        dependencies and finite queues can prevent the predicted overlap.
+
+        Callers must exclude pinned copies, casts and unsupported types.
+        Collect the entire step first, including conversion and relayout
+        work, so subclass contributions do not rebalance partial steps.
+        """
+        vector, scalar = copies['vector'], copies['scalar']
+        if not vector:
+            return busy
+        # Do not move copies merely to improve a non-bottleneck engine.
+        other = max((ns for engine, ns in busy.items() if engine != 'vector'),
+                    default=0.0)
+        fraction = 0.0 if busy['vector'] + vector <= other else min(1.0, max(
+            0.0, (busy['vector'] + vector - busy['scalar']) / (vector + scalar)))
+        busy['vector'] += (1 - fraction) * vector
+        busy['scalar'] += fraction * scalar
+        return busy
+
+    def dma_ns(self, rows, cols, bits, count=1, load=False, *, row_segments=None):
         """A ``rows x cols`` tile of ``bits``-wide elements moved in
         ``count`` ``dma_copy`` instructions; a ``load`` moved in one is cut
         into one per piece of its 128-row blocks (``stream_blocks``).  The
@@ -254,7 +281,11 @@ class TrainiumModel(RuntimeModel):
         bandwidth = config.dram_bandwidth
         if parts <= config.dma_half_rate_partitions:
             bandwidth /= 2
-        moved = rows * (row_bytes + config.dma_row_overhead_bytes)
+        # A physical partition can contain many non-contiguous HBM runs.
+        # Charge the existing per-row overhead to those runs; the payload
+        # and bandwidth stay unchanged. No workload-specific coefficient.
+        segments = rows if row_segments is None else row_segments
+        moved = rows * row_bytes + segments * config.dma_row_overhead_bytes
         issue = config.dma_issue_ns
         copy = moved / bandwidth / count
         idle = config.dma_copy_idle_ns * min(1.0, issue / copy)
@@ -326,13 +357,21 @@ class TrainiumModel(RuntimeModel):
             rows, cols = rows_cols(s)
             count = _dma_count(tuple(s), value.shape, p)
             copies = 1
+            segments = None
             if spread:
+                # Kernel arguments are dense HBM boxes. A host-side view is
+                # materialized by the NKI boundary; its PyTorch strides do
+                # not describe the emitted argument's physical layout.
+                strides = tuple(math.prod(value.shape[i + 1:])
+                                for i in range(value.ndim))
+                segments = spread_row_segments(s, strides, parts)
                 rows, cols, count = parts, rows * cols // parts, 1
             elif rows == 1 and load:
                 rows = parts
             elif rows < parts and load:
                 copies = parts // rows
-            total += copies * self.dma_ns(rows, cols, bits, count, load)
+            total += copies * self.dma_ns(rows, cols, bits, count, load,
+                                          row_segments=segments)
         return total
 
     def quantize_mx_busy(self, rows, cols):
@@ -480,7 +519,9 @@ def kernel_nodes(gm):
 
 def predicted_seconds(nodes, config):
     """The latency the tile search predicted for each kernel of ``nodes``
-    (``kernel_nodes``): the cost of its winning tiling, stamped as
+    (``kernel_nodes``): prefer the selected implementation's cost, which is
+    retained on both freshly built nodes and template-cache hits. Legacy
+    builder-only callers use the cost of the winning tiling, stamped as
     ``meta["tile_result"]`` on a GEMM's anchor and on a GEMV or vector op
     itself.  A kernel whose build was reused takes the prediction of the one
     it reuses.
@@ -492,8 +533,14 @@ def predicted_seconds(nodes, config):
     for node, key in nodes:
         anchor = get_anchor_node(node) or node
         result = anchor.meta.get("tile_result") or node.meta.get("tile_result")
-        if result is not None:
-            seconds = result.cost.latency / (config.frequency * 1e9)
+        choice = node.meta.get("implementation")
+        cost = choice.cost if choice is not None else None
+        if cost is None and result is not None:
+            cost = result.cost
+        if cost is not None:
+            seconds = cost.latency / (config.frequency * 1e9)
             priced.setdefault(key, seconds)
-        predicted.append(priced[key])
+        else:
+            seconds = priced[key]
+        predicted.append(seconds)
     return predicted

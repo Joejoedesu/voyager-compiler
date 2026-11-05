@@ -110,6 +110,13 @@ class ImplementationSpec:
     Cost is used. Two competing implementations must both provide a cost.
     A builder may reject a candidate with ``CandidateRejected``; programming
     errors propagate rather than silently hiding a broken implementation.
+
+    ``matches`` is a read-only eligibility predicate. ``cache_by_shape`` opts
+    into reusing a build and its selection evidence for identical structural,
+    shape, dtype and layout signatures within one compilation. Reuse requires
+    every matching recipe to opt in and the ordered matching recipe set to
+    be identical; unrelated recipes do not disable it. Hooks depending on
+    additional per-node facts must leave this flag false.
     """
 
     name: str

@@ -170,6 +170,12 @@ def max_cache_len(args, config):
     chunks."""
     block = math.lcm(config.vector_lanes, residual_length(args))
     raw = args.context_length + DECODE_MAX_GEN
+    capacity = getattr(args, "decode_cache_capacity", None)
+    if capacity is not None:
+        if (isinstance(capacity, bool) or not isinstance(capacity, int)
+                or capacity < raw or capacity % block):
+            raise ValueError("decode_cache_capacity must cover context+generation and satisfy cache alignment")
+        return capacity
     return -(-raw // block) * block
 
 

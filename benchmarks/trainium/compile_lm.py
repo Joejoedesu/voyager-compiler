@@ -31,6 +31,7 @@ Attention and the rest stay BF16.
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -105,7 +106,48 @@ def voyager_args(args, config):
     # The decode cache is sized in whole vector-lane groups of this core.
     voyager.pe_array_size = config.pe_array_size
     voyager.vector_unit_width = config.vector_unit_width
+    select_decode_capacity(voyager, args, config)
     return voyager
+
+
+def select_decode_capacity(voyager, args, config):
+    """Choose external KV storage before export; preserve logical token positions."""
+    policy = getattr(args, "decode_cache_policy", "search")
+    if policy not in ("search", "exact"):
+        raise ValueError(f"unknown decode cache policy: {policy}")
+    if args.phase != "decode":
+        return
+    receipt = dict(policy=policy, status="unchanged", logical_context=args.context,
+                   generation_slots=llama.DECODE_MAX_GEN,
+                   baseline_capacity=llama.max_cache_len(voyager, config))
+    supported = (config is TRN2 and getattr(args, "dtype", "bf16") == "bf16"
+                 and args.attention == "sdpa" and voyager.spec_length == 1
+                 and voyager.qconfig is None
+                 and all(getattr(voyager, key) == value for key, value in LAYOUT.items()))
+    if policy == "search" and supported:
+        from transformers import AutoConfig
+        from voyager_compiler.targets.trainium.decode_capacity import search_decode_capacity
+        hf = AutoConfig.from_pretrained(args.model).get_text_config()
+        if (getattr(hf, "sliding_window", None) or
+                any(t != "full_attention" for t in getattr(hf, "layer_types", None) or [])):
+            receipt["reason"] = "heterogeneous/sliding attention is outside this search"
+        else:
+            heads = hf.num_attention_heads
+            result = search_decode_capacity(config,
+                required=args.context + llama.DECODE_MAX_GEN,
+                alignment=math.lcm(config.vector_lanes, llama.residual_length(voyager)),
+                heads=heads, kv_heads=getattr(hf, "num_key_value_heads", heads),
+                head_dim=getattr(hf, "head_dim", None) or hf.hidden_size//heads,
+                layers=args.layers or hf.num_hidden_layers,
+                max_kv_bytes=getattr(args, "decode_cache_max_bytes", None))
+            voyager.decode_cache_capacity = result["selected_capacity"]
+            receipt.update(result, status="selected")
+    elif policy == "search":
+        receipt["reason"] = "requires Trn2 BF16 single-token SDPA decode with default tensor layout"
+    receipt["physical_capacity"] = llama.max_cache_len(voyager, config)
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "cache-capacity-search.json"), "w") as stream:
+        json.dump(receipt, stream, indent=2)
 
 
 def main():
@@ -120,6 +162,12 @@ def main():
         "--attention", choices=("sdpa", "eager"), default="sdpa"
     )
     parser.add_argument("--out", required=True)
+    parser.add_argument("--resident-handoff", choices=("off", "auto", "hbm", "sbuf"), default="off",
+                        help="Compare HBM and on-chip attention/projection boundaries (experimental)")
+    parser.add_argument("--decode-cache-policy", choices=("search", "exact"), default="search",
+                        help="enumerate resource-bounded physical KV capacities, or retain original capacity")
+    parser.add_argument("--decode-cache-max-bytes", type=int,
+                        help="optional total BF16 K+V storage budget across all layers")
     parser.add_argument(
         "--merge-linears",
         action="store_true",
@@ -164,6 +212,8 @@ def main():
     # The flash attention's causal table is the additive fill.
     compile_args["bool_mask"] = False
     transform(gm, example_args, example_kwargs, **transform_args)
+    from voyager_compiler.targets.trainium.handoff import outline
+    outline(gm, args.resident_handoff)
     nodes = kernel_nodes(gm)
     model = compile(gm, example_args, example_kwargs, **compile_args)
     # Saved first, so the translation can be redone without compiling.

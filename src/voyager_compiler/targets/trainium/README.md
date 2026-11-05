@@ -39,17 +39,173 @@ overlap assumptions being priced by the model.
 | Extension | Binding and responsibility |
 | --- | --- |
 | `hardware` | `config.py:TrainiumConfig`, TRN2/TRN3: engines, partitions and capacities |
+| `operators` | `scan.py:selective_scan`: unbatched FP32 state-space recurrence with explicit CPU and fake semantics |
 | `normalization` | `config.py:LAYOUT` and `fusion.py:FUSION_PATTERNS`: operand layouts and explicit target-owned broad fusion patterns |
-| `implementations` / `model` | `implementations.py`, `model.py`, GEMM/attention/vector models and builders: competing FP8 row modes plus shared recipes |
+| `legalize` / `lower` | `normalization.py`, `dag.py`: guarded RMS recognition, inverse-transpose cancellation, numerical-policy tagging and equal-shape FP32 DAG outlining |
+| `implementations` / `model` | `implementations.py`, `compensated.py`, `model.py`, GEMM/attention/vector models and builders: competing arithmetic forms plus shared recipes |
 | `encode` | `implementations.py:encode`: selected row mode in common IR; immediate constants in binary payloads (including non-finite values) and translation limits in saved target records |
 | `emit` | `target.py:emit`, `translate.py`: read saved IR and translation records to generate NKI, without live FX or configuration objects |
 
-No separate `input_preprocessing`, `quantization`, `legalize`, `lower`, `refine`, `runtime` or `characterize` hook is
+No separate `input_preprocessing`, `quantization`, `refine`, `runtime` or `characterize` hook is
 registered. Shared defaults apply; inherited runtime tools are invoked separately.
 Broad graph patterns live in `fusion.py`; registered compilation and both benchmark
 frontends consume that table, with no imports from tests or hardware-derived
 patterns. Instruction patterns in `patterns.py` belong to target builders/translation
 and remain a separate mechanism.
+
+RMS prologues and last-axis softmax epilogues use the existing shared GEMM
+builder. `normalization.py` also registers separately priced materialized
+alternatives through the common sequential-region builder; their costs include
+the component kernels and intermediate movement. This adds no scheduler or
+extension contract. The same composition also covers GEMM followed by RMSNorm:
+when a full-row fused epilogue cannot fit, GEMM and add/RMS can use their own
+legal tiles and materialize the intermediate. The fused candidate remains in
+the search; this is not a dimension-specific fallback.
+
+`legalize` recognizes private FP32 `softmax((Q @ K.T) * scale) @ V` expressions
+(including division by a positive literal) as unmasked attention. It preserves
+the explicit scale and reaches the existing shared attention search/builder.
+Observed scores/probabilities, non-last-axis softmax, and low-precision
+intermediate rounding are excluded. Streaming reassociates FP32 arithmetic;
+numerical equivalence is accuracy-qualified, not bitwise. The FP32 builder omits
+redundant same-dtype casts so scale/store/row-reduction instruction fusion remains
+visible. Actual dtype conversions remain explicit.
+
+Unweighted RMS recognition is limited to FP32, power-of-two
+last dimensions and the exact `x / sqrt(sum(square(x) / width))` expression with
+keepdim. It is accuracy-qualified, not bitwise equivalent across reduction
+orders, overflow or underflow. Other expressions retain their original graph.
+The ordinary row and spread translators support absent RMS weights; this does
+not establish support for every K-major representation.
+
+The November 2 shared-queue evidence validates full-size RMSNorm+Matmul and
+Add+RMSNorm+Matmul against the original NumPy functions at relative L2 < 2e-5.
+Held-out shapes, materialized alternatives, saved emission and an unchanged-path
+lifecycle comparison are covered by `tests/test_trainium_alternatives.py`.
+Model latency is in cycles; conversion to nanoseconds divides by the configured
+frequency in GHz. The matrix change adds no performance formula or fitted parameter.
+
+The Set2 compilation repair passes full-output relative L2 < 2e-5 on hardware:
+case 08 takes 4.373250 ms and case 20 takes 143.917178 ms. The same attention
+recognition improves Set1 GQA from 15.592859 to 9.009785 ms; the other 13 Set1
+plans and emitted programs remain identical. These are LNC1 resident-device
+measurements, 2 x (10 warmups + 40 timed calls), excluding host glue/transfers.
+The large attention still emits 1.29 million instructions and requires a
+memory-aware source-parser/isolated-backend compilation workflow. See the
+[repair evidence](../../../../../reports/set2-compile-fixes-20261104/REVIEW.txt)
+for measurements, compiler-memory limits and reproduction scripts.
+
+Emitter layout analysis deduplicates identical `OpUse` constraints, whose unions
+and maxima are independent of multiplicity. Repeated row access syntax is cached
+within one kernel emission pass using the resolved view, reshape dimensions,
+slot and requested row/column range. Both caches reset with the emission pass;
+they do not cache candidate predictions or alter schedules, buffers or placement.
+
+`dag.py` groups dtype-preserving FP32 or BF16 pointwise DAGs, including branches and
+multiple live outputs. Its implementation uses `build_pipelined_buffers` for
+movement, slots, waits and loops. Ordinary SRAM destinations and last-use coloring
+represent intermediates; it introduces no native whole-kernel invocation or new
+scheduler. The target `lower` hook exposes eligible short fused chains and outlines
+connected regions. Inputs may also be contiguous suffixes broadcast over leading
+dimensions. The builder visits outer indices inside each suffix tile, allowing the
+shared pipeline to reuse the loaded broadcast tile. It does not expand the input
+in HBM. Other broadcast geometries, strided inputs and mixed types retain the
+materialized path. The external allocation retains the logical output shape;
+internal transfer maps are flat or two-dimensional. Export-only example clones
+handle disjoint aliased inputs without introducing executable copies.
+
+Dtype is a semantic constraint, not an automatic precision choice. Every operation
+writes a destination of its declared dtype, preserving intermediate BF16 rounding.
+The candidate's buffer capacity, DMA bytes and engine service use that dtype;
+division's reciprocal scratch remains FP32. Selecting BF16 for an FP32 graph would
+need a separate explicit numerical policy. The direct `compile_bufferized` entry
+expects an already lowered graph and does not run this outlining hook itself.
+
+Oversized DAG searches rank all fitting parameter sets with the existing
+analytical cost before building at most 63, reserving the default planner's
+64th trial for the materialized comparator. Smaller searches retain their
+original order. Stable latency ordering retains the modeled winner and its
+tie order without changing costs; allocation refinement can try the remaining
+shortlisted alternatives. Region inlining binds actual positional and keyword
+arguments, preserving repeated operands introduced by transpose cancellation.
+
+For ordinary pointwise tiles spread over SBUF partitions, the DMA model counts
+contiguous HBM runs and applies the existing row overhead to those runs. It uses
+the dense NKI argument shape, matching the emitter and runtime boundary, rather
+than a host view's parent strides. This corrects fragmented-access ranking without
+changing bandwidth constants. It does not model every emitted command, Walrus
+packet, hoisted load or queue dependency; geometry correction is not a claim of
+cycle-accurate prediction. The November4 implementation/access report records
+the model error, isolated controls and unchanged-path regression evidence.
+
+Candidates pair a model with physical width, two/three pipeline slots and optional
+ScalarEngine placement for literal add/multiply. Widths use a bounded 128-column
+lattice up to8192, with exact divisibility and the existing usable-SBUF limit;
+this is a search policy, not a hardware limit. `TargetInvoke` on individual ordinary
+primitives freezes width/engine selection into saved PrimOp records. It does not
+own private allocation. Emission consumes these records without making a new
+tiling decision. A separately priced materialized region remains available.
+
+The optional `compile_workload` option `trainium_approximate_reciprocal=True`
+also permits ScalarEngine activation reciprocal in this DAG family. It is off
+by default: the SDK documents lower precision than VectorEngine reciprocal and
+the supported input range `±[2^-42, 2^42]`. The caller must qualify its numerical
+contract and input domain; host replay alone cannot validate approximate hardware
+arithmetic. The benchmark harness exposes `--dag-approximate-reciprocal` explicitly.
+Search retains the original VectorEngine form and scalar-literal-only control.
+This is a numerical candidate, not an emit-time rewrite. It shares the existing
+reciprocal scratch and buffer plan. Ordinary standalone reciprocal also emits
+the VectorEngine form unless the saved choice requests activation.
+
+The DAG cost reuses `TrainiumModel` engine/DMA/sweep services, accounts for every
+input/output transfer, and bounds compute by both engine totals and dependencies,
+including scratch reuse. Vector reciprocal prices eight elements of work per
+logical element, following the Neuron2.31 documented `max(MIN_II,8*N)` throughput
+versus `max(MIN_II,N)` for ScalarEngine activation. Tile widths here exceed the
+documented approximate64-cycle initiation interval. The shared engine clocks and
+overheads remain unchanged; this adds instruction work rather than a fitted
+kernel factor. It is not a cycle-exact scheduler: two versus three slots
+currently share the overlap estimate; backend automatic engine placement and
+instruction-specific service costs remain limitations. The November2 DAG evidence
+under `reports/implementation-dag-20261102` retains those estimation errors rather
+than installing per-kernel timing factors. Tests in `test_trainium_dag.py` cover
+branches, retained intermediate outputs, disjoint views, guards, host replay and
+fresh saved emission on held-out shapes. Hardware evidence is scoped separately
+to the benchmark RoPE, AdamW and SiLU shapes.
+
+The optional `trainium_compensated_matmul=True` admits
+`trainium.gemm.compensated` alongside ordinary FP32 GEMM. It is off by default.
+The recipe splits FP32 operands into high and residual halves (FP16 or BF16),
+then accumulates high×high, high×low and low×high in FP32. It omits low×low;
+rounding, FP16 range and residual underflow require application-specific numerical
+qualification. It is not an exact FP32 replacement or a range-checked fallback.
+Search compares both formats at their modeled cost; a tie does not establish
+equal numerical quality. The benchmark harness exposes `--compensated-matmul`.
+
+This recipe subclasses the existing GEMM step/model and uses `_gemm_plan`,
+`build_pipelined_buffers`, shared operand reuse, transpose loads, PSUM planning
+and eviction. Four ordinary SRAM destinations hold high/residual components;
+decomposition repeats when an input tile changes. Selected dtype and all three
+products are explicit in the frozen buffer program and survive saved emission.
+There is no native whole-kernel body, new public hook or separate DMA scheduler.
+Its current scope is two-input FP32 matrix contractions whose operands land
+K-major, including batched and input-transpose forms. Bias, computed prologues,
+epilogues, MX representations and transposed outputs retain other recipes.
+
+The paired cost uses three half-precision TensorEngine products, FP32 conversion
+passes, input-reuse counts, explicit split-buffer capacity and the existing
+DMA/sweep services. FP32 input transposes are charged once per loaded tile.
+These are resource costs with an overlap assumption, not a cycle-exact backend
+schedule. The held-out small-matrix latency error remains substantial even when
+a full-size case is predicted closely. `test_trainium_compensated.py` covers
+split-K, batch, format, numerical-policy guards, input preservation and fresh
+saved emission. Dated hardware evidence is in
+`reports/implementation-compensated-20261102` outside this checkout.
+
+Rank-two `numpy_T` canonicalization and cancellation of inverse transposes across
+a region boundary preserve other external uses. These layout changes are
+independent of the numerical option. Existing host padding/cropping is still
+outside resident-device timings and must be disclosed in comparisons.
 
 ## Static preparation, padding and local checks
 
@@ -65,6 +221,9 @@ SBUF/PSUM partition, MX packing and attention constraints remain target-specific
 Kernel manifests record partially written output ranges for per-kernel checking.
 The completed program still requires full-output comparison; partial MX writes
 remain unsupported. Older manifests without ranges retain whole-output checking.
+Partial ordinary HBM outputs receive the existing destination as a kernel input,
+so subsequent calls preserve the ranges written by earlier calls. Mutable
+destination inputs are cloned during per-call comparison to protect references.
 Not every generic halo/partial-transfer form translates to NKI. `patterns.py`
 implements instruction fusions, such as paired scalar ALU operations in one
 `tensor_scalar`; translation packs MX codes/scales with required padding. These
@@ -78,6 +237,24 @@ execution or measured performance. Shared changes also need affected target gate
 Donor ISA comparator: `9bdf4ee9cb11d2b5eaa0fc9a46201746c2bbf79c`.
 
 ## How a model gets there
+
+`workloads.mamba.SelectiveScan` exposes `trainium_ops::selective_scan` for
+`delta/u [channels, time]`, `A [channels, states]` and `B/C [states, time]`.
+Its CPU reference follows NumPy FP32 exponential and serial recurrence rounding.
+It does not recognize an arbitrary Python-unrolled recurrence. The native recipe
+currently requires FP32 and channel counts divisible by 128. Recipe search
+selects a sequence tile, declares private SBUF capacity and implicit HBM traffic,
+and prices scalar/vector/DMA work. Saved `TargetInvoke` records that tile;
+emission uses `tensor_tensor_scan` with explicit state carried between tiles.
+NKI owns private allocation and scheduling. The estimate is analytical and does
+not imply a fitted scan throughput. Delta and U are retained explicitly across
+states; their full sequence storage is included in the private reservation.
+The model uses separate vector/scalar/DMA work budgets, exposed fill/drain and
+one two-ALU scan instruction overhead, with a one-element carry-copy allowance.
+It does not sum all engines as sequential work. This overlap assumption was
+checked with Trn2 NTFF profiles; it is not a general promise for every native
+macro or a dependency-exact downstream schedule. Saved-emission and
+semantic tests are in `tests/test_trainium_alternatives.py`.
 
 Use `pipeline.compile_workload(workload, registry.target("trainium"), output,
 config=TRN2)` (or `TRN3`) with a prepared `WorkloadSpec`. The registered target
@@ -97,6 +274,18 @@ measurements are not setup instructions or fresh acceptance evidence here.
 
 Apply these Trainium-specific rules within the shared compilation contract.
 Other targets may need different primitive representations or execution models.
+
+The selected NKI program is not necessarily the final instruction inventory.
+Downstream allocation, DMA optimization, copy elimination and synchronization
+lowering can change transfers, alias copies and engine waits. In particular,
+`CompileOptions.disable_backend_optimizations()` changes two NKI pipeline options;
+it does not suppress every later Neuron compiler pass. `dma_copy` with unknown
+DGE mode also leaves descriptor generation to that compiler. Keep its installed
+version and options with any model-validation evidence. Inspect compiler IR and
+NTFF together before treating a source-level copy as one hardware instruction,
+or a source-level DMA subdivision as fewer physical transfers. Small-DMA and
+reuse behavior is conditional on shape, layout, dtype, lifetimes and capacity;
+do not generalize a measured threshold from one descriptor path to all kernels.
 
 1. **Translate the selected execution.** Instruction/transfer expansion follows
    the chosen primitive's limits, including FP8 row mode and MX contraction
@@ -475,9 +664,166 @@ program reads the position as a Python scalar, which a trace cannot, so
 it takes the value the reference run recorded -- a decode is compiled
 with references (without `--no-reference`).
 
+## Automatic copy service attribution
+
+The GEMM model can share unpinned, same-type FP32 PSUM-to-SBUF copies
+between VectorE and ScalarE on Trn2, for one row group per pipeline step
+(`rows <= partitions`). It collects their service separately and balances it
+after the fixed arithmetic, store issue and, for compensated products, input
+conversion/relayout work. Existing engine rates and overheads are unchanged.
+This is a steady-state resource approximation, not a replay of Walrus scheduling
+or an instruction-engine directive. Casts, half-width copies, other targets and
+multiple row groups retain their previous pricing.
+
+The measured reason for that scope matters: unconstrained balancing selected a
+256-row softmax tile that regressed from 4.470 to 6.252 ms. Its trace exposed less
+overlap despite fewer copies and DMAs. The scoped model retains the 128-row
+softmax kernel and estimates 4.904 ms instead of 7.535 ms. It also selects a
+128-row compensated BMM that passes full numerics and improves 3.472 to 3.021 ms.
+Nine other qualified kernels have identical saved emission; 33 affected tests
+pass. The softmax scaling cost is deliberately unchanged. Exact pass snapshots,
+rejected control and shared-queue measurements are in the
+[copy-engine review](../../../../../reports/implementation-copy-engine-20261102/REVIEW.txt).
+
+## Selective-scan numerical algorithm
+
+The native `trainium.selective_scan` recipe accepts the explicit compilation
+option `options={"trainium_scan_algorithm": "integrating_factor"}`. The default
+is `"direct"`; unknown values fail rather than silently selecting a policy.
+The option applies to the semantic selective-scan workload, not arbitrary
+Python-unrolled recurrences. Both paths require FP32, channel multiples of 128,
+and complete time panels. The existing recipe search chooses a panel, declares
+private SBUF and traffic, and freezes the algorithm and width for saved emission.
+
+The integrating-factor path computes a tile-local prefix of delta and positive
+and negative exponentials of A times that prefix. Cumulative sums then reconstruct
+the carried state. This avoids compounding independently rounded exponentials
+over thousands of direct recurrence steps. The CPU semantic reference remains
+the original serial recurrence. The native algorithm remains an opaque scheduling
+boundary; this does not add a shared bufferized recurrence builder.
+
+This is a numerical opt-in: product association, prefix sums and state evaluation
+order change, and large positive or negative prefix exponents can overflow or
+underflow even when a direct recurrence is finite. There is no runtime range
+check or universal-error guarantee. Qualify the caller's inputs and tolerance.
+The resource model prices the declared ScalarE, VectorE and DMA work using the
+existing service rates and fill/drain assumptions. It does not fit a per-kernel
+correction or reconstruct every dependency; tested panel rankings can disagree
+with hardware. The retained direct path still fails the Set1 long-scan relative-L2
+gate, while the integrating option passes the recorded benchmark and held-outs.
+See the [numerical diagnosis and qualification](../../../../../reports/mamba-numerics-20261103/REVIEW.txt).
+
 ## Not supported yet
 
-Kernels that write an HBM box they did not allocate, transfers with a
-non-zero pad, partial transfers, MXFP4, convolution, pooling other than an
+Kernels that read an HBM box while writing it, partial MX outputs, transfers with
+a non-zero pad, generic partial transfers, MXFP4, convolution, pooling other than an
 unpadded NCHW max_pool2d, and a fused attention other than a K-major flash
 attention (`sdpa_mx`, a split KV cache's, is not lowered).
+# Reuse experiment: composable products and bufferized scan
+
+The 2026-11-03 reuse experiment is recorded under
+`/home/ubuntu/AGEN-voyager/reports/reuse-mamba-20261103`. Its source snapshot,
+paired LNC1 measurements and candidate identities are retained there. It does
+not integrate the separate DMA-expansion predictor.
+
+Compensated arithmetic now specializes operand preparation and slice accumulation
+inside `GemmSteps`, rather than duplicating the matrix loop. The same traversal
+owns activation prologues, transposition, split-K, residual/normalization/softmax
+tails and final eviction. Extra high/residual buffers enter the ordinary matrix
+fit calculation through a target-local helper. `trainium_compensated_matmul=True`
+remains required. Bias, MX, unsupported weight layouts and transposed outputs
+remain excluded. Shared control does not imply every fused arithmetic candidate
+is faster or qualified over every FP32 input range.
+
+`trainium_scan_execution="bufferized"`, together with
+`trainium_scan_algorithm="integrating_factor"`, enables the shared scan experiment.
+The existing `build_pipelined_buffers` owns the channel/time/state grid, input and
+output slots, movement and persistent scratch. Carry and panel intermediates are
+ordinary explicit SRAM buffers. The two target primitives are a tile cumulative
+sum with optional incoming state and a tile scaled exponential. Their emitter
+consumes the saved tile views and allocates no private scratch. B/C rows use the
+existing partition-broadcast DMA path, without host replication. Capacity pricing
+includes those physical replicas even though their logical buffer shape is one row.
+This uses the existing pipeline, not a new recurrence scheduler or native macro.
+
+The default execution remains `native` while this experiment is evaluated. Direct
+scan remains the default numerical algorithm and its known long-case L2 failure
+is unchanged. Integrating factors retain their input-range/overflow limitations.
+Saved emission and multi-panel carry tests cover the new path; see the dated
+report for exact hardware shapes and numerical qualification.
+
+The native integrating-factor model now charges one vector service for its
+cumulative instruction, and surviving boundary copies to ScalarE, using matching
+NTFF evidence. The shared scan model prices its own actual pipeline work and
+slot capacity using the existing hardware rates. Neither model receives a
+benchmark-specific correction factor. Native-versus-shared ranking remains a
+separate question from ranking panels within the shared path.
+
+## Enumerated physical decode-cache capacity
+
+The full-model Trainium benchmark defaults to `--decode-cache-policy search`
+for homogeneous, batch-one BF16 single-token SDPA decode on Trn2 with the
+default layouts. Other paths retain their existing capacity. `exact` retains
+the original context-plus-generation alignment. An optional
+`--decode-cache-max-bytes` constrains total persistent BF16 K+V storage across
+the model's layers. Logical context, generation budget and update positions
+are unchanged; the workload's normal mask covers the extra physical slots.
+
+`decode_capacity.search_decode_capacity` builds shape-only normalized attention
+nodes and invokes the existing shared `attention_op_tiling`, including its
+product mapping searches and target fit/cost model. It does not force a tile
+into compilation, adjust hardware service rates, or fuse attention/projection.
+The resulting full model is still tiled by the ordinary compiler. Compare its
+saved choices with the representation-search receipt before reusing a forecast.
+
+The search exhaustively visits aligned capacities through the largest first
+capacity that accommodates any PSUM-bounded aligned key tile. Two score
+parities bound a tile by `(psum_banks // 2) * moving_free_max`; actual fitting
+also includes all other PSUM and SBUF buffers. For each tile, its smallest
+capacity is the first multiple of `lcm(tile, cache_alignment)` covering the
+required context and generation budget. Further multiples add identical steps,
+traffic and storage under this single-token model. The finite bound therefore
+covers every undominated capacity/tile choice in the supported representation;
+it does not claim to search alternative algorithms, partial final tiles or
+different attention schedules. All interior aligned capacities are visited too.
+
+The objective is strict modeled **attention** latency summed over the layers;
+ties prefer less traffic and persistent memory. KV storage is a budget and
+tie-break, not a latency coefficient. This estimate excludes other full-model
+operators, input preparation and host overhead. The benchmark writes
+`cache-capacity-search.json` with the domain, memory usage, scored/rejected tile
+trials and selected capacity. It uses no model-family or preferred-capacity
+table. P2048 selecting2304/1152 is a search result, not a DMA-size requirement.
+
+Tests are in `tests/test_trainium_decode_capacity.py`; dated full-model evidence
+and source-isolation checks are under
+`/home/ubuntu/AGEN-voyager/reports/cache-capacity-search-20261103`.
+
+
+
+### Optional resident decode attention/projection
+
+`trainium_resident_handoff="auto"` in `compile_workload` options (or
+`compile_lm.py --resident-handoff auto`) compares priced HBM and SBUF region
+recipes. The default is `off`; `hbm` and `sbuf` force the boundary for controlled
+qualification. Initial scope is BF16 batch-one, single-token decode, 128-wide
+heads, an absent/BF16 mask, and a single plain output-projection consumer through
+order-preserving views. Unsupported patterns retain ordinary compilation.
+
+`handoff.py` specializes the existing FA3 output boundary and GEMV operand
+reader. Shared `bufferize.residency.compose_resident_stages` joins completed
+producer/consumer stages; the ordinary allocator owns their storage. The
+Trainium emitter preserves live on-chip values in one kernel scope from frozen
+IR. It does not select fusion or invent prefetch. Bufferized stages are ordered,
+but the lower compiler can overlap independent weight DMA and ready projection
+products with late attention work. The initial component-sum estimate does not
+credit that overlap; see `LOWER-COMPILER-OVERLAP.txt` in the evidence directory.
+
+The resident output is packed `[128, heads]` in SBUF (8 KiB for 32 heads), after
+the original BF16 rounding. Local transpose/copy and persistent capacity are
+priced; removed output/input DMAs are removed from the existing engine and
+traffic calculations before recomputing latency. Costs use the unchanged
+hardware resource parameters. HBM remains a comparable candidate and capacity
+fallback. Qualification evidence is under
+`/home/ubuntu/AGEN-voyager/reports/onchip-handoff-20261103`; consult its state for
+measured scope and limitations.

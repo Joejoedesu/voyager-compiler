@@ -419,6 +419,10 @@ class _FA3Pipeline(torch.nn.Module):
             post_count=post_count,
         )
 
+    def _store_output(self, b, coords):
+        """Write the completed output through the selected storage boundary."""
+        self._store_out(get_slot(b.out_slots, 0), b.out, b.out_sem, coords)
+
     def _store_out(self, tile, out, sem, coords):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
@@ -641,7 +645,7 @@ class _FA3Pipeline(torch.nn.Module):
         # (no prior store exists at the first boundary).
         _guarded_wait(get_slot(b.out_sem, 0), sweep >= 2)
         self._finalize(b, get_slot(b.l, prev_sweep_slot))
-        self._store_out(get_slot(b.out_slots, 0), b.out, b.out_sem, prev)
+        self._store_output(b, prev)
         voyager.insert(torch.zeros_like(b.o), b.o)
 
     # --- the kernel's buffers -------------------------------------------
@@ -653,6 +657,10 @@ class _FA3Pipeline(torch.nn.Module):
         slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
         return slots, voyager.zeros([], torch.int64, num_slots=2)
 
+    def _allocate_output(self):
+        """Storage boundary selected by the paired implementation/model."""
+        return voyager.alloc(self.out_shape, self.out_dtype)
+
     def _alloc(self, b):
         """Allocate the kernel's buffers into ``b``, which holds its
         operands as folded (``forward``): the output, the slots the DMA
@@ -662,7 +670,7 @@ class _FA3Pipeline(torch.nn.Module):
         unit = (1,) * self.nb
         tq, tkv, d_pad = self.tq, self.tkv, self.d_pad
         bs = self.block_size
-        b.out = voyager.alloc(self.out_shape, self.out_dtype)
+        b.out = self._allocate_output()
         b.q_slots, b.q_sem = self._stream(b.q, self.q_tile)
         b.k_slots, b.k_sem = self._stream(b.k, (d_pad, tkv))
         b.v_slots, b.v_sem = self._stream(b.v, (tkv, d_pad))
@@ -1275,7 +1283,7 @@ class _FA3Pipeline(torch.nn.Module):
         if sweeps > 1:  # a prior boundary store exists (static)
             voyager.async_wait(get_slot(b.out_sem, 0))
         self._finalize(b, get_slot(b.l, last_sweep_slot))
-        self._store_out(get_slot(b.out_slots, 0), b.out, b.out_sem, c_last)
+        self._store_output(b, c_last)
         voyager.async_wait(get_slot(b.out_sem, 0))  # drain
         out = b.out
         if self.g_head > 1:

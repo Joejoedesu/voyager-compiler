@@ -205,10 +205,15 @@ minimal `RuntimeModel.prepare` returning `None`, provided its recipes implement
 and cost all supported forms. `None` means no local tiling model, not proof of
 operation support or permission to invent a zero cost.
 
-Keep `cache_by_shape=False` for new recipes unless matching, parameters, legality
-and generated code are determined by the existing structural/shape/dtype key.
+Keep `cache_by_shape=False` for new recipes unless parameters, legality, modeled
+cost and generated code are determined by the structural/shape/dtype/layout key.
 Tensor-content-dependent specialization is not covered merely because shapes
 match. This is distinct from an `OpModel.key` used by mapping search.
+`matches` is a read-only eligibility predicate, evaluated before template lookup.
+Sharing also requires the same ordered set of matching recipe identities, with
+every matching recipe opting in. An unrelated uncacheable recipe does not disable
+reuse; a matching uncacheable recipe does. Scope-specific allocation exclusions
+conservatively disable sharing for that bufferization pass.
 
 The shared planner selects; the candidate callback proposes; the model estimates;
 the builder constructs. A builder may request shared tile search through its

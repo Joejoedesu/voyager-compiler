@@ -72,6 +72,7 @@ and a call per kernel) and ``manifest.json``.
 import hashlib
 import json
 import math
+from collections import Counter
 import operator
 import os
 import re
@@ -181,6 +182,8 @@ ACTIVATIONS = {
     "aten::sigmoid": "nl.sigmoid",
     "aten::tanh": "nl.tanh",
     "aten::rsqrt": "nl.rsqrt",
+    "aten::sqrt": "nl.sqrt",
+    "aten::square": "nl.square",
     "aten::gelu": "nl.gelu",
 }
 # Per-tensor quantization: ``quantize`` divides by the scale and saturates
@@ -297,7 +300,7 @@ class Layout:
         return self.blocks * self.cols * self.spacing
 
 
-@dataclass
+@dataclass(frozen=True)
 class OpUse:
     """What a compute op does with the kernel's on-chip boxes, as the
     analysis walk records it (``Kernel._lay_out``).
@@ -710,6 +713,12 @@ class Kernel:
                 self.one_partition.add(crossing.box)
         if set(self.reads) & set(self.writes):
             raise NotImplementedError("a kernel reads an HBM box it writes")
+        # A partial store writes the IR's existing HBM allocation. Passing
+        # that destination through the kernel preserves earlier stores and
+        # avoids copying or replacing the untouched part of the box.
+        self.destinations = [b for b in self.writes if not self.stored[b].all()]
+        if set(self.destinations) & set(self.mx):
+            raise NotImplementedError("a partial MX output")
 
     def _translate(self, ops):
         """Walk ``ops`` twice: to learn each box's uses, then to emit."""
@@ -721,6 +730,7 @@ class Kernel:
         self.reads, self.writes = [], []
         self.stored = {}
         self.windows = {}
+        self.row_alignment = {}
         self.uses = {}
         self.op_uses = []
         self.lines = []
@@ -846,8 +856,22 @@ class Kernel:
         PSUM holds an 8-bit element in two bytes, the way TensorE writes an
         FP8 transpose, and starts each row block on a 4-byte boundary, where
         an instruction's PSUM access must start."""
+        # Iterations often have identical layout constraints. Multiplicity
+        # changes neither their unions nor maxima, but makes the membership
+        # checks in _spread_ops quadratic in the expanded instruction count.
+        self.op_uses = list(dict.fromkeys(self.op_uses))
         spread_ops = self._spread_ops()
         spread = {name for use in spread_ops for name in use.rows}
+        alignment = {name: self.row_alignment.get(name, 1) for name in spread}
+        changed = True
+        while changed:
+            changed = False
+            for use in spread_ops:
+                required = math.lcm(*(alignment[name] for name in use.rows))
+                for name in use.rows:
+                    if alignment[name] != required:
+                        alignment[name] = required
+                        changed = True
         for box in self.boxes.values():
             if box.level not in ON_CHIP or box.name in self.mx_tiles:
                 continue
@@ -864,7 +888,7 @@ class Kernel:
                 continue
             if box.name in spread:
                 elements = math.prod(box.shape)
-                parts = spread_partitions(elements)
+                parts = spread_partitions(elements, alignment[box.name])
                 self.layouts[box.name] = Layout(
                     parts, 1, elements // parts, False, spread=True
                 )
@@ -881,7 +905,7 @@ class Kernel:
                 parts = max(
                     (
                         (
-                            spread_partitions(use.cols)
+                            spread_partitions(use.cols, alignment[next(iter(use.rows))])
                             if use in spread_ops
                             else use.parts
                         )
@@ -906,10 +930,15 @@ class Kernel:
         (``OpUse.flat``) whose rows no other op touches, TensorE never reads
         and none lies on one partition -- an op that cannot holds its rows
         against the flat ops sharing them, until none is left out."""
-        spread = [use for use in self.op_uses if use.flat]
+        spread = [
+            use for use in self.op_uses
+            if use.flat and spread_partitions(
+                use.cols, math.lcm(*(self.row_alignment.get(n, 1) for n in use.rows))
+            ) > 1
+        ]
         while True:
             held = set(self.one_partition) | {
-                name for name, uses in self.uses.items() if "gemm" in uses
+                name for name, uses in self.uses.items() if "gemm" in uses or "scan" in uses
             }
             for use in self.op_uses:
                 if use not in spread:
@@ -1038,9 +1067,13 @@ class Kernel:
         if hbm.box.name not in names:
             names.append(hbm.box.name)
         self._use(sbuf.box, "load" if load else "store")
+        sizes = tuple(kw["sizes"]) or (1,)
+        if len(sizes) > 1 and math.prod(sizes[:-1]) > 1 and sizes[-1] < hbm.shape[-1]:
+            self.row_alignment[sbuf.box.name] = math.lcm(
+                self.row_alignment.get(sbuf.box.name, 1), sizes[-1]
+            )
         if self.analyze:
             return
-        sizes = tuple(kw["sizes"]) or (1,)
         steps = kw.get("strides") or sizes
         dims = kw.get("dims")
         offsets = [0] * len(sizes)
@@ -1271,6 +1304,14 @@ class Kernel:
         # The op's prims, whose scratch regions ``temp`` reads.
         self.prims = prims
         anchor = prims[0]
+        if anchor.target in ('trainium_ops::prefix_sum','trainium_ops::scaled_exp'):
+            self._scan_primitive(anchor, self._view(op.outputs[0].destination))
+            return
+        if anchor.target == "trainium_ops::selective_scan":
+            if len(prims) != 1:
+                raise NotImplementedError("selective_scan must be a native whole-kernel invocation")
+            self._selective_scan(anchor, self._view(op.outputs[0].destination))
+            return
         if prims[-1].target == QUANTIZE_MX:
             # Its results are the scales, then the codes.
             dst = tuple(self._view(o.destination) for o in op.outputs[:2])
@@ -1554,6 +1595,7 @@ class Kernel:
         partitions (``Layout.spread``) on all of them, or, reading a tile
         from PSUM in whole 128-row blocks, every block at once -- PSUM holds
         a tile's blocks side by side within a bank."""
+        chunk_free = self._kwargs(prims[0]).get('nki_chunk_free', CHUNK_FREE)
         shape = self._result_shape(prims[0], {})
         rows, cols = _rows_cols(shape)
         # A scratch region (``temp``), named ``<group>.<kind>_<cols>``, is
@@ -1569,7 +1611,7 @@ class Kernel:
         )
         if layout is not None and layout.spread:
             # Partition ``p`` holds the tile's elements ``p * cols ..``.
-            for lo, hi in _runs(layout.cols, CHUNK_FREE):
+            for lo, hi in _runs(layout.cols, chunk_free):
                 linear = np.arange(layout.parts)[:, None] * layout.cols
                 linear = linear + np.arange(lo, hi)[None, :]
                 coords = np.stack(np.unravel_index(linear, shape))
@@ -1587,7 +1629,7 @@ class Kernel:
             self._chain(prims, {}, dst, Chunk(None, None, shape, coords))
             return
         for a, b in _runs(rows, PARTITIONS):
-            for lo, hi in _runs(cols, CHUNK_FREE):
+            for lo, hi in _runs(cols, chunk_free):
                 linear = np.arange(a, b)[:, None] * cols
                 linear = linear + np.arange(lo, hi)[None, :]
                 coords = np.stack(np.unravel_index(linear, shape))
@@ -1818,6 +1860,8 @@ class Kernel:
         # Beside exponentials on ScalarE (``scalar_exps``), a
         # ``tensor_scalar`` runs on VectorE.
         engine = ", engine=nisa.vector_engine" if self.scalar_exps else ""
+        if self._kwargs(prim).get('nki_scalar_literals', 0):
+            engine = ", engine=nisa.scalar_engine"
         aps = fit(
             [(out.free, out.offsets())] + [(f, o) for _, f, o in tiles],
             source.coords.shape[1],
@@ -1854,7 +1898,8 @@ class Kernel:
             else:
                 raise NotImplementedError(f"{prim.name}: no tile operand")
         elif target == "aten::div" and kinds[0] == "tile":
-            inverse = self._reciprocal(args[1], kinds[1], source)
+            inverse = self._reciprocal(args[1], kinds[1], source,
+                activation=self._kwargs(prim).get('nki_activation_reciprocal', 0))
             if kinds[1] == "tile":
                 self.emit(
                     f"nisa.tensor_tensor(dst={dst}, data1={args[0]}, "
@@ -1903,6 +1948,11 @@ class Kernel:
                 f"nisa.tensor_scalar(dst={dst}, data={args[0]}, "
                 f"op0=nl.maximum, operand0=0.0{engine})"
             )
+        elif target == "aten::reciprocal":
+            if self._kwargs(prim).get('nki_activation_reciprocal', 0):
+                self.emit(f"nisa.activation(dst={dst}, op=nl.reciprocal, data={args[0]})")
+            else:
+                self.emit(f"nisa.reciprocal(dst={dst}, data={args[0]})")
         elif target in ACTIVATIONS:
             self.emit(
                 f"nisa.activation(dst={dst}, op={ACTIVATIONS[target]}, "
@@ -1922,7 +1972,7 @@ class Kernel:
         self.emit(f"nisa.nc_transpose(dst={result}, data={data})")
         return result
 
-    def _reciprocal(self, value, kind, source):
+    def _reciprocal(self, value, kind, source, activation=False):
         """``1 / value`` as an operand: a literal for a scalar, else computed
         into a scratch tile of the same kind (there is no ALU divide)."""
         if kind == "scalar":
@@ -1934,7 +1984,10 @@ class Kernel:
         else:
             temp = self.temp("t", w)
             inverse = f"{temp}[0:{r}, 0:{w}]"
-        self.emit(f"nisa.reciprocal(dst={inverse}, data={value})")
+        if activation:
+            self.emit(f"nisa.activation(dst={inverse}, op=nl.reciprocal, data={value})")
+        else:
+            self.emit(f"nisa.reciprocal(dst={inverse}, data={value})")
         return inverse
 
     def _sine(self, dst, angle, shift, chunk):
@@ -2035,6 +2088,11 @@ class Kernel:
     def _rows_ap(self, view, start, r, lo, hi):
         """``view``'s rows ``start .. start + r``, columns ``lo .. hi``; a
         replicated view on ``r`` partitions."""
+        # Layouts are fixed for this emission pass. Repeated steps resolve
+        # the same on-chip windows; cache their access syntax, not decisions.
+        key = ("rows_ap", view.key(), view.dims, start, r, lo, hi)
+        if key in self.memo:
+            return self.memo[key]
         cols = view.shape[-1]
         if self.layouts[view.box.name].replicated:
             rows = np.zeros((r, 1), dtype=int)
@@ -2045,7 +2103,9 @@ class Kernel:
         aps = fit([(self.free(view.box), flat)], r)
         if aps is None:
             raise NotImplementedError("rows no pattern walks")
-        return _ap(self.var(view.box, view.slot), aps[0])
+        result = _ap(self.var(view.box, view.slot), aps[0])
+        self.memo[key] = result
+        return result
 
     def _rowwise(self, prims, dst):
         """A row-wise op (a layer norm, an RMS norm, a softmax) and the ops
@@ -2161,7 +2221,6 @@ class Kernel:
         cols = prim.kwargs["input"].tensor_box.output_shape[-1]
         if list(kw["normalized_shape"]) != [cols]:
             raise NotImplementedError("an RMS norm over more than one dim")
-        weight = self._view(prim.kwargs["weight"].tensor_box)
         pieces = _runs(cols, STATS_FREE)
         stats = self.temp("st", 6 * len(pieces))
         for q, (lo, hi) in enumerate(pieces):
@@ -2186,6 +2245,13 @@ class Kernel:
             f"operand0={float(kw['eps'])!r})"
         )
         self.emit(f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})")
+        if kw.get("weight") is None:
+            self.emit(
+                f"nisa.tensor_scalar(dst={out}, data={rows(0, cols)}, "
+                f"op0=nl.multiply, operand0={rstd}, engine=nisa.vector_engine)"
+            )
+            return
+        weight = self._view(prim.kwargs["weight"].tensor_box)
         self.emit(
             f"nisa.scalar_tensor_tensor(dst={out}, "
             f"data={rows(0, cols)}, op0=nl.multiply, "
@@ -2205,17 +2271,17 @@ class Kernel:
         if list(kw["normalized_shape"]) != [parts * free]:
             raise NotImplementedError("an RMS norm over more than one dim")
         linear = np.arange(parts * free).reshape(parts, free)
-        x, weight = (
-            self._view(prim.kwargs[key].tensor_box)
-            for key in ("input", "weight")
-        )
+        x = self._view(prim.kwargs["input"].tensor_box)
+        weight = (self._view(prim.kwargs["weight"].tensor_box)
+                  if kw.get("weight") is not None else None)
         rows = []
-        for view in (x, weight, dst):
+        for view in (x, dst, *([weight] if weight is not None else [])):
             aps = fit([(self.free(view.box), self.flat(view, linear))], parts)
             if aps is None:
                 raise NotImplementedError(f"{view.box.name}: a spread row")
             rows.append(_ap(self.var(view.box, view.slot), aps[0]))
-        data, scale, out = rows
+        data, out = rows[:2]
+        scale = rows[2] if weight is not None else None
         ones = self.temp("one", PARTITIONS)
         if ("ones", ones) not in self.memo:
             self.memo["ones", ones] = True
@@ -2239,6 +2305,12 @@ class Kernel:
             f"operand1={float(kw['eps'])!r})"
         )
         self.emit(f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})")
+        if scale is None:
+            self.emit(
+                f"nisa.tensor_scalar(dst={out}, data={data}, op0=nl.multiply, "
+                f"operand0={rstd}, engine=nisa.vector_engine)"
+            )
+            return
         self.emit(
             f"nisa.scalar_tensor_tensor(dst={out}, data={data}, "
             f"op0=nl.multiply, operand0={rstd}, op1=nl.multiply, "
@@ -2374,6 +2446,49 @@ class Kernel:
             f"op0=nl.multiply, operand0={total}[0:{r}, 0:1], "
             f"engine=nisa.vector_engine)"
         )
+
+    def _scan_primitive(self, prim, dst):
+        views={k:self._view(a.tensor_box) for k,a in prim.kwargs.items()
+               if a.WhichOneof('arg_type')=='tensor_box'}
+        for view in (dst,*views.values()):
+            self._use(view.box,'scan')
+        if self.analyze:
+            return
+        rows,cols=_rows_cols(dst.shape)
+        for start in range(0,rows,PARTITIONS):
+            count=min(PARTITIONS,rows-start)
+            out=self._rows_ap(dst,start,count,0,cols)
+            data=self._rows_ap(views['data'],start,count,0,cols)
+            if prim.target=='trainium_ops::scaled_exp':
+                scale=self._rows_ap(views['scale'],start,count,0,1)
+                self.emit(f'nisa.activation(dst={out}, op=nl.exp, data={data}, scale={scale})')
+            else:
+                initial=views.get('initial')
+                carry='' if initial is None else ', imm1='+self._rows_ap(initial,start,count,0,1)
+                mode='reset_reduce' if initial is None else 'load_reduce'
+                self.emit(f'nisa.tensor_scalar_cumulative(dst={out}, src={data}, op0=nl.add, imm0=0.0, op1=nl.add{carry}, reduce_cmd=nisa.reduce_cmd.{mode})')
+
+    def _selective_scan(self, prim, dst):
+        from .scan import body
+
+        inputs = [self._view(prim.kwargs[name].tensor_box) for name in ("delta", "u", "a", "b", "c")]
+        if dst.box.level != DRAM or not dst.covers_box() or any(
+            x.box.level != DRAM or not x.covers_box() for x in inputs
+        ):
+            raise NotImplementedError("selective_scan requires whole HBM tensors")
+        if self.analyze:
+            for view in inputs:
+                if view.box.name not in self.reads:
+                    self.reads.append(view.box.name)
+            if dst.box.name not in self.writes:
+                self.writes.append(dst.box.name)
+            self.stored[dst.box.name] = np.ones(math.prod(dst.box.shape), dtype=bool)
+            return
+        self.lines.extend(body(
+            [self.var(x.box) for x in inputs], self.var(dst.box), inputs[0].shape,
+            inputs[2].shape[1], self._kwargs(prim)["sequence_tile"],
+            algorithm=self._kwargs(prim).get("scan_algorithm", "direct"),
+        ))
 
     def _reduce(self, prims, dst):
         """A max or sum over a stored tile's last dim into ``dst``, kept as
@@ -2744,9 +2859,16 @@ class Kernel:
 
     def source(self, name):
         """The kernel as an ``@nki.jit`` function ``name``."""
-        args = ", ".join(f"in{i}" for i in range(len(self.reads)))
+        args = [f"in{i}" for i in range(len(self.reads))]
+        args += [
+            f"out{i}" for i, box in enumerate(self.writes)
+            if box in self.destinations
+        ]
+        args = ", ".join(args)
         lines = ["@nki.jit", f"def {name}({args}):"]
         for i, box_name in enumerate(self.writes):
+            if box_name in self.destinations:
+                continue
             box = self.boxes[box_name]
             if box_name in self.mx:
                 mx = self.mx[box_name]
@@ -2832,20 +2954,50 @@ def _hbm_allocation(op):
     )
 
 
+def _onchip_references(message):
+    """On-chip boxes named by a frozen operation, including nested regions."""
+    if message.DESCRIPTOR.full_name.endswith("TensorBox"):
+        return {message.node} if message.memory.level in ON_CHIP else set()
+    found = set()
+    for field, value in message.ListFields():
+        if field.message_type is None:
+            continue
+        if field.is_repeated:
+            values = value.values() if field.message_type.GetOptions().map_entry else value
+            for child in values:
+                if hasattr(child, "ListFields"):
+                    found.update(_onchip_references(child))
+        else:
+            found.update(_onchip_references(value))
+    return found
+
+
 def segments(model):
     """The top-level ops as ``("kernel", ops)``, ``("host", op)`` and
     ``("alloc", op)`` (an HBM allocation), in order.  A kernel starts at an
-    on-chip allocation made after the one before it has done work; a host
-    op or an HBM allocation runs before a kernel that has not."""
+    on-chip allocation made after earlier work, unless a frozen on-chip value
+    is still live across that boundary. Pure HBM allocations can precede the
+    whole fused kernel; host computation cannot cross a live on-chip value.
+    This preserves bufferized residency without inventing scheduling decisions.
+    """
     items, current, worked, host_scalars = [], [], False, set()
-    for op in model.ops:
+    references = [_onchip_references(op) for op in model.ops]
+    remaining = Counter(name for names in references for name in names)
+    resident = set()
+    for op, names in zip(model.ops, references):
+        # A live resident value cannot cross an independently dispatched kernel.
+        crosses = bool(resident & remaining.keys())
+        remaining.subtract(names)
+        remaining += Counter()
         kind = op.WhichOneof("op_type")
         target = op.prim.target if kind == "prim" else None
         host = _is_host(op, host_scalars)
         if host or _hbm_allocation(op):
-            if worked:
+            if crosses and host:
+                raise NotImplementedError("host operation crosses live on-chip storage")
+            if worked and not crosses:
                 items.append(("kernel", current))
-                current, worked = [], False
+                current, worked, resident = [], False, set()
             items.append(("host" if host else "alloc", op))
             if host:
                 host_scalars.update(
@@ -2854,10 +3006,11 @@ def segments(model):
                     if o.WhichOneof("result_type") == "scalar"
                 )
             continue
-        if target in ALLOCATIONS and worked:
+        if target in ALLOCATIONS and worked and not crosses:
             items.append(("kernel", current))
-            current, worked = [], False
+            current, worked, resident = [], False, set()
         current.append(op)
+        resident.update(names)
         if (
             kind != "prim"
             or op.prim.op != "cpu"
@@ -2965,12 +3118,37 @@ def _aten_call(name, kwargs):
         arguments = getattr(packet, overload)._schema.arguments
         names = {a.name for a in arguments}
         required = {a.name for a in arguments if not a.has_default_value()}
-        if set(given) <= names and required <= set(given):
+        if (
+            set(given) <= names and required <= set(given)
+            and all(
+                _host_type_matches(given[a.name], a.type)
+                for a in arguments if a.name in given
+            )
+        ):
             args = ", ".join(f"{k}={_host_value(v)}" for k, v in given.items())
             if device is not None and "device" in names:
                 args += ", device=device"
             return f"torch.ops.aten.{name}.{overload}({args})"
     raise NotImplementedError(f"aten::{name} on {sorted(given)}")
+
+
+def _host_type_matches(argument, expected):
+    """Discriminate schema overloads whose argument names are identical.
+
+    In particular repeat_interleave's Tensor and integer repeats must not
+    select each other's overload. Optional and list types retain that test.
+    Other scalar/device/dtype conversions are handled by the host renderer.
+    """
+    kind = argument.WhichOneof("arg_type")
+    if expected.kind() == "OptionalType":
+        if kind == "str_value" and argument.str_value == "None":
+            return True
+        return _host_type_matches(argument, expected.getElementType())
+    if expected.kind() == "TensorType":
+        return kind == "tensor_box"
+    if expected.kind() == "ListType":
+        return kind in ("tensor_box_list", "scalar_list")
+    return kind not in ("tensor_box", "tensor_box_list", "scalar_list")
 
 
 def host_statement(op):
@@ -3079,7 +3257,11 @@ def run(
         cache) are stored back into ``params``.
     """
     t = dict(inputs, **params)
-    device = next(iter(params.values())).device
+    values = params.values() if params else inputs.values()
+    device = next(
+        (value.device for value in values if isinstance(value, torch.Tensor)),
+        torch.device("cpu"),
+    )
 '''
 
 # A decoder layer's index in the name of a box it writes.
@@ -3161,7 +3343,7 @@ def translate(model, out_dir, config, immediates):
                 # An MX array goes as stored, already packed.
                 casts = [
                     "" if b in mx else _kernel_cast(kernel.boxes[b].dtype)
-                    for b in kernel.reads
+                    for b in kernel.reads + kernel.destinations
                 ]
                 # Each result the kernel writes only part of -> the runs
                 # ``[start, stop)`` of row-major positions it writes.
@@ -3176,7 +3358,9 @@ def translate(model, out_dir, config, immediates):
                     casts,
                     [
                         [names.index(b) for b in boxes]
-                        for boxes in (kernel.reads, kernel.writes)
+                        for boxes in (
+                            kernel.reads + kernel.destinations, kernel.writes
+                        )
                     ],
                     partial,
                 )
@@ -3184,6 +3368,7 @@ def translate(model, out_dir, config, immediates):
             reads, writes = ([names[i] for i in group] for group in indices)
             step = {"kernel": name, "inputs": reads, "outputs": writes}
             step["partial"] = {writes[i]: runs for i, runs in partial.items()}
+            step["destinations"] = [writes[i] for i in partial]
             step["ops"] = [item[0].name, item[-1].name]
             args = ", ".join(f"t[{b!r}]{c}" for b, c in zip(reads, casts))
             outs = ", ".join(f"t[{b!r}]" for b in writes)
@@ -3192,9 +3377,12 @@ def translate(model, out_dir, config, immediates):
         lines.append(line)
     # An HBM box no kernel writes is allocated by the program, in place.
     by_kernel = {b for s in steps if s["kernel"] for b in s["outputs"]}
+    destinations = {
+        b for s in steps if s["kernel"] for b in s["destinations"]
+    }
     for index, op in reversed(allocations):
         reads, writes, line = host_allocation(op)
-        if writes[0] in by_kernel:
+        if writes[0] in by_kernel and writes[0] not in destinations:
             continue
         step = {"kernel": None, "inputs": reads, "outputs": writes}
         step["ops"] = [op.name, op.name]
@@ -3413,7 +3601,10 @@ def record(gm, args, manifest, path, steps=True):
     scalars = set(manifest["scalars"])
     before = {}
     for step in manifest["steps"]:
-        before.setdefault(step["ops"][0], []).extend(step["inputs"])
+        before.setdefault(step["ops"][0], []).extend(
+            name for name in step["inputs"]
+            if name not in step.get("destinations", ())
+        )
     nodes = {n.name: n for n in gm.graph.nodes}
     values = {}
 

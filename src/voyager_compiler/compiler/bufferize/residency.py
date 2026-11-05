@@ -209,3 +209,55 @@ def refine_residency(program, config, *, layout=None):
             continue
         program.validation["resident_merges"] = merged
         return
+
+
+def compose_resident_stages(stages, inputs, *, output_shape=None):
+    """Join already-bufferized stages through explicit on-chip results.
+
+    Each stage is ``(graph, bindings)``. A binding is an external input index or
+    ``(earlier_stage, result_index)``. Internal bindings must resolve to SRAM
+    allocations, possibly through pure views. Builders establish tile coverage
+    and completion; this helper preserves their operations and storage identity.
+    Allocation and cost validation still belong to the candidate's caller.
+    """
+    from voyager_compiler.codegen.subgraph import replace_node_with_graph_module
+    from voyager_compiler.compiler.allocate import _buffer_identity
+    from voyager_compiler.shape_prop import set_node_value
+    from voyager_compiler.extensions import CandidateRejected
+
+    graph = Graph()
+    external = [graph.placeholder(f'input_{i}') for i in range(len(inputs))]
+    for node, value in zip(external, inputs):
+        set_node_value(node, value)
+    output = graph.output(())
+    module = GraphModule(torch.nn.Module(), graph)
+    results = []
+    for stage, bindings in stages:
+        args = []
+        for binding in bindings:
+            if isinstance(binding, int):
+                args.append(external[binding])
+            else:
+                index, port = binding
+                if not 0 <= index < len(results):
+                    raise CandidateRejected('resident stage dependency is not earlier')
+                value = results[index][port]
+                identity = _buffer_identity(module).get(value, value)
+                if (identity.target != torch.ops.voyager.alloc.default
+                        or identity.args[2:3] != (int(MemoryLevel.SRAM),)):
+                    raise CandidateRejected('resident stage boundary is not an SRAM allocation')
+                args.append(value)
+        with graph.inserting_before(output):
+            call = graph.call_function(torch.ops.aten.alias.default, tuple(args))
+        result = replace_node_with_graph_module(module, call, stage, propagate=False)
+        graph.erase_node(call)
+        results.append(result)
+    value = results[-1][0]
+    if output_shape is not None:
+        with graph.inserting_before(output):
+            value = graph.call_function(torch.ops.aten.reshape.default, (value, output_shape))
+    output.args = ((value,),)
+    graph.lint()
+    module.recompile()
+    ShapeProp(module, recurse=True).propagate(*inputs)
+    return module

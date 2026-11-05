@@ -500,14 +500,15 @@ def gemm_step_busy(
     tail_copies,
     store_issue=0.0,
     distance,
+    copy_busy=None,
 ):
     """Each engine's busy time on one GEMM step, ``[rows, depth] x [depth,
     cols]``.
 
     TensorE transposes each 128 x 128 block of an activation stored
     ``[rows, depth]`` -- and of a weight stored ``[cols, depth]`` -- and
-    multiplies the activation into PSUM one moving slice at a time; VectorE
-    copies the transposed blocks out of PSUM, an activation's half a bank
+    multiplies the activation into PSUM one moving slice at a time; copies
+    read the transposed blocks out of PSUM, an activation's half a bank
     of them at a time (``half_bank_blocks``, a short last block alone) and
     a weight's one at a time, and evicts the finished slices.  Given a
     ``distance``, the matmuls contract two 128-deep chunks that many apart
@@ -549,6 +550,9 @@ def gemm_step_busy(
             stores (``TrainiumModel.store_issue_ns``).
         distance: Chunks apart the step's matmuls pair them, ``None`` for
             none (``pairing``).
+        copy_busy: Optional accumulator of eligible automatic-copy service
+            times on VectorE and ScalarE. If supplied, the caller balances
+            them after adding its remaining work; otherwise this step does.
     """
     config = model.config
     act_bits, weight_bits, _ = bits
@@ -556,6 +560,22 @@ def gemm_step_busy(
     widths = extents(cols, config.moving_free_max)
     tensor_cycles = 0.0
     busy = Counter()
+    copies = Counter() if copy_busy is None else copy_busy
+    # Verified on Trn2 with one row group per pipeline step. Multiple row
+    # groups reuse row-operation scratch and can expose dependencies that a
+    # pooled service model misses. Keep their prior conservative pricing;
+    # this guard describes model coverage, not ScalarE instruction legality.
+    balance_copies = config.target == 'trn2' and rows <= config.partitions
+
+    def copy(width, element_bits, share=1.0, eligible=True):
+        # Scope the approximation to the same-type FP32 copies emitted by
+        # the floating GEMM path. Half-width copies/casts keep prior pricing.
+        if balance_copies and element_bits == 32 and eligible:
+            for engine in ('vector', 'scalar'):
+                copies[engine] += share * model.engine_ns(engine, width, 32)
+        else:
+            busy['vector'] += share * model.engine_ns('vector', width, element_bits)
+
     doubles = 0
     if mx:
         rate = 1.0
@@ -586,19 +606,16 @@ def gemm_step_busy(
         else:
             extent_cycles = extent
         tensor_cycles += depth_chunks * (extent_cycles + overhead)
-        copies = extents(whole, per_copy) + [1] * (short > 0)
-        busy["vector"] += sum(
-            model.engine_ns("vector", n * extent, element_bits) for n in copies
-        )
+        for n in extents(whole, per_copy) + [1] * (short > 0):
+            copy(n * extent, element_bits)
     evictions = 1 / num_k if tail_copies else 0
     for _ in extents(rows, config.pe_array_size[1]):
         tensor_cycles += singles * sum(w / rate + overhead for w in widths)
         tensor_cycles += doubles * sum(
             2 * w / config.fp8_matmul_speedup + overhead for w in widths
         )
-        busy["vector"] += evictions * sum(
-            model.engine_ns("vector", w, 32) for w in widths
-        )
+        for w in widths:
+            copy(w, 32, evictions, eligible=bits[2] == 32)
     busy["tensor"] = tensor_cycles / config.frequency
     tail = [(e, 1.0, 32) for e in tail_engines]
     tail_busy = model.passes_busy(tail, rows, cols)
@@ -609,7 +626,7 @@ def gemm_step_busy(
     prologue = [(e, 1.0, act_bits) for e in prologue_engines]
     busy.update(model.passes_busy(prologue, rows, depth))
     busy["scalar"] += store_issue
-    return busy
+    return model.balance_copy_busy(busy, copies) if copy_busy is None else busy
 
 
 @dataclass(frozen=True)
@@ -930,6 +947,7 @@ class TrainiumGemm(OpModel):
         buffers = gemm_buffers(config, self.operands, scratch, tile, staging)
         if buffers is None:
             return None
+        buffers = self.representation_buffers(mapping, buffers)
         if mx_in:
             act = model.mx_sbuf(depth, rows, False)
             act += model.mx_sbuf(depth, rows, True)
@@ -963,6 +981,10 @@ class TrainiumGemm(OpModel):
         if act + out + weight + placed > config.usable_scratchpad_size:
             return None
         return TrainiumPlacement(buffers=buffers, scratch=scratch)
+
+    def representation_buffers(self, mapping, buffers):
+        """Additional operand representations, accounted by the same fit check."""
+        return buffers
 
     def cost(self, mapping, placement):
         """The whole GEMM in TensorE cycles -- its L3 sweep, each step's
@@ -1162,6 +1184,8 @@ class TrainiumGemv(TrainiumGrid):
         shapes = self.operand_shapes(tiling)
         mx = self._mx_tiles(shapes)
         grid, moves = gemv_transfers(self.node, shapes, tiling.grid)
+        if getattr(self, "resident_input", False):
+            moves = [m for m in moves if m[0] is not self.node.args[0]]
         steps = math.prod(grid)
         stores = sum(c for n, _, c in moves if n is self.node)
         busy = gemm_step_busy(
@@ -1176,6 +1200,7 @@ class TrainiumGemv(TrainiumGrid):
             tiling.grid[1],
             self.multiplies_mx,
             tail_copies=not self.tail_engines,
+            act_k_major=getattr(self, "resident_input", False),
             # TensorE transposes the activation ``[depth, 128]`` at a time.
             distance=(
                 None
@@ -1755,6 +1780,7 @@ class GemmSteps:
         ``first`` step, adding to it after -- and on the ``last`` step the
         evictions and the tail's whole-tile op."""
         plan = self.plan
+        self._prepare_step(tiles, boxes, step)
         weight = plan.weight(tiles)
         activation = None if self.transposes else plan.activation(tiles)
         operands = [tiles[i] for i in plan.fused_idx]
@@ -1764,10 +1790,7 @@ class GemmSteps:
                 activation = self._transposed(tiles, boxes, step, c)
             for t, (j, w) in enumerate(self.columns):
                 psum = self._psum(boxes, step, c, t)
-                product = self._product(
-                    tiles, boxes, activation, weight, chunk, j, w, first
-                )
-                voyager.insert(product if first else product + psum, psum)
+                self._accumulate(tiles, boxes, activation, weight, chunk, j, w, first, psum)
                 if evict:
                     self._evict(operands, outs, boxes, psum, c, t)
             if evict and self.row_op is not None:
@@ -1783,6 +1806,14 @@ class GemmSteps:
             transpose_through(
                 boxes[STAGED], outs[0], boxes[STAGED_TRANSPOSES], step
             )
+
+    def _prepare_step(self, tiles, boxes, step):
+        """Prepare a specialized operand representation before shared row traversal."""
+
+    def _accumulate(self, tiles, boxes, activation, weight, chunk, j, w, first, psum):
+        """Accumulate this slice; shared traversal owns its prologue and epilogue."""
+        product = self._product(tiles, boxes, activation, weight, chunk, j, w, first)
+        voyager.insert(product if first else product + psum, psum)
 
     def _psum(self, boxes, step, c, t):
         """The PSUM tile slice ``t`` of row chunk ``c`` writes: its bank of a

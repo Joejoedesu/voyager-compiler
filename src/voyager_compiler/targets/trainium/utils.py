@@ -18,6 +18,7 @@ from voyager_compiler.codegen.node_info import (
     RMS_NORM_OPS,
     SOFTMAX_OPS,
     get_anchor_node,
+    get_arg_value,
     is_compute_op,
     is_nop,
 )
@@ -80,6 +81,7 @@ SCALAR_OPS = frozenset(
         torch.ops.aten.gelu.default,
         torch.ops.aten.tanh.default,
         torch.ops.aten.sqrt.default,
+        torch.ops.aten.square.default,
         torch.ops.aten.rsqrt.default,
     )
 )
@@ -108,6 +110,38 @@ def sbuf_bytes(rows, cols, bits, partitions):
     spread over the partitions, each partition holding a whole row block."""
     row_bytes = math.ceil(cols * bits / 8)
     return partitions * math.ceil(rows / partitions) * row_bytes
+
+
+def contiguous_span(shape, strides):
+    """Elements in a contiguous suffix of a logical HBM tile.
+
+    Singleton axes do not interrupt a run. Use the source tensor's strides,
+    not the dense tile's: spreading a gapped rectangle over SBUF partitions
+    does not remove its gaps in HBM.
+    """
+    run = 1
+    for extent, stride in zip(reversed(shape), reversed(strides)):
+        if extent == 1:
+            continue
+        if stride != run:
+            break
+        run *= extent
+    return run
+
+
+def spread_row_segments(shape, strides, parts):
+    """Contiguous runs after splitting a dense logical tile over partitions.
+
+    Count the union of HBM run boundaries and SBUF partition boundaries.
+    This counts transfer geometry, not Walrus instructions or DMA packets.
+    """
+    size = math.prod(shape)
+    assert size % parts == 0
+    cols = size // parts
+    span = contiguous_span(shape, strides)
+    runs = size // span
+    coincident = size // math.lcm(cols, span) - 1
+    return parts + runs - 1 - coincident
 
 
 # The PSUM tiles a GEMM's matmul results rotate through, and those a
@@ -323,10 +357,13 @@ F32, BF16 = torch.float32, torch.bfloat16
 SCALAR_COLUMNS = ("sc", 1, F32, 2, SRAM)
 
 
-def spread_partitions(cols):
+def spread_partitions(cols, alignment=1):
     """The partitions a flat row of ``cols`` elements is cut across: the
-    most, up to 128, that cut it evenly (``translate.Layout.spread``)."""
-    return max(p for p in range(1, PARTITIONS + 1) if cols % p == 0)
+    most, up to 128, that cut it evenly (``translate.Layout.spread``).
+    A strided HBM rectangle requires each partition's chunk to contain
+    whole contiguous rows of ``alignment`` elements."""
+    return max(p for p in range(1, PARTITIONS + 1)
+               if cols % p == 0 and (cols // p) % alignment == 0)
 
 
 def scratch_name(kind, cols):
@@ -370,14 +407,21 @@ def chain_ops(ops):
     another op of ``ops`` computes is a ``"value"``, one of a single
     element a ``"scalar"`` the kernel reads from DRAM, one value per row of
     a wider result a ``"column"`` (``"column32"`` stored in float32), any
-    other a ``"tile"``.  A view, a relayout or a cast computes nothing."""
+    other a ``"tile"``. Numeric constants are ``"literal"`` operands and
+    need no on-chip buffer. A view, a relayout or a cast computes nothing."""
     chain = []
     for op in ops:
         if is_nop(op) or op.target in CHAIN_RELAYOUTS or not is_compute_op(op):
             continue
         kinds = []
-        for arg in op.args:
+        arguments = [
+            get_arg_value(op, i, argument.name)
+            for i, argument in enumerate(op.target._schema.arguments)
+        ]
+        for arg in arguments:
             if not isinstance(arg, torch.fx.Node):
+                if isinstance(arg, (int, float, bool)):
+                    kinds.append("literal")
                 continue
             if arg in ops:
                 kinds.append("value")
@@ -420,7 +464,7 @@ def chain_tiles(chain, width):
             # The reciprocal of the divisor or scale.
             if kinds[1] in ("tile", "value"):
                 tiles.add(("t", width, F32, 2, SRAM))
-            else:
+            elif kinds[1] != "literal":
                 tiles.add(SCALAR_COLUMNS)
         if target is QUANTIZE:
             tiles.add(("qt", width, BF16, 2, SRAM))

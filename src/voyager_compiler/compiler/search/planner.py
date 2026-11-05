@@ -11,6 +11,8 @@ from voyager_compiler.compiler.search.tiler import Tiler
 from voyager_compiler.extensions import CandidateRejected
 from voyager_compiler.ir.plan import ImplementationChoice
 
+DEFAULT_CANDIDATE_BUDGET = 64
+
 
 def candidate_key(implementation, parameters):
     from voyager_compiler.artifacts import content_digest
@@ -49,8 +51,29 @@ def _candidate_nodes(node, anchor):
 
 
 def select_implementation(
-    node, anchor, context, implementations, *, budget=64, excluded=()
+    node, anchor, context, implementations, *,
+    budget=DEFAULT_CANDIDATE_BUDGET, excluded=()
 ):
+    return _select_matched_implementation(
+        node,
+        anchor,
+        context,
+        (i for i in implementations if i.matches(node, anchor)),
+        budget=budget,
+        excluded=excluded,
+    )
+
+
+def _select_matched_implementation(
+    node, anchor, context, implementations, *,
+    budget=DEFAULT_CANDIDATE_BUDGET, excluded=()
+):
+    """Select among already matched recipes, without evaluating matches twice.
+
+    Bufferization needs the matching set before its template-cache lookup.
+    The ordinary selection entry point supplies a lazy filtered iterable, so
+    its candidate metadata isolation and matching order remain unchanged.
+    """
     candidates = []
     rejected = []
     candidate_nodes = _candidate_nodes(node, anchor)
@@ -63,8 +86,6 @@ def select_implementation(
 
     count = 0
     for implementation in implementations:
-        if not implementation.matches(node, anchor):
-            continue
         for parameters in implementation.candidates(node, context):
             count += 1
             if count > budget:

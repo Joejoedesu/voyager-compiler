@@ -918,7 +918,9 @@ def bufferize_graph(
         builders: The rules that pick each compute node's builder, tried in
           order; a node none matches is bufferized whole.
     """
-    from voyager_compiler.compiler.search.planner import select_implementation
+    from voyager_compiler.compiler.search.planner import (
+        _select_matched_implementation,
+    )
     from voyager_compiler.ir.plan import ImplementationChoice
 
     graph = model.graph
@@ -961,15 +963,25 @@ def bufferize_graph(
 
         anchor = get_anchor_node(node)
 
+        matched = (
+            tuple(i for i in implementations if i.matches(node, anchor))
+            if implementations is not None
+            else None
+        )
         key = _bufferize_key(node)
         if excluded_choices:
             key = None
         # Arbitrary candidate hooks may depend on facts beyond shape/layout.
-        # Only the fixed compatibility recipes opt into template sharing.
-        if implementations is not None and any(
-            not getattr(i, "cache_by_shape", False) for i in implementations
-        ):
-            key = None
+        # Only matching recipes can affect this node's build. An unrelated
+        # uncacheable recipe must not disable reuse across identical layers.
+        if matched is not None:
+            if any(not i.cache_by_shape for i in matched):
+                key = None
+            elif key is not None:
+                # Matching may depend on scope even when each matched build
+                # is shape-cacheable. Keep distinct candidate sets separate.
+                # TargetSpec validates that recipe names are unique.
+                key = (key, tuple(i.name for i in matched))
         cached = build_cache.get(key) if key is not None else None
         logger.debug(
             "[bufferize] %s anchor=%s %s",
@@ -995,11 +1007,16 @@ def bufferize_graph(
                 )
                 sub_gm = rule.build(node, ctx) if rule is not None else None
             else:
-                sub_gm, choice, alternatives, rejected = select_implementation(
+                (
+                    sub_gm,
+                    choice,
+                    alternatives,
+                    rejected,
+                ) = _select_matched_implementation(
                     node,
                     anchor,
                     ctx,
-                    implementations,
+                    matched,
                     excluded=(excluded_choices or {}).get(scope, ()),
                 )
 
@@ -1039,6 +1056,9 @@ def bufferize_graph(
                     rejected,
                 )
 
+        # Preserve the selected decision on the original node for consumers
+        # that retain it for reporting, including when no builder ran here.
+        node.meta["implementation"] = choice
         if compilation_plan is not None:
             compilation_plan.select(scope, choice, alternatives, rejected)
 

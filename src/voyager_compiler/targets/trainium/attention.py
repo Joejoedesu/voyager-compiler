@@ -316,6 +316,8 @@ class TrainiumAttention(OpModel):
             + sbuf_bytes(*self._out_tile(tq), out_bits, p)
             + sbuf_placed_bytes(config, buffers, scratch)
         )
+        if getattr(self, "resident_output", False):
+            needed += sbuf_bytes(d, self.node.value.shape[1], out_bits, p)
         if self.mask_bits:
             slots = 1 if self._mask_once(tiling.grid) else 2
             needed += slots * sbuf_bytes(tq, tkv, self.mask_bits, p)
@@ -433,10 +435,16 @@ class TrainiumAttention(OpModel):
             for r in rows
         )
         # The output stores' issue, on ScalarE's queue.
-        step["scalar"] += model.store_issue_ns(sweeps, steps)
+        step["scalar"] += (0 if getattr(self, "resident_output", False)
+                           else model.store_issue_ns(sweeps, steps))
         rescale = step + passes(("vector",) * 2, d)
         boundary = step + passes(("vector",) * 2, d)
         if self.transposed_output:
+            boundary["tensor"] += head_blocks * tensor_ns(rows)
+            boundary["vector"] += head_blocks * copies_ns(
+                "vector", len(rows), min(tq, p), out_dtype, len(rows)
+            )
+        if getattr(self, "resident_output", False):
             boundary["tensor"] += head_blocks * tensor_ns(rows)
             boundary["vector"] += head_blocks * copies_ns(
                 "vector", len(rows), min(tq, p), out_dtype, len(rows)
@@ -464,6 +472,8 @@ class TrainiumAttention(OpModel):
             (model.dma_ns(*tile, bits, load=i > 0), n)
             for i, (tile, bits, n) in enumerate(moves)
         ]
+        if getattr(self, "resident_output", False):
+            moves, dmas = moves[1:], dmas[1:]
         latency = model.sweep_ns(dmas, steps, interior)
         latency += sweeps * (boundary_ns - interior)
         traffic = sum(
@@ -738,9 +748,11 @@ class TrainiumFlashAttention(_FA3Pipeline):
                 bank_max = get_slot(b.bank_max, slot)
             for i, (j, w) in enumerate(self.banks):
                 bank = self._bank(b.scores, slot, block, i)
-                scaled = (_block(bank, (0, 0), (self.rows, w)) * self.scale).to(
-                    scores.dtype
-                )
+                scaled = _block(bank, (0, 0), (self.rows, w)) * self.scale
+                # A redundant cast hides the shared score/reduction result
+                # from instruction fusion. Retain actual dtype conversions.
+                if scaled.dtype != scores.dtype:
+                    scaled = scaled.to(scores.dtype)
                 largest = torch.amax(scaled, dim=-1, keepdim=True)
                 voyager.insert(
                     scaled,

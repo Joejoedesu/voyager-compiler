@@ -76,11 +76,20 @@ def implementations():
 def encode(encoded, program, config):
     """Carry the frozen choice into the NKI projection; no late selection."""
     modes = {}
+    scans = {}
+    chunks = {}
     for module in program.graph.modules():
         if not isinstance(module, torch.fx.GraphModule):
             continue
         for node in module.graph.nodes:
             invocation = node.meta.get("target_invoke")
+            if invocation is not None and invocation.opcode.startswith("elementwise_chunk."):
+                fields = invocation.opcode.split('.')
+                chunks[node.name] = tuple(int(fields[i]) if len(fields) > i else 0
+                                          for i in (1, 2, 3))
+            if invocation is not None and invocation.opcode.startswith("selective_scan."):
+                fields = invocation.opcode.split(".")
+                scans[node.name] = (int(fields[1]), fields[2] if len(fields) > 2 else "direct")
             if invocation is None or not invocation.opcode.startswith(
                 "nc_matmul."
             ):
@@ -91,6 +100,16 @@ def encode(encoded, program, config):
             modes[node.name] = mode
 
     def walk(message):
+        if message.DESCRIPTOR.full_name == "voyager.PrimOp" and message.name in chunks:
+            width, scalar, reciprocal = chunks[message.name]
+            message.kwargs["nki_chunk_free"].scalar.int_value = width
+            message.kwargs["nki_scalar_literals"].scalar.int_value = scalar
+            message.kwargs["nki_activation_reciprocal"].scalar.int_value = reciprocal
+        if message.DESCRIPTOR.full_name == "voyager.PrimOp" and message.name in scans:
+            width, algorithm = scans[message.name]
+            message.kwargs["sequence_tile"].scalar.int_value = width
+            if algorithm != "direct":
+                message.kwargs["scan_algorithm"].str_value = algorithm
         if (
             message.DESCRIPTOR.full_name == "voyager.PrimOp"
             and message.name in modes

@@ -3,7 +3,7 @@
 import torch
 
 from voyager_compiler import OpMatcher
-from voyager_compiler.codegen.node_info import is_fully_connected
+from voyager_compiler.codegen.node_info import get_arg_value, is_fully_connected, swaps_last_two_dims
 
 
 def _can_fuse(node):
@@ -23,6 +23,20 @@ def _is_constant_div(node):
         return divisor.value.numel() == 1
 
     return True
+
+
+def _has_rms_prologue(node):
+    if not _can_fuse(node):
+        return False
+    activation = node.args[0]
+    if swaps_last_two_dims(activation):
+        activation = activation.args[0]
+    return activation.target == torch.ops.aten.rms_norm.default
+
+
+def _last_dim_softmax(node):
+    dim = get_arg_value(node, 1, 'dim')
+    return dim in (-1, node.value.ndim - 1)
 
 
 MXU_OPS = [
@@ -68,7 +82,17 @@ FUSION_PATTERNS = [
 ]
 
 
+RMS_PROLOGUE_PATTERN = [
+        OpMatcher("add"),
+        OpMatcher("rms_norm"),
+        OpMatcher("permute", "transpose", predicate=swaps_last_two_dims),
+        OpMatcher(*MXU_OPS, predicate=_has_rms_prologue),
+]
+
 FUSION_PATTERNS += [
+    RMS_PROLOGUE_PATTERN,
+    [OpMatcher(*MXU_OPS, predicate=_can_fuse),
+     OpMatcher("softmax", predicate=_last_dim_softmax)],
     [OpMatcher("add"), OpMatcher("rms_norm")],
     [
         OpMatcher("add"),

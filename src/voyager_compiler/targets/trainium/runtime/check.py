@@ -179,7 +179,12 @@ def check_calls(directory, kernels, manifest, tensors, only, distinct):
             continue
         seen.add(call["kernel"])
         dtypes = manifest["dtypes"]
-        args = [to_kernel(tensors[b], dtypes.get(b)) for b in call["inputs"]]
+        args = [
+            to_kernel(tensors[b], dtypes.get(b)).clone()
+            if b in call.get("destinations", ())
+            else to_kernel(tensors[b], dtypes.get(b))
+            for b in call["inputs"]
+        ]
         got = dict(
             zip(call["outputs"], simulate(kernels, call["kernel"], args))
         )

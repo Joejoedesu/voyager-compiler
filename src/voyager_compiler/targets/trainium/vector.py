@@ -266,6 +266,8 @@ class TrainiumVector(TrainiumGrid):
             for n in node.all_input_nodes
             if self.flat and require_allocation(n)
         ]
+        value = node.value[-1] if isinstance(node.value, (tuple, list)) else node.value
+        self.output_shape = tuple(value.shape)
 
     def row_parts(self, out_tile):
         """``(parts, spread)`` for an output tile ``out_tile``: the
@@ -280,7 +282,11 @@ class TrainiumVector(TrainiumGrid):
         element."""
         rows, cols = rows_cols(out_tile)
         size = rows * cols
-        parts = spread_partitions(size)
+        # Cutting a gapped HBM rectangle mid-row makes the per-partition
+        # DMA starts non-affine. Keep complete rows on each partition.
+        shapes = [getattr(self, "output_shape", out_tile), *self.inputs]
+        alignment = cols if rows > 1 and any(s[-1] > cols for s in shapes if s) else 1
+        parts = spread_partitions(size, alignment)
         flat = self.flat and all(
             math.prod(min(d, t) for d, t in zip(s[::-1], out_tile[::-1]))
             in (1, size)
