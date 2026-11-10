@@ -13,6 +13,9 @@ the requested implementation needs them; an old gap is not a standing task.
 
 The [extension catalog](extensions.md) maps public bindings to signatures,
 consumers and decision owners. Roles are concerns; they are not extra callbacks.
+Here, extension means compiler support. For tasks that also own hardware design,
+use [hardware–compiler co-design and DSE](adoption/hardware-codesign.md) to choose
+and implement hardware changes, and these roles to bind each candidate.
 
 ## Focused role readers
 

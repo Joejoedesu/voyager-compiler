@@ -1,17 +1,22 @@
 # Target and workload adoption
 
-Two procedures cover adoption work. Start at the relevant step; neither procedure
-is a mandatory campaign for every change.
+Choose the procedure matching the requested ownership. The task defines the
+deliverable and completion criteria; these guides describe how to implement it.
+Start at the relevant step rather than running every procedure for a small change.
 
 | Procedure | Use when | Ordered path |
 | --- | --- | --- |
-| [Target registration and extension](adoption/registration.md) | A binding or capability is missing or changing | Inspect current capabilities → identify the gap → pair alternatives → bind hooks → check affected behavior |
+| [Target registration and compiler support](adoption/registration.md) | Compiler support for an identified hardware/ISA candidate is missing or changing | Inspect current capabilities → identify the gap → pair alternatives → bind hooks → check affected behavior |
 | [Workload × target binding and refinement](adoption/workload-binding.md) | A concrete pair needs coverage or better mapping | Reuse preparation → inspect real signatures → address gaps → connect regions → validate and refine |
+| [Hardware–compiler co-design and DSE](adoption/hardware-codesign.md) | The task includes hardware configuration choices or new hardware implementation | Diagnose workload needs → compare hardware and mapping alternatives → implement hardware and compiler support → validate connected execution → select a complete design |
 
 For a new target/workload pair, the high-level route is **target registration →
 workload × target binding → coverage and performance refinement**. Binding can
 reveal a missing target capability and return to registration; registration does
 not require completing every possible operation before trying a workload.
+For co-design, registration and workload binding are steps inside the hardware
+design loop. Missing required support returns to implementation or architectural
+revision; completing either compiler procedure does not complete the whole task.
 
 These are dependency-aware guides: reuse completed work, skip inapplicable steps,
 and iterate when a later check identifies an earlier problem. A small emitter fix
@@ -19,6 +24,7 @@ can start with the [emission role](roles/emission.md); it does not need a new
 registration campaign. The [compilation guide](compilation.md#guide-scope-and-implementation-objectives)
 owns correctness, coverage and utilization objectives. Coverage can grow while
 performance improves on already mapped regions; 100% coverage is not a tuning gate.
+This permits incremental development, without relaxing final coverage requirements.
 
 ## Start from current state
 
@@ -59,7 +65,8 @@ for a continuing task; it is not a support ledger or evidence of completion.
 | Mapping decisions survive submission | Target-specific review/checks of the converter and runtime or traces for the decisions in question; exact output alone does not prove reuse or overlap |
 | Performance improves | Fixed semantic/mapped work and timing scope, with estimates distinguished from applicable endpoint measurements |
 
-Compiler-only registration can finish its requested scope without device access.
+Compiler-only validation is sufficient only when the user requested a
+compiler-only deliverable.
 Claiming execution requires execution evidence. Exact numerical correctness,
 decision ownership and measured performance are independent properties. None
 implies the others. Exact arithmetic and execution-control work belong to the
@@ -75,6 +82,10 @@ Exact behavior means exact target behavior at the declared boundary, including
 code/bit comparison where relevant. Existing pinned contracts remain unchanged.
 
 ## Freeze the execution endpoint when relevant
+
+Freeze the identity of each candidate used for validation. During authorized
+co-design, hardware and compiler may evolve together between candidates; this
+rule does not freeze the architecture for the whole exploration.
 
 The endpoint is where emitted work
 enters the target stack and results can be observed. For an endpoint-dependent

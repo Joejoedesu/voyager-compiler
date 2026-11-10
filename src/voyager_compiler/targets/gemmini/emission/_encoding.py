@@ -58,16 +58,29 @@ def ex(a_stride=1):
 
 
 def loop_mm(
-    m, n, k, a, b, d, c, sa, sb, sc, *, accumulate=False, full_output=False
+    m,
+    n,
+    k,
+    a,
+    b,
+    d,
+    c,
+    sa,
+    sb,
+    sc,
+    *,
+    accumulate=False,
+    full_output=False,
+    dim=16,
 ):
     """LOOP_WS configuration and launch, matching the pinned gemmini.h."""
-    i, j, z = ((v + 15) // 16 for v in (m, n, k))
+    i, j, z = ((v + dim - 1) // dim for v in (m, n, k))
     if min(i, j, z) < 1 or max(i, j, z) >= 65536:
         raise ValueError("Hardware matrix loop bounds out of range")
     return [
         command(
             9,
-            ((z * 16 - k) << 32) | ((j * 16 - n) << 16) | (i * 16 - m),
+            ((z * dim - k) << 32) | ((j * dim - n) << 16) | (i * dim - m),
             (z << 32) | (j << 16) | i,
         ),
         command(10, a, b),

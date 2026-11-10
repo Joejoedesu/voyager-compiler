@@ -26,14 +26,18 @@ def write_replay(result, directory, commands_path):
             )
         return value.detach().cpu().contiguous().numpy().tobytes()
 
+    emitted = json.loads(Path(commands_path).read_text())
+    aperture = emitted.get("hardware_parameters", {}).get(
+        "dram_bytes", APERTURE
+    )
     images = collect_replay_images(
-        result, encode, alignment=16, capacity=APERTURE
+        result, encode, alignment=16, capacity=aperture
     )
     initial, expected = images.initial, images.expected
     size = len(initial)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
-    command_stream = json.loads(Path(commands_path).read_text())["commands"]
+    command_stream = emitted["commands"]
     records = [
         dict(type="defaults", status=STATUS),
         *command_stream,
@@ -49,7 +53,7 @@ def write_replay(result, directory, commands_path):
             dict(
                 version=1,
                 base=hex(BASE),
-                size=APERTURE,
+                size=aperture,
                 alignment=16,
                 regions=[
                     dict(

@@ -22,6 +22,7 @@ target's bindings. Start with these source owners; follow imports as needed:
 | Problem | Next action |
 | --- | --- |
 | Starting with no target implementation | Use registration’s fresh-target route and authoritative specs. Establish one complete compilation-to-endpoint path, then broaden real workload coverage and compare legal alternatives. |
+| Task includes hardware implementation or DSE | Follow [hardware–compiler co-design](../adoption/hardware-codesign.md). Integrate required hardware, ISA and compiler changes; a finished component or registration step returns to the enclosing task until its deliverables pass. |
 | Several roles touch one execution assumption | Provide one case, contract and artifact boundary; integrate model, builder and emitter changes together. Delegate only when authorized and separable. |
 | Asked for comparable implementation quality or performance | Separate coverage, numerical correctness, endpoint behavior, model ranking and measured speed. Use fixed workload/configuration boundaries; report what remains unverified. |
 
@@ -43,6 +44,8 @@ target's bindings. Start with these source owners; follow imports as needed:
 ## Handoff and validation
 
 Return supported work and gaps, actual host/emission/endpoint evidence, estimates versus measurements, changed source and reproducible artifacts. State each claim at its validated scope; no stage-completion label is required.
+The requested deliverable determines final acceptance. Honest progress reporting
+does not make missing required implementation optional or authorize reducing scope.
 
 Use the task-local [adoption work record](../adoption/harness.md) across resumptions.
 A pending check names its tested artifact; a passing check does not close an

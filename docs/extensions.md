@@ -1,5 +1,11 @@
 # Extension points and decision ownership
 
+Here, **extension** means extending the compiler's support through its public
+bindings. This catalog explains where to implement support for a hardware
+capability; it does not prescribe which hardware capabilities to design. For
+choosing and implementing hardware changes together with their compiler support,
+follow [hardware–compiler co-design and DSE](adoption/hardware-codesign.md).
+
 Use this catalog to answer **where a change enters the compiler**. The
 [role readers](roles.md) describe who owns the work; the
 [compilation reference](compilation.md) describes stage invariants. A Python file

@@ -2,6 +2,11 @@
 
 Use for: A new target/endpoint, capability or hardware configuration.
 
+This role describes and binds an identified hardware candidate. For deciding
+which hardware to build or change, follow
+[hardware–compiler co-design and DSE](../adoption/hardware-codesign.md), then
+apply this role to the candidate's compiler support.
+
 ## Binding and ownership
 
 `TargetSpec.name / TargetSpec.hardware`. Registry assembly and physical configuration. Follow the separately listed hooks for target behavior.
@@ -36,11 +41,17 @@ target's bindings. Start with these source owners; follow imports as needed:
    [discovery contract](../compilation.md#extension-policy-and-minimal-examples).
    Reuse shared operators/builders before introducing target arithmetic.
 
-4. Freeze the endpoint and ownership of mapping decisions. Use the registration procedure for affected checks; registry presence and emission alone do not prove endpoint execution.
+4. Freeze each tested candidate's endpoint and ownership of mapping decisions.
+   Authorized hardware exploration may produce further candidates. Use the
+   registration procedure for affected checks; registry presence and emission
+   alone do not prove endpoint execution.
 
 ## Do not
 
-- Resize physical memories or invent hardware facts to make a model fit; keep software policies separate.
+- Change a fixed device's declared resources to make a model fit. In authorized
+  hardware DSE, change the actual hardware/generator configuration and its
+  compiler description together, then validate the new candidate. Keep proposed
+  resources distinct from implemented resources and software policies.
 - Re-register an existing capability because an old checklist is incomplete, or introduce target-name branches in shared stages.
 
 ## Handoff and validation

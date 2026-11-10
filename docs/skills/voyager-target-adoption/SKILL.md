@@ -5,6 +5,17 @@ description: Bind an accelerator to Voyager's shared bufferized compiler or diag
 
 # Voyager target adoption
 
+## Determine task ownership
+
+The user's task defines the required deliverable and completion criteria.
+Compiler extension means supporting hardware capabilities through Voyager's
+bindings. If the task also includes hardware configuration DSE or new hardware
+implementation, use [hardware–compiler co-design](../../../docs/adoption/hardware-codesign.md)
+as the enclosing procedure. Missing required hardware, ISA, compiler or runtime
+support is implementation work: implement it or revise the hardware candidate,
+then continue mapping and validation. A partial registration or truthful report
+of gaps does not complete a full accelerator task.
+
 ## Locate the selected checkout
 
 Use the user-selected checkout and inspect current source and local instructions.
@@ -44,8 +55,9 @@ requirement. R/W/X labels and the separate X stage are retired; exact arithmetic
 and execution-control work belong to relevant roles when requested.
 
 State the requested workload/signature, numerical boundary, hardware, endpoint and
-performance claim. Target registration can be compiler-only; claiming execution
-requires endpoint evidence. Full compiler control and bit-exact arithmetic are
+performance claim. Compiler-only validation is sufficient only when the user
+requested a compiler-only deliverable. Claiming execution requires endpoint
+evidence. Full compiler control and bit-exact arithmetic are
 independent properties, not universal prerequisites for coverage or model fitting.
 
 ## Bind through the shared pipeline
@@ -76,7 +88,8 @@ selected tiling/ISA/addresses and must not reinvent them.
 ## Coverage, utilization and model agreement
 
 Grow correctly supported workload coverage and tune already mapped work as it
-grows. A coverage percentage is optional; if useful, fix its semantic-work
+grows; incremental progress does not relax the task's final coverage or execution
+requirements. A coverage percentage is optional; if useful, fix its semantic-work
 denominator and distinguish unsupported work from compile-time elimination.
 Introduced copies, fused call counts and padded activity do not increase coverage
 or useful utilization. Isolated kernel support does not establish connected-model

@@ -11,6 +11,7 @@ service. Current code and applicable evidence remain authoritative.
 | --- | --- | --- |
 | [Target registration](registration.md) | What execution can this hardware/API express through the shared compiler? | Inspect ISA/API alternatives, arithmetic, layouts, live resources and execution ownership. Pair each useful recipe with legality, model and builder. Check representative signatures and conversion/runtime assumptions. |
 | [Performant workload binding](workload-binding.md) | Which supported assignment executes this workload fastest within its accuracy and coverage constraints? | Compare numerical policies with their executable lowerings, input representations, algorithms and fusion. Investigate missing coverage and dominant costs, then refine tiles and ranking. Check connected outputs and complete execution cost. |
+| [Hardware–compiler co-design and DSE](hardware-codesign.md) | Which implemented hardware and mapping combination satisfies the task and best serves its objective? | Track candidate hardware/compiler identities, required support, connected validation and comparisons among feasible designs. |
 
 Binding can reveal a missing registration capability. Follow that dependency and
 return; these routes are not completion gates. Load the relevant role/contract
@@ -46,6 +47,26 @@ A check asks whether a particular compiled artifact matches its numerical
 reference. Passing that check does not resolve the optimization question.
 `check` validates record structure, not numerical truth or performance claims.
 
+## Required work and feasible designs
+
+The current tool accepts `registration` and `binding` routes. For a co-design
+task with workloads, use `binding` and describe the hardware-design scope in
+`objective` and `constraints`; no additional tool route is required.
+
+Keep required unfinished implementation distinct from optional optimization in
+the entry's `question` and `next` action. Pair each required capability with a
+pending acceptance check. A missing controller or workload lowering is required
+work when the task depends on it; recording it as an opportunity does not make
+it deferrable. Revise a candidate if necessary while preserving the task's scope.
+
+State in `best.claim` whether the artifact is a partial development prototype or
+a feasible design satisfying all hard task requirements, and name its hardware
+and compiler identities. A prototype may be retained as the best validated
+progress so far; it is not eligible as the final design until required support
+and validation are complete. Final selection also requires the task's DSE
+evidence. These are record conventions using existing fields, not additional
+checks enforced by `tools/adoption.py`.
+
 ## Use it to choose the next experiment
 
 On resume, inspect current source and the record, reconcile running jobs, and
@@ -63,5 +84,6 @@ Keep excluded initial host preparation visible and charge internal movement.
 Freeze the source/artifact snapshot used by a running check. A separate candidate
 can continue developing; attach its checks to its own identity. Promote `best`
 explicitly after reviewing evidence, and retain unresolved opportunities through
-handoffs. At completion, summarize results and remaining questions in the task
+intermediate handoffs. Continue required implementation and validation after
+such a handoff. At completion, summarize results and optional remaining questions in the task
 report; do not turn this record into a permanent target-support tracker.

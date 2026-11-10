@@ -19,6 +19,13 @@ Start with the [documentation router](../../../docs/README.md), then the
 If no target exists, begin with authoritative ISA/API/configuration and the
 fresh-target route; a donor model or target guide is not a prerequisite.
 
+Extension points describe where compiler support belongs. If the task includes
+hardware configuration search or implementing hardware features, follow
+[hardware–compiler co-design and DSE](../../../docs/adoption/hardware-codesign.md)
+as the enclosing workflow. Hardware and compiler may evolve together between
+validated candidates. Required missing capabilities remain implementation work;
+registration and component checks are milestones within the requested deliverable.
+
 For model/search creation, start with the
 [creation instructions](../../../docs/compilation/performance-models.md#create-and-register-the-model)
 and the [performance role](../../../docs/roles/performance.md).

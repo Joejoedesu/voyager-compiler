@@ -66,6 +66,10 @@ large abstract model hierarchy in advance.
    behavior: data movement, accumulator lifetime, buffering, padding, scratch and
    overlap. Do not require complete operation coverage before providing a useful
    analytical model.
+   This allows modeling during development; it does not waive required final
+   coverage. If addressing the gap requires authorized hardware changes, use
+   [hardware–compiler co-design](../adoption/hardware-codesign.md) and pair each
+   candidate model with its implementation and validation.
 2. **Choose the search representation.** `RuntimeModel.prepare(node)` returns an
    `OpModel` with a compatible `MatrixSpace` or `GridSpace`; attention uses
    `prepare_attention`. A recipe can instead supply its own candidates and

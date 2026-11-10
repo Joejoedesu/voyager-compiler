@@ -1,4 +1,11 @@
-# Target registration and extension
+# Target registration and compiler support
+
+Registration introduces a target binding; extension here adds or changes compiler
+support for its capabilities. This procedure takes an identified hardware/ISA
+candidate as its contract. It does not decide which new hardware to build.
+For hardware configuration search or feature implementation, use
+[hardware–compiler co-design and DSE](hardware-codesign.md) as the enclosing
+procedure and return here for each candidate's compiler support.
 
 Start with [current source and applicable evidence](../adoption.md#start-from-current-state).
 When the target is absent, use the fresh-target route below; there is no target
@@ -38,9 +45,13 @@ need to be registered again. Load only the [roles](../roles.md) needed for it.
    and compare host results under the declared contract. Submit and compare at
    the endpoint when claiming endpoint execution; a stock native example alone
    does not validate the Voyager path.
-6. **Return the scoped result.** Link bindings, changes, restrictions and evidence.
+6. **Validate the requested scope.** Link bindings, changes, restrictions and evidence.
    Distinguish compiler checks from endpoint execution and report unavailable
-   evidence honestly. Compiler-only work may finish without device access.
+   evidence honestly. Compiler-only validation is sufficient only when the user
+   requested a compiler-only deliverable.
+   If this registration is part of a larger workload or hardware-design task,
+   return to that task's implementation and validation loop until its required
+   deliverables are complete.
 
 Use the [adoption work record](harness.md) when registration spans experiments: keep
 missing capabilities and competing execution forms as opportunities, and record

@@ -117,6 +117,7 @@ def worker(args):
         from voyager_compiler.targets.gemmini.emission.replay import (
             write_replay,
         )
+        from voyager_compiler.targets.gemmini.hardware import hardware
         from voyager_compiler.targets.gemmini.target import TARGET
 
         target = TARGET
@@ -149,6 +150,7 @@ def worker(args):
             WorkloadSpec(args.case, lambda _: model, lambda m, o: (inputs, {})),
             target,
             out / "compiler",
+            config=hardware(dim=args.dim),
             dump_tensors=False,
         )
         outputs, evidence = run(
@@ -186,6 +188,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--donor", type=Path)
+    parser.add_argument("--dim", type=int, choices=(16, 32), default=16)
     parser.add_argument("--worker", choices=("current", "donor"))
     parser.add_argument(
         "--case",
@@ -210,6 +213,8 @@ def main():
         ],
     )
     args = parser.parse_args()
+    if args.donor and args.dim != 16:
+        parser.error("The legacy frontend comparator is pinned to DIM16")
     if args.worker:
         return worker(args)
     import numpy as np
@@ -245,6 +250,8 @@ def main():
                         mode,
                         "--case",
                         case,
+                        "--dim",
+                        str(args.dim),
                     ],
                     env=env,
                     stdout=log,
@@ -268,6 +275,7 @@ def main():
             json.dumps(
                 dict(
                     passed=len(results) == len(args.cases),
+                    dim=args.dim,
                     expected_cases=args.cases,
                     cases=results,
                     scope="Host/reference and selected-plan checks; RTL results recorded separately",

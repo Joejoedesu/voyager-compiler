@@ -31,7 +31,10 @@ gemmini/
 ├── hardware.py        physical configuration
 ├── semantics.py       operations, accepted forms and pure facts
 ├── quantization.py    shared quantizer/domain policy
-├── scheduling.py      candidate/capacity/cost callbacks
+├── scheduling.py      Interstellar adapter and candidate/capacity/cost callbacks
+├── performance.py     native matrix/convolution and pooling service estimates
+├── native_service.py  finite in-flight convolution execution floor
+├── traffic.py         physical read packets, logical tails and multiplicities
 ├── lowering.py        custom operations, buffer builders and storage refinement
 └── emission/
     ├── __init__.py    registered encode and emit hooks
@@ -50,6 +53,38 @@ adapter and call shared `search_matrix`; pointwise recipes use direct estimates.
 No separate `legalize`, `runtime` or `characterize` hook is registered.
 The replay helper prepares artifacts and does not pretend to execute hardware.
 Shared normalization, final allocation, freezing and bundling remain shared.
+
+## Hardware family and DSE parameters
+
+`hardware()` retains the Lean16 default: 16×16 INT8 matrix array, INT32
+accumulation, 256 KiB scratchpad, 64 KiB accumulator, four/two respective
+banks, 16 bytes/cycle DMA service and a 16 MiB DRAM aperture. To compile a
+family member, pass a resolved configuration through the existing pipeline:
+
+```python
+from voyager_compiler.targets.gemmini.hardware import hardware
+
+config = hardware(dim=32, scratchpad_kib=512, accumulator_kib=64,
+                  dma_bytes_per_cycle=16, dram_bytes=32 << 20)
+result = compile_workload(workload, TARGET, "out/lean32",
+                          config=config, dump_tensors=False)
+```
+
+The keyword parameters also include `scratchpad_banks` and `accumulator_banks`.
+Array geometry determines SRAM/accumulator row widths, search unrolling,
+alignment, reservations, DMA block strides, loop bounds and explicit command
+addresses. Capacities determine tile feasibility; changing bank counts does
+not itself supply a calibrated bank-contention model. DMA service bandwidth
+is distinct from the fixed 16-byte packet beat and 64-byte maximum read size.
+The compiler does not rebuild RTL: use a matching hardware endpoint.
+
+Emission freezes these parameters into target IR. Independent saved-bundle
+emission and replay-manifest generation use the saved geometry/aperture.
+Legacy bundles without the additional parameters retain Lean16 behavior.
+The API permits square power-of-two dimensions from 4 to 256; donor timing
+evidence covers only DIM16/DIM32. Other dimensions need endpoint validation.
+This family preserves the existing ISA and numerical contract; it does not
+add accumulator execute reads, compute-to-scratchpad writes or SRAM fusion.
 
 ## Supported numerical contract
 
@@ -163,7 +198,7 @@ footprint calculation.
 ## Search and command ownership
 
 `scheduling.NativeMatrixModel` maps GEMM/conv to three Interstellar levels:
-16×16 array, private on-chip storage, DRAM (`fit_level=1`). Matrix recipes each
+configured square array, private on-chip storage, DRAM (`fit_level=1`). Matrix recipes each
 search factors through the shared engine; both spatial axes and all capacity-valid
 channel factors are available. The outer recipe budget does not truncate that
 search. Matmul compares explicit and hardware-loop ISA recipes; convolution uses
@@ -171,7 +206,7 @@ the hardware convolution loop. Pointwise recipes retain small direct candidates.
 
 The builder preserves `TileResult` in `ImplementationChoice.tile`; emission derives
 the native tile from that frozen mapping. Channel search extents and matmul rows are rounded to
-16 and projected to logical tails; interior matmul tiles fill 16-element blocks. `semantics.tile_storage` supplies the physical
+`DIM` and projected to logical tails; interior matmul tiles fill `DIM`-element blocks. `semantics.tile_storage` supplies the physical
 footprint to both search and emission, including hardware-loop padding and two
 private contexts. Named-memory resource capacities come from the shared helper.
 Outer order is fixed to the emitted batch → rows → columns → output channels →
@@ -202,9 +237,40 @@ and command-encoding checks. The pinned Lean RTL configuration disables full-wid
 accumulator readback, so these raw INT32 outputs are **not** covered by the INT8
 endpoint validation below.
 
-The cost model is a heuristic, not a fitted queue/overlap model. Cycle observations
-below are endpoint measurements, not proof that search selects the fastest tile.
-Performance work must inspect transfer placement, reuse and submission together.
+### Performance model and port provenance
+
+The native matrix/convolution predictor is adapted from
+`../voyager-gemmini-dse` (v6-E Docs+skill `bd8a9124…` followed by manual
+parameterization and predictor repairs). The port uses the current shared
+pipeline, Interstellar adapter and target operations; it does not replace
+those with the donor compiler.
+
+- Dense convolution prices padded input patches, weight/bias reloads, output
+  stores and launch service. A finite-in-flight execution floor models
+  row-local convolution traversal, rather than assuming ideal flattened GEMM
+  throughput on every short row. Five matrix IDs are a pinned hardware fact;
+  eight cycles of controller slack are inherited Lean16 calibration.
+- LoopWS matmul separates physical read packets and the pinned full-DIM B
+  reduction tail from padded SRAM reservations and logical output writes.
+  Search assumes aligned operand bases; `traffic.row_bytes` can audit finalized
+  addresses. A narrow broadcast-bias steady-state fit remains DIM16-only.
+- Max pooling uses the emitter's actual input strips/halos and output vector
+  counts with inherited store-unit service coefficients. Its one-row emitter
+  differs from the donor's rectangle tiler, so donor pooling timings are not
+  reused as measurements of this implementation.
+- Explicit matmul, depthwise convolution, residual DMA, requantization and
+  the accumulator-based global average retain separate analytical estimates.
+  In particular, this average is not the donor's GEMM-based average; importing
+  its GEMM timing would price a different implementation.
+
+There is no per-layer or per-configuration timing lookup table. Startup and
+service coefficients are empirical, so this is not an entirely unfitted model.
+The donor's recorded aggregate errors (+1.41% Lean16, +1.56% frozen Lean32)
+are historical evidence for that checkout's mappings/operations, **not a new
+accuracy result for this port**. Numerical policy and non-matrix command
+schedules differ. Local host/re-emission tests establish arithmetic and
+configuration propagation; fresh RTL timing is required to characterize this
+checkout's prediction error and selected-mapping performance.
 
 ## Compile and validate
 
@@ -249,8 +315,9 @@ host replay unless a runtime hook is supplied.
 The pinned endpoint has a 16 MiB whole-program aperture. ResNet18 is the
 model-level regression and fits that endpoint.
 The donor's per-operation staging/reset runtime is not part of this port.
-Hardware capacities/ISA assumptions are pinned by `hardware.py` and `semantics.py`;
-a different endpoint requires reviewing both, not silently changing constants.
+The default hardware remains pinned; other family members use explicit
+`hardware(...)` parameters and require a matching endpoint. ISA support and
+numerical constraints remain defined by `semantics.py`.
 
 Local checks (use the existing environment):
 

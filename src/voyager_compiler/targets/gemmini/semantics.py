@@ -276,8 +276,6 @@ def _validate(kind, p, operands):
             or max(p["h"], p["w"], p["oh"], p["ow"]) > 255
         ):
             raise ValueError("Unsupported Gemmini pooling geometry")
-        if p["h"] * k > 1024 or p["w"] * k > 1024:
-            raise ValueError("Pooling strip exceeds accumulator capacity")
         if (
             p["oh"] != (p["h"] + 2 * pad - k) // s + 1
             or p["ow"] != (p["w"] + 2 * pad - k) // s + 1
@@ -407,7 +405,7 @@ def facts(node):
     return name, p, tensors
 
 
-def raw_dimensions(node):
+def raw_dimensions(node, dim=16):
     if (
         node.op != "call_function"
         or node.target != torch.ops.aten._int_mm.default
@@ -421,45 +419,53 @@ def raw_dimensions(node):
     if (
         k != kb
         or any(t.value.dtype != torch.int8 for t in (a, b))
-        or n % 16
-        or k % 16
+        or n % dim
+        or k % dim
     ):
         raise CandidateRejected(
-            "Gemmini requires INT8 matrices with 16-aligned N and K"
+            f"Gemmini requires INT8 matrices with {dim}-aligned N and K"
         )
-    if m % 16 or max(m, n, k) >= 65536:
+    if m % dim or max(m, n, k) >= 65536:
         raise CandidateRejected(
-            "this native family requires 16-aligned M and 16-bit bounds"
+            f"this native family requires {dim}-aligned M and 16-bit bounds"
         )
     return m, n, k
 
 
-def tile_storage(kind, params, tile, mode):
+def tile_storage(kind, params, tile, mode, dim=16):
     """Physical scratchpad/accumulator bytes, shared by search and emission."""
 
     def blocks(value):
-        return (value + 15) // 16
+        return (value + dim - 1) // dim
 
     if kind == "matmul":
         m, n, k = tile
         if mode == "hardware_loop":
-            m, n, k = (blocks(v) * 16 for v in tile)
-        return 16 * (m * blocks(k) + k * blocks(n)), 64 * m * blocks(n)
+            m, n, k = (blocks(v) * dim for v in tile)
+        return dim * (m * blocks(k) + k * blocks(n)), 4 * dim * m * blocks(n)
     if kind == "depthwise_conv2d":
         r, c = tile
-        return tile_storage("conv2d", params, (r, c, 1, 1), mode)
+        kernel, stride = params["kernel"], params["stride"]
+        return (
+            dim
+            * (
+                (r * stride + kernel - 1) * (c * stride + kernel - 1)
+                + kernel * kernel
+            ),
+            4 * dim * r * c,
+        )
     if kind == "conv2d":
         r, c, o, i = tile
         kernel, stride = params["kernel"], params["stride"]
         return (
-            16
+            dim
             * (
                 (r * stride + kernel - 1)
                 * (c * stride + kernel - 1)
                 * blocks(i)
-                + kernel * kernel * i * blocks(o)
+                + kernel * kernel * blocks(i) * dim * blocks(o)
             ),
-            64 * r * c * blocks(o),
+            4 * dim * blocks(r * c) * dim * blocks(o),
         )
     raise ValueError(f"No matrix tile storage for {kind}")
 

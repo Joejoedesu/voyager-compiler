@@ -32,6 +32,10 @@ steps relevant to the requested gap; load the needed [roles](../roles.md).
    but slow mapping remains supported work with a performance gap. Mark untested
    ideas as unverified; support an infeasibility claim with a specific constraint
    or test. Use [target registration](registration.md) for missing capabilities.
+   Determine whether the gap is in compiler support or in the hardware itself.
+   When hardware changes are part of the task, follow
+   [hardware–compiler co-design](hardware-codesign.md) to implement or revise the
+   candidate, then return to mapping. Missing required support remains work.
 4. **Connect and check the affected regions.** Use the common pipeline. Check
    state, region boundaries and combined outputs; when splitting a logical op,
    validate the calls and reconstruction. Reuse existing end-to-end evidence
@@ -56,6 +60,8 @@ steps relevant to the requested gap; load the needed [roles](../roles.md).
 The steps iterate. Coverage is an adoption priority, not a 100% barrier before
 performance work. Exact arithmetic or explicit execution-control work uses the
 relevant role/contract when needed; it is not a separate adoption stage.
+This ordering permits incremental progress; it does not reduce the task's final
+workload coverage or execution requirements.
 
 ## Input preprocessing before quantization
 

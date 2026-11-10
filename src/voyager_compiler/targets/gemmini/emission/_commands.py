@@ -4,10 +4,8 @@ Operation expansions are adapted from the voyager-gemmini donor scheduler.
 Residual phase drains preserve its validated conservative load/add/store order.
 """
 
+from ..hardware import hardware
 from ..semantics import tile_storage
-
-SPAD_ROWS = 16384
-ACC_ROWS = 1024
 from ._encoding import ACC, command, ex, ld, loop_conv, loop_mm, st, tile
 
 
@@ -15,20 +13,25 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def matmul(p, addr):
+def matmul(p, addr, config=None):
+    config = config or hardware()
+    dim = config.pe_array_size[0]
     m, k, n = p["m"], p["k"], p["n"]
     tm, tn, tk = p["tile"]
-    sp, acc = tile_storage("matmul", p, p["tile"], "hardware_loop")
-    if sp > SPAD_ROWS * 16 // 2 or acc > ACC_ROWS * 64 // 2:
+    sp, acc = tile_storage("matmul", p, p["tile"], "hardware_loop", dim)
+    if (
+        sp > config.memory_instance("scratchpad").size.value // 2
+        or acc > config.memory_instance("accumulator").size.value // 2
+    ):
         raise ValueError("Matmul tile exceeds double-buffered Lean capacity")
     a, b, c = addr["a"], addr["b"], addr["y"]
     d = addr.get("bias", 0)
     out = [
         ex(),
         st(n, p.get("scale", 1), p.get("relu", False)),
-        ld(k),
-        ld(n, 1),
-        ld(0, 2),
+        ld(k, block_stride=dim),
+        ld(n, 1, block_stride=dim),
+        ld(0, 2, block_stride=dim),
     ]
     for r in range(0, m, tm):
         for s in range(0, n, tn):
@@ -45,11 +48,14 @@ def matmul(p, addr):
                     n,
                     n,
                     accumulate=bool(d or t),
+                    dim=dim,
                 )
     return out
 
 
-def conv(p, addr, *, depthwise=False):
+def conv(p, addr, *, depthwise=False, config=None):
+    config = config or hardware()
+    dim = config.pe_array_size[0]
     batch, h, w, ci, co, oh, ow, k = (
         p[x] for x in ("batch", "h", "w", "ci", "co", "oh", "ow", "kernel")
     )
@@ -60,8 +66,12 @@ def conv(p, addr, *, depthwise=False):
         p,
         p["tile"],
         "hardware_loop",
+        dim,
     )
-    if sp > SPAD_ROWS * 16 // 2 or acc > ACC_ROWS * 64 // 2:
+    if (
+        sp > config.memory_instance("scratchpad").size.value // 2
+        or acc > config.memory_instance("accumulator").size.value // 2
+    ):
         raise ValueError(
             "Convolution tile exceeds double-buffered Lean capacity"
         )
@@ -117,7 +127,9 @@ def conv(p, addr, *, depthwise=False):
     return out
 
 
-def pointwise(kind, p, addr):
+def pointwise(kind, p, addr, config=None):
+    config = config or hardware()
+    dim = config.pe_array_size[0]
     channels = p["channels"]
     out = [
         ex(),
@@ -125,12 +137,12 @@ def pointwise(kind, p, addr):
     ]
     if kind == "average":
         out += [
-            ld(channels, shrunk=True),
+            ld(channels, shrunk=True, block_stride=dim),
             st(channels, p.get("scale", 1) / p["pixels"]),
         ]
         for b in range(p.get("batch", 1)):
-            for c in range(0, channels, 16):
-                nc = min(16, channels - c)
+            for c in range(0, channels, dim):
+                nc = min(dim, channels - c)
                 for r in range(p["pixels"]):
                     out.append(
                         command(
@@ -143,9 +155,19 @@ def pointwise(kind, p, addr):
                     command(3, addr["y"] + b * channels + c, tile(ACC, 1, nc))
                 )
         return out
-    out += [ld(channels, shrunk=True, scale=p.get("a_scale", 1))]
+    out += [
+        ld(channels, shrunk=True, scale=p.get("a_scale", 1), block_stride=dim)
+    ]
     if kind == "add":
-        out += [ld(channels, index=1, shrunk=True, scale=p.get("b_scale", 1))]
+        out += [
+            ld(
+                channels,
+                index=1,
+                shrunk=True,
+                scale=p.get("b_scale", 1),
+                block_stride=dim,
+            )
+        ]
         # Retire each DMA phase before a read/modify/write or row reuse. Both
         # overlapped explicit loads and LoopMatmul residual mode dropped some
         # scaled B contributions on this pin; keep the tested conservative path.
@@ -173,10 +195,10 @@ def pointwise(kind, p, addr):
                     ("b", 1, ACC | (1 << 30)),
                     ("y", 3, ACC),
                 ):
-                    block = 16 if key == "y" else 64
+                    block = dim if key == "y" else 64
                     for cc in range(0, nc, block):
-                        for rr in range(0, nr, 16):
-                            local = flags + (cc // 16) * tm + rr
+                        for rr in range(0, nr, dim):
+                            local = flags + (cc // dim) * tm + rr
                             offset = (r + rr) * channels + c + cc
                             out.append(
                                 command(
@@ -184,23 +206,25 @@ def pointwise(kind, p, addr):
                                     addr[key] + offset,
                                     tile(
                                         local,
-                                        min(16, nr - rr),
+                                        min(dim, nr - rr),
                                         min(block, nc - cc),
                                     ),
                                 )
                             )
                     out.append(dict(type="drain"))
         return out
-    for r in range(0, p["rows"], 16):
-        for c in range(0, channels, 16):
-            nr, nc = min(16, p["rows"] - r), min(16, channels - c)
+    for r in range(0, p["rows"], dim):
+        for c in range(0, channels, dim):
+            nr, nc = min(dim, p["rows"] - r), min(dim, channels - c)
             offset = r * channels + c
             out.append(command(2, addr["x"] + offset, tile(ACC, nr, nc)))
             out.append(command(3, addr["y"] + offset, tile(ACC, nr, nc)))
     return out
 
 
-def maxpool(p, addr):
+def maxpool(p, addr, config=None):
+    config = config or hardware()
+    dim = config.pe_array_size[0]
     # Tile one output row, preserving the full input-row stride and true halo.
     h, w, ch, oh, ow, k, stride, pad = (
         p[x]
@@ -210,23 +234,23 @@ def maxpool(p, addr):
         raise NotImplementedError(
             "Gemmini maxpool pads with zero: padded pooling requires a proven nonnegative input (e.g. ReLU)"
         )
-    out = [ex(), ld(ch, shrunk=True)]
+    out = [ex(), ld(ch, shrunk=True, block_stride=dim)]
     for b in range(p.get("batch", 1)):
         for r in range(oh):
             start = r * stride - pad
             up, down = max(0, -start), max(0, start + k - h)
             rows = k - up - down
-            for c in range(0, ch, 16):
-                nc = min(16, ch - c)
+            for c in range(0, ch, dim):
+                nc = min(dim, ch - c)
                 for y in range(rows):
-                    for x in range(0, w, 16):
+                    for x in range(0, w, dim):
                         out.append(
                             command(
                                 2,
                                 addr["x"]
                                 + ((b * h + start + up + y) * w + x) * ch
                                 + c,
-                                tile(ACC + y * w + x, min(16, w - x), nc),
+                                tile(ACC + y * w + x, min(dim, w - x), nc),
                             )
                         )
                 out.append(
@@ -242,25 +266,35 @@ def maxpool(p, addr):
     return out
 
 
-def expand(kind, params, addresses):
+def expand(kind, params, addresses, config=None):
     if kind == "matmul":
-        return matmul(params, addresses)
+        return matmul(params, addresses, config)
     if kind in ("conv2d", "depthwise_conv2d"):
-        return conv(params, addresses, depthwise=kind == "depthwise_conv2d")
+        return conv(
+            params,
+            addresses,
+            depthwise=kind == "depthwise_conv2d",
+            config=config,
+        )
     if kind in ("add", "relu", "requantize", "average"):
-        return pointwise(kind, params, addresses)
+        return pointwise(kind, params, addresses, config)
     if kind == "maxpool":
-        return maxpool(params, addresses)
+        return maxpool(params, addresses, config)
     raise NotImplementedError(f"Unsupported Lean operation: {kind}")
 
 
-def explicit_matmul(p, addr):
+def explicit_matmul(p, addr, config=None):
+    config = config or hardware()
+    dim = config.pe_array_size[0]
     """Selected SRAM tile, INT32 accumulation, one scaled store after reduction."""
     m, n, k = (p[key] for key in ("m", "n", "k"))
     tm, tn, tk = p["tile"]
-    a_rows = tm * ceildiv(tk, 16)
-    sp, acc = tile_storage("matmul", p, p["tile"], "explicit")
-    if sp > SPAD_ROWS * 16 or acc > ACC_ROWS * 64:
+    a_rows = tm * ceildiv(tk, dim)
+    sp, acc = tile_storage("matmul", p, p["tile"], "explicit", dim)
+    if (
+        sp > config.memory_instance("scratchpad").size.value
+        or acc > config.memory_instance("accumulator").size.value
+    ):
         raise ValueError("Explicit matmul tile exceeds physical memory")
     commands = [
         ex(),
@@ -272,87 +306,87 @@ def explicit_matmul(p, addr):
     for row in range(0, m, tm):
         for col in range(0, n, tn):
             mr, nr = min(tm, m - row), min(tn, n - col)
-            for c in range(0, nr, 16):
-                for r in range(0, mr, 16):
+            for c in range(0, nr, dim):
+                for r in range(0, mr, dim):
                     commands.append(
                         command(
                             14,
                             addr["bias"] + (col + c) * 4,
                             tile(
-                                ACC + (c // 16) * tm + r,
-                                min(16, mr - r),
-                                min(16, nr - c),
+                                ACC + (c // dim) * tm + r,
+                                min(dim, mr - r),
+                                min(dim, nr - c),
                             ),
                         )
                     )
             for depth in range(0, k, tk):
                 kr = min(tk, k - depth)
-                for d in range(0, kr, 16):
-                    for r in range(0, mr, 16):
+                for d in range(0, kr, dim):
+                    for r in range(0, mr, dim):
                         commands.append(
                             command(
                                 2,
                                 addr["a"] + (row + r) * k + depth + d,
                                 tile(
-                                    (d // 16) * tm + r,
-                                    min(16, mr - r),
-                                    min(16, kr - d),
+                                    (d // dim) * tm + r,
+                                    min(dim, mr - r),
+                                    min(dim, kr - d),
                                 ),
                             )
                         )
-                for c in range(0, nr, 16):
-                    for d in range(0, kr, 16):
+                for c in range(0, nr, dim):
+                    for d in range(0, kr, dim):
                         commands.append(
                             command(
                                 1,
                                 addr["b"] + (depth + d) * n + col + c,
                                 tile(
-                                    a_rows + (c // 16) * tk + d,
-                                    min(16, kr - d),
-                                    min(16, nr - c),
+                                    a_rows + (c // dim) * tk + d,
+                                    min(dim, kr - d),
+                                    min(dim, nr - c),
                                 ),
                             )
                         )
-                for c in range(0, nr, 16):
-                    for r in range(0, mr, 16):
-                        dest = ACC | (1 << 30) | ((c // 16) * tm + r)
-                        for d in range(0, kr, 16):
+                for c in range(0, nr, dim):
+                    for r in range(0, mr, dim):
+                        dest = ACC | (1 << 30) | ((c // dim) * tm + r)
+                        for d in range(0, kr, dim):
                             commands.extend(
                                 [
                                     command(
                                         6,
                                         tile(
-                                            a_rows + (c // 16) * tk + d,
-                                            min(16, kr - d),
-                                            min(16, nr - c),
+                                            a_rows + (c // dim) * tk + d,
+                                            min(dim, kr - d),
+                                            min(dim, nr - c),
                                         ),
                                         tile(
                                             dest,
-                                            min(16, mr - r),
-                                            min(16, nr - c),
+                                            min(dim, mr - r),
+                                            min(dim, nr - c),
                                         ),
                                     ),
                                     command(
                                         4,
                                         tile(
-                                            (d // 16) * tm + r,
-                                            min(16, mr - r),
-                                            min(16, kr - d),
+                                            (d // dim) * tm + r,
+                                            min(dim, mr - r),
+                                            min(dim, kr - d),
                                         ),
-                                        tile(0xFFFFFFFF, 16, 16),
+                                        tile(0xFFFFFFFF, dim, dim),
                                     ),
                                 ]
                             )
-            for c in range(0, nr, 16):
-                for r in range(0, mr, 16):
+            for c in range(0, nr, dim):
+                for r in range(0, mr, dim):
                     commands.append(
                         command(
                             3,
                             addr["y"] + (row + r) * n + col + c,
                             tile(
-                                ACC + (c // 16) * tm + r,
-                                min(16, mr - r),
-                                min(16, nr - c),
+                                ACC + (c // dim) * tm + r,
+                                min(dim, mr - r),
+                                min(dim, nr - c),
                             ),
                         )
                     )

@@ -4,6 +4,7 @@ import json
 
 import torch
 
+from ..hardware import hardware, parameters
 from ._encoding import ACC, command, ex, ld, loop_mm, st, tile
 
 DRAM_BASE = 0x80000000
@@ -11,6 +12,7 @@ DRAM_BASE = 0x80000000
 
 def encode(encoded, program, config):
     program.assert_frozen()
+    dim = config.pe_array_size[0]
     commands, bodies = [], []
 
     def address(node):
@@ -66,19 +68,19 @@ def encode(encoded, program, config):
                     raise ValueError(
                         "Gemmini mvin requires an INT8 scratchpad operand"
                     )
-                for col in range(0, cols, 16):
-                    for row in range(0, rows, 16):
+                for col in range(0, cols, dim):
+                    for row in range(0, rows, dim):
                         commands += [
                             ld(cols, block_stride=rows),
                             command(
                                 2,
                                 address(source) + row * cols + col,
                                 tile(
-                                    address(dest) // 16
-                                    + (col // 16) * rows
+                                    address(dest) // dim
+                                    + (col // dim) * rows
                                     + row,
-                                    16,
-                                    16,
+                                    dim,
+                                    dim,
                                 ),
                             ),
                         ]
@@ -91,18 +93,22 @@ def encode(encoded, program, config):
                         "Gemmini full-width mvout requires an INT32 accumulator"
                     )
                 commands.append(st(cols * 4))
-                for col in range(0, cols, 16):
-                    for row in range(0, rows, 16):
+                for col in range(0, cols, dim):
+                    for row in range(0, rows, dim):
                         local = (
                             ACC
                             | (1 << 29)
-                            | (address(source) // 64 + (col // 16) * rows + row)
+                            | (
+                                address(source) // (4 * dim)
+                                + (col // dim) * rows
+                                + row
+                            )
                         )
                         commands.append(
                             command(
                                 3,
                                 address(dest) + (row * cols + col) * 4,
-                                tile(local, 16, 16),
+                                tile(local, dim, dim),
                             )
                         )
         invocation = node.meta.get("target_invoke")
@@ -186,7 +192,12 @@ def encode(encoded, program, config):
         )
         start = len(commands)
         if invocation.opcode == "loop_ws":
-            commands += [ex(), ld(k, 0), ld(n, 1), st(n * 4)]
+            commands += [
+                ex(),
+                ld(k, 0, block_stride=dim),
+                ld(n, 1, block_stride=dim),
+                st(n * 4),
+            ]
             commands += loop_mm(
                 m,
                 n,
@@ -199,23 +210,26 @@ def encode(encoded, program, config):
                 n,
                 n,
                 full_output=True,
+                dim=dim,
             )
         elif invocation.opcode == "ws_matmul":
             commands.append(ex())
-            for col in range(0, n, 16):
-                for row in range(0, m, 16):
-                    for depth in range(0, k, 16):
+            for col in range(0, n, dim):
+                for row in range(0, m, dim):
+                    for depth in range(0, k, dim):
                         out = ACC | (
-                            address(dest) // 64 + (col // 16) * m + row
+                            address(dest) // (4 * dim) + (col // dim) * m + row
                         )
                         if depth:
                             out |= 0x40000000
-                        ar = address(a) // 16 + (depth // 16) * m + row
-                        br = address(b) // 16 + (col // 16) * k + depth
+                        ar = address(a) // dim + (depth // dim) * m + row
+                        br = address(b) // dim + (col // dim) * k + depth
                         commands += [
-                            command(6, tile(br, 16, 16), tile(out, 16, 16)),
+                            command(6, tile(br, dim, dim), tile(out, dim, dim)),
                             command(
-                                4, tile(ar, 16, 16), tile(0xFFFFFFFF, 16, 16)
+                                4,
+                                tile(ar, dim, dim),
+                                tile(0xFFFFFFFF, dim, dim),
                             ),
                         ]
         else:
@@ -233,7 +247,10 @@ def encode(encoded, program, config):
     if not bodies:
         raise NotImplementedError("no supported Gemmini matrix invocation")
     encoded.target_data = dict(
-        schema_version=1, instructions=commands, bodies=bodies
+        schema_version=1,
+        hardware_parameters=parameters(config),
+        instructions=commands,
+        bodies=bodies,
     )
     return encoded
 
@@ -244,6 +261,7 @@ def emit(bundle, output):
     data = bundle.target_data
     if data["schema_version"] != 1:
         raise ValueError("unsupported Gemmini target IR")
+    config = hardware(**data.get("hardware_parameters", {}))
     commands, offsets = [], []
     for instruction in data["instructions"]:
         offsets.append(len(commands))
@@ -252,9 +270,9 @@ def emit(bundle, output):
                 instruction[key] for key in ("kind", "parameters", "addresses")
             )
             commands.extend(
-                explicit_matmul(params, addresses)
+                explicit_matmul(params, addresses, config)
                 if kind == "matmul" and instruction["mode"] == "explicit"
-                else expand(kind, params, addresses)
+                else expand(kind, params, addresses, config)
             )
         else:
             commands.append(instruction)
@@ -274,6 +292,7 @@ def emit(bundle, output):
             dict(
                 commands=commands,
                 bodies=bodies,
+                hardware_parameters=data.get("hardware_parameters", {}),
                 scope="Emitted RoCC stream; endpoint execution evidence is recorded separately",
             ),
             indent=2,

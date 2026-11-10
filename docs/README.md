@@ -14,6 +14,7 @@ human-readable tour, use the [compiler walkthrough](../../reports/voyager-compil
 | Reuse an existing compiler transformation | [Shared transformations](compilation/rewrites.md) | Focused feature reference, current pass and target binding |
 | Compare algorithms for one operation/region | [Algorithm comparison](compilation/algorithm-search.md) | Implementation recipes, component builders and whole-region costs |
 | Adopt a target or workload | [Adoption overview](adoption.md) | [Target registration](adoption/registration.md) or [workload × target binding](adoption/workload-binding.md), plus relevant roles |
+| Explore hardware configurations or implement new hardware features | [Hardware–compiler co-design and DSE](adoption/hardware-codesign.md) | Workload diagnosis, candidate hardware implementation, compiler registration and connected validation |
 | Implement a specific change | [Role index](roles.md) | Selected role, linked contract section, current callable source |
 | Build a model without an existing target | [Performance role](roles/performance.md) | [Create and register the model](compilation/performance-models.md#create-and-register-the-model), builder and ISA/runtime contract |
 | Diagnose poor selection/performance | [Performance role](roles/performance.md) | [Model/converter guidance](compilation.md#execution-model-and-converter-consistency), target implementation |

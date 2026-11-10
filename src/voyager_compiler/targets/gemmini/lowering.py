@@ -32,7 +32,7 @@ def build_raw_explicit(node, context, parameters):
 
 def build_raw_loop(node, context, parameters):
     demand = raw_requirements(node, context, True)
-    m, n, k = raw_dimensions(node)
+    m, n, k = raw_dimensions(node, context.tiler.config.pe_array_size[0])
     invocation = TargetInvoke(
         "gemmini.hardware_loop",
         "loop_ws",
@@ -72,7 +72,9 @@ def build_native_kernel(node, context, parameters):
         ),
         allocation_owner="native",
         scheduling_owner="hardware" if mode == "hardware_loop" else "compiler",
-        implicit_traffic_bytes=cost(kind, p, tile, mode).dram_bytes,
+        implicit_traffic_bytes=cost(
+            kind, p, tile, mode, context.tiler.config
+        ).dram_bytes,
         native_requirements=requirements,
     )
     return build_native(node, invocation)
@@ -340,7 +342,9 @@ def lower_operations(prepared, config, options):
                     )
             else:
                 weight = fetch_attr(gm, node.args[1].target)
-                from voyager_compiler.codegen.node_info import is_depthwise_conv
+                from voyager_compiler.codegen.node_info import (
+                    is_depthwise_conv,
+                )
 
                 depthwise = is_depthwise_conv(node)
                 kernel = weight.shape[2:] if depthwise else weight.shape[:2]
